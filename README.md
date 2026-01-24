@@ -1,6 +1,6 @@
 # CamillaDSP Utilities for Raspberry Pi
 
-Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and intelligent source switching.
+Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and seamless source switching.
 
 ## Quick start
 
@@ -29,7 +29,7 @@ Automatically switches a MOTU interface clock source based on CamillaDSP's sampl
 Use case: avoid audio dropouts caused by clock-source mismatches when switching sources.
 
 ### 🔄 Source Switcher
-Intelligently switches CamillaDSP configurations based on the active audio source.
+Seamlessly switches CamillaDSP configurations based on the active audio source.
 
 Priority: AirPlay/Streamer → USB Gadget → TOSLINK (fallback)
 
