@@ -54,7 +54,7 @@ The script polls CamillaDSP's active configuration every second to read the curr
 ## 3. Source Switcher
 
 ### What it does (simple):
-Intelligently switches between three CamillaDSP configs based on which audio source is active. Priority: AirPlay Streamer → USB Gadget → TOSLINK (fallback).
+Automatically switches between three CamillaDSP configs based on which audio source is active. Priority: AirPlay Streamer → USB Gadget → TOSLINK (fallback).
 
 ### How it works (detailed):
 The script checks multiple hardware indicators every second:
