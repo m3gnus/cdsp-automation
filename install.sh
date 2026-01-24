@@ -24,7 +24,8 @@ install_dependencies() {
     pip3 install --upgrade pip
     pip3 install websocket-client
     pip3 install git+https://github.com/HEnquist/pycamilladsp.git
-    
+
+    sudo apt update
     sudo apt install -y python3-rpi-lgpio
     
     deactivate
@@ -37,7 +38,7 @@ download_scripts() {
     echo "📥 Downloading scripts from GitHub..."
     mkdir -p ~/camilladsp/scripts
     
-    BASE_URL="https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/scripts"
+    BASE_URL="https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts"
     
     wget -q "$BASE_URL/trigger.py" -O ~/camilladsp/scripts/trigger.py
     wget -q "$BASE_URL/clock_sync.py" -O ~/camilladsp/scripts/clock_sync.py
