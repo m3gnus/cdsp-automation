@@ -1,6 +1,6 @@
 # CamillaDSP Automation Utilities for Raspberry Pi
 
-I've created three Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
+I've created three Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs. 
 
 ## Installation
 
