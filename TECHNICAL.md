@@ -1,11 +1,11 @@
 # CamillaDSP Automation Utilities for Raspberry Pi
 
-I've created three Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs. 
+I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
 
 ## Installation
 
 ```bash
-wget https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh -O install.sh
+wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/install.sh -O install.sh
 chmod +x install.sh && ./install.sh
 ```
 
@@ -16,12 +16,15 @@ The installer provides a menu to install utilities individually or all at once, 
 ## 1. Trigger Control (GPIO Relay)
 
 ### What it does (simple):
+
 Automatically turns on a GPIO pin when music is playing and turns it off after 5 minutes of silence. Perfect for controlling amplifier power via a relay.
 
 ### How it works (detailed):
+
 The script continuously monitors CamillaDSP's capture RMS levels every 200ms. When any channel shows activity (RMS > -999dB), it immediately sets GPIO pin 4 HIGH. When silence is detected, it starts a 320-second countdown timer. Only if silence persists for the full duration does it set the pin LOW.
 
 **Why this approach:**
+
 - **200ms polling interval** - Fast enough to catch audio immediately, but not so frequent it wastes CPU
 - **320-second timeout** - Long enough to handle natural gaps in music (between tracks, quiet passages) without constantly cycling your amplifier on/off, which could cause pops or reduce component life
 - **RMS threshold of -999dB** - This is CamillaDSP's indicator for "no signal," making it reliable even with various audio levels
@@ -34,12 +37,15 @@ The script continuously monitors CamillaDSP's capture RMS levels every 200ms. Wh
 ## 2. MOTU Clock Sync
 
 ### What it does (simple):
+
 Automatically switches your MOTU audio interface's clock source based on CamillaDSP's sample rate. Sets it to "optical" for 48kHz, "internal" for everything else.
 
 ### How it works (detailed):
+
 The script polls CamillaDSP's active configuration every second to read the current sample rate. When a rate change is detected, it sends binary WebSocket commands directly to the MOTU's web interface to change the clock source. The hex payloads (`000b0000000103` for internal, `000b0000000102` for optical) are reverse-engineered commands from MOTU's web UI.
 
 **Why this approach:**
+
 - **WebSocket communication** - MOTU interfaces expose a WebSocket API that their web UI uses. By capturing and replaying these commands, we can control the device programmatically without any official API
 - **Sample rate detection** - Reading from CamillaDSP's config ensures we're always synchronized with the actual DSP state, not making assumptions
 - **48kHz = optical logic** - This assumes your TOSLINK/optical input runs at 48kHz (common for streaming devices, TVs, game consoles) while internal sources use different rates
@@ -54,10 +60,13 @@ The script polls CamillaDSP's active configuration every second to read the curr
 ## 3. Source Switcher
 
 ### What it does (simple):
+
 Automatically switches between three CamillaDSP configs based on which audio source is active. Priority: AirPlay Streamer → USB Gadget → TOSLINK (fallback).
 
 ### How it works (detailed):
+
 The script checks multiple hardware indicators every second:
+
 1. **AirPlay/Streamer**: Reads `/proc/asound/Loopback/pcm*/sub*/status` to see if ALSA Loopback is in RUNNING state
 2. **USB Gadget**: Executes `amixer` to check if UAC2Gadget's capture rate is non-zero (indicating a connected USB host)
 3. **RMS monitoring**: After switching configs, it monitors RMS levels to detect actual audio activity vs. hardware just being "ready"
@@ -65,6 +74,7 @@ The script checks multiple hardware indicators every second:
 When a higher-priority source becomes active, it immediately switches configs. When a source goes silent, it waits 60 seconds before considering lower-priority sources, preventing rapid switching during track changes or brief pauses.
 
 **Why this approach:**
+
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **Two-phase detection** - First checks if hardware is "ready" (device connected/active), then uses RMS levels to detect actual audio playback. This prevents switching to a connected-but-silent device
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from your current source just because of a quiet passage or pause button
@@ -72,24 +82,99 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
 
 **Priority logic explained:**
+
 - **Priority 1: Streamer** - Assumes AirPlay/network streaming is your primary source. When you start casting from your phone, it takes over immediately
 - **Priority 2: USB Gadget** - Direct USB connection (phone, laptop) is secondary. Useful when you plug in directly but don't want to interrupt if streaming is active
 - **Priority 3: TOSLINK** - Optical input is the fallback. Always available, so it's what you'll hear when nothing else is playing
 
 **Config requirements:** You need to create three config files:
+
 - `toslink.yml` - Configured for optical input
 - `streamer.yml` - Configured for ALSA Loopback (from Squeezelite/AirPlay)
 - `gadget.yml` - Configured for USB Gadget (Pi Zero as USB sound card)
 
 ---
 
+## 4. Remote Control (Bluetooth/USB HID)
+
+### What it does (simple):
+
+Lets you control CamillaDSP volume, mute, bass, and treble using a Bluetooth or USB remote control.
+
+### How it works (detailed):
+
+The script uses the `evdev` library to capture raw input events from the HID device. It runs an async event loop that processes key press, hold, and release events, translating them into CamillaDSP API calls via `pycamilladsp`.
+
+**Event handling:**
+
+- **keystate == 1** (pressed): Immediate action for volume/tone changes
+- **keystate == 2** (held): Continuous volume adjustment when holding volume keys, tone reset trigger when holding ENTER
+- **keystate == 0** (released): Status display on short ENTER press, counter resets
+
+**Why this approach:**
+
+- **evdev for input** - Direct kernel-level access to input events, works with any HID device that registers as a keyboard
+- **Async event loop** - Non-blocking event processing allows the script to handle rapid button presses and long holds without lag
+- **Separate tone step** - Bass/treble use 0.5dB steps (configurable) for fine adjustment, while volume uses 1dB steps for faster changes
+- **Tone limits** - Hardcoded ±6dB range prevents accidentally over-boosting frequencies
+- **Filter-based tone control** - Modifies the `gain` parameter in Bass/Treble Biquad filters, which must exist in your CamillaDSP config
+- **Device reconnection** - If the Bluetooth remote disconnects, the script automatically searches for it again
+
+**Button mapping:**
+
+| Button | Press | Hold |
+|--------|-------|------|
+| Volume Up | +1dB | Continuous +1dB |
+| Volume Down | -1dB | Continuous -1dB |
+| Mute | Toggle | - |
+| Up Arrow | Treble +0.5dB | - |
+| Down Arrow | Treble -0.5dB | - |
+| Right Arrow | Bass +0.5dB | - |
+| Left Arrow | Bass -0.5dB | - |
+| Enter | Show status | Reset tone to 0dB |
+
+**Finding your remote:**
+
+After pairing a Bluetooth remote, find its device name:
+
+```bash
+python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
+```
+
+The script searches for the configured `REMOTE_NAME` and waits if it's not found (useful for remotes that auto-sleep).
+
+**CamillaDSP requirements:**
+
+For tone controls, your config must have filters named exactly `Bass` and `Treble` with a `gain` parameter:
+
+```yaml
+filters:
+  Bass:
+    type: Biquad
+    parameters:
+      type: Lowshelf
+      freq: 85
+      gain: 0
+      q: 0.9
+  Treble:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 6500
+      gain: 0
+      q: 0.7
+```
+
+---
+
 ## Why Systemd Services?
 
-All three utilities run as systemd services with these benefits:
+All four utilities run as systemd services with these benefits:
+
 - **Auto-start on boot** - No need to manually launch them
 - **Automatic restart** - If a script crashes, systemd brings it back up within 1 second
 - **Dependency management** - They won't start until CamillaDSP is running
-- **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-motu-sync`, `-source-switcher`)
+- **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-motu-sync`, `-source-switcher`, `-remote`)
 - **Easy control** - Standard `systemctl start/stop/restart` commands
 
 ---
@@ -97,20 +182,29 @@ All three utilities run as systemd services with these benefits:
 ## Debug Mode
 
 The Source Switcher includes a `DEBUG_MODE` flag. Set it to `True` in the script to see detailed output:
+
 ```python
 DEBUG_MODE = True  # In source_switcher.py
 ```
 
 This shows real-time status of hardware detection, timers, and switching decisions - helpful for troubleshooting or understanding the logic.
 
+For Remote Control, all actions are logged to journalctl by default. Watch live:
+
+```bash
+journalctl -u cdsp-remote -f
+```
+
 ---
 
 ## Can I Use Just One?
 
 Absolutely! The utilities are independent:
+
 - **Just Trigger** - For basic amp power control
 - **Just MOTU Sync** - If you only need clock management
 - **Just Source Switcher** - For automatic source selection
+- **Just Remote** - For volume/tone control via remote
 - **Any combination** - They don't interfere with each other
 
 ---
@@ -122,6 +216,7 @@ Absolutely! The utilities are independent:
 - Python 3 with venv support
 - For MOTU sync: MOTU UltraLite (or similar) on the network
 - For Source Switcher: Appropriate audio hardware and configs
+- For Remote: Bluetooth or USB HID remote control
 
 ---
 
