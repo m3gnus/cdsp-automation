@@ -1,10 +1,35 @@
 # CamillaDSP Utilities for Raspberry Pi
 
-Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and automatic source switching.
+Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and seamless source switching.
 
-## Quick start
+## ⚠️ Prerequisites
 
-Download and run the installer from this repository:
+Before installing, ensure you have:
+
+**General Requirements:**
+- Raspberry Pi (any model) running Raspberry Pi OS
+- CamillaDSP installed and running
+- Python 3.7 or newer
+
+**For Trigger Control:**
+- 5V relay module ([like this](https://www.aliexpress.com/item/1005007109343076.html))
+- Mono 3.5mm jack connector ([like this](https://www.aliexpress.com/item/32704200322.html))
+- Your amplifier must support trigger input (typically 3-12V)
+
+**For MOTU Clock Sync:**
+- MOTU UltraLite mk5 (or compatible MOTU interface)
+- MOTU accessible on your network
+
+**For Source Switcher:**
+- Three CamillaDSP config files with **specific naming**:
+  - `~/camilladsp/configs/toslink.yml` - Must be configured for 48kHz
+  - `~/camilladsp/configs/streamer.yml` - For AirPlay/network streaming
+  - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
+- **IMPORTANT:** Only the TOSLINK config should use 48kHz sample rate. Other configs must use different rates (e.g., 44.1kHz, 96kHz)
+
+## Quick Start
+
+Download and run the installer:
 
 ```bash
 wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/install.sh -O install.sh
@@ -12,199 +37,406 @@ chmod +x install.sh
 ./install.sh
 ```
 
-Notes:
-- Run the installer on the Raspberry Pi where you want the utilities installed.
-- The installer uses `sudo` where required, so you do not need to run the whole script as root.
+**Notes:**
+- Run the installer on the Raspberry Pi where you want the utilities installed
+- The installer uses `sudo` where required, so you do not need to run the whole script as root
+- Choose option **1** to install all utilities at once, or install them individually
 
-## Utilities
+---
 
-### 🔌 Trigger Control
-Automatically controls a GPIO relay based on audio activity. Turns on immediately when music plays, and turns off after a configurable period of silence.
+## 🔌 Trigger Control - Detailed Setup
 
-Use case: power control for amplifiers via a trigger relay.
+### What It Does
+Automatically powers your amplifier on/off via a 12V trigger signal based on audio activity.
 
-### 🎚️ MOTU Clock Sync
-Automatically switches a MOTU interface clock source based on CamillaDSP's sample rate (48 kHz → optical, otherwise → internal).
+### Hardware Requirements
+1. **5V Relay Module** - [Example](https://www.aliexpress.com/item/1005007109343076.html)
+2. **Mono 3.5mm Jack** - [Example](https://www.aliexpress.com/item/32704200322.html)
+3. Jumper wires
+4. Amplifier with 12V trigger input
 
-Use case: avoid audio dropouts caused by clock-source mismatches when switching sources.
+### Wiring Instructions
 
-### 🔄 Source Switcher
-Automatically switches CamillaDSP configurations based on the active audio source.
+**What You Need:**
+- Raspberry Pi
+- 5V relay module (6 pins total)
+- Mono 3.5mm jack cable (to amplifier)
 
-Priority: AirPlay/Streamer → USB Gadget → TOSLINK (fallback)
+**Connections:**
 
-Use case: automatic switching between multiple audio sources.
+**Step 1: Control Side of Relay** (powers the relay)
+1. **Pi 5V** (Pin 2 or 4) → **Relay DC+**
+2. **Pi Ground** (Pin 6, 9, 14, 20, 25, 30, 34, or 39) → **Relay DC-**
+3. **Pi GPIO 4** (Pin 7) → **Relay IN**
 
-## Requirements
+**Step 2: Switch Side of Relay** (triggers the amp)
+4. **Pi 5V** (Pin 2 or 4) → **Relay COM**
+5. **Relay NO** → **Mono jack Tip**
+6. **Pi Ground** (any ground pin) → **Mono jack Sleeve**
 
-- Raspberry Pi (any model with GPIO for trigger control)
-- CamillaDSP installed and accessible (default port used by scripts: 1234)
-- Python 3.7 or newer
-- For MOTU sync: a MOTU interface accessible on your network (e.g. UltraLite)
-- For Source Switcher: three configuration files (toslink.yml, streamer.yml, gadget.yml) — see Configuration below
+**Step 3: Leave Unused**
+7. **Relay NC** → nothing (leave empty)
 
-## Installation (what the installer does)
+**Summary:**
+- **Pi 5V** connects to 2 places: DC+ and COM
+- **Pi Ground** connects to 2 places: DC- and jack sleeve
+- **Pi GPIO 4** connects to 1 place: IN
+- **Jack Tip** connects to 1 place: NO
+- **Jack Sleeve** connects to 1 place: Pi Ground
+- **NC terminal** stays empty
 
-The installer in this repo provides a simple menu-driven interface to:
-- create a Python virtualenv under `~/camilladsp/.venv`
-- install Python dependencies (websocket-client and pycamilladsp)
-- install required system packages (e.g. `python3-rpi-lgpio`)
-- download the utility scripts into `~/camilladsp/scripts`
-- create systemd service unit files for each utility
-- enable and optionally start those services
-- provide an uninstall option
+**Done!** When the script activates GPIO 4, the relay switches on and sends 5V to your amp's trigger input.
 
-## Manual installation
+**3.5mm Jack to Amplifier:**
+- Connect the mono jack to your amplifier's trigger input
 
-If you prefer to install manually:
+### Configuration
 
-1. Create directories:
-   ```bash
-   mkdir -p ~/camilladsp/scripts
-   mkdir -p ~/camilladsp/configs
-   ```
+Edit `~/camilladsp/scripts/trigger.py`:
+```python
+PowerGpio = 4              # GPIO pin number (change if using different pin)
+delay_time = 320           # Seconds of silence before turning off (320 = 5min 20sec)
+check_interval = 0.2       # How often to check audio (0.2 = 200ms)
+```
 
-2. Create a virtualenv and install Python deps:
-   ```bash
-   python3 -m venv --system-site-packages ~/camilladsp/.venv
-   source ~/camilladsp/.venv/bin/activate
-   pip install --upgrade pip
-   pip install websocket-client
-   pip install git+https://github.com/HEnquist/pycamilladsp.git
-   deactivate
-   ```
+### How It Works
+- Detects music and turns relay ON (checks every 200ms)
+- Starts 320-second countdown when music stops
+- Only turns relay OFF if silence continues for full duration
+- Resets countdown if music resumes
 
-3. Install system package for GPIO (Raspberry Pi OS):
-   ```bash
-   sudo apt update
-   sudo apt install -y python3-rpi-lgpio
-   ```
+**Why 320 seconds?** Long enough to handle gaps between tracks and quiet passages without constantly cycling your amplifier on/off.
 
-4. Copy the scripts from this repo into `~/camilladsp/scripts` (or clone the repo) and make them executable:
-   ```bash
-   wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts/trigger.py -O ~/camilladsp/scripts/trigger.py
-   wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts/clock_sync.py -O ~/camilladsp/scripts/clock_sync.py
-   wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts/source_switcher.py -O ~/camilladsp/scripts/source_switcher.py
-   chmod +x ~/camilladsp/scripts/*.py
-   ```
+---
 
-5. Create systemd service unit files (examples are in the installer). After adding them to `/lib/systemd/system/` run:
-   ```bash
-   sudo systemctl daemon-reload
-   sudo systemctl enable cdsp-trigger
-   sudo systemctl enable cdsp-motu-sync
-   sudo systemctl enable cdsp-source-switcher
-   ```
+## 🎚️ MOTU Clock Sync
 
-## Configuration
+### What It Does
+Automatically switches your MOTU interface's clock source when CamillaDSP changes sample rates.
 
-- Scripts live at: `~/camilladsp/scripts/`
-- Virtualenv: `~/camilladsp/.venv/`
+### How It Works
+- Detects sample rate changes in CamillaDSP
+- Sends WebSocket commands to MOTU to change clock source
+- **48kHz** → switches to **optical** clock
+- **Other rates** → switches to **internal** clock
 
-Trigger Control (`trigger.py`):
-- `PowerGpio`: GPIO pin number (default: 4)
-- `delay_time`: seconds before turning off (default: 320)
-- `check_interval`: polling frequency (default: 0.2)
+### Requirements
+- MOTU UltraLite mk5 (other MOTU models may need different hex payloads)
+- MOTU must be accessible on your network
+- Your TOSLINK source must run at 48kHz
 
-MOTU Clock Sync (`clock_sync.py`):
-- The installer prompts for your MOTU device IP address and writes it into the script.
-- You can also edit `~/camilladsp/scripts/clock_sync.py` to change the IP later.
+### Configuration
 
-Source Switcher (`source_switcher.py`):
-- `IDLE_TIMEOUT`: seconds of silence before switching (default: 60)
-- `RMS_DELTA_EPS`: RMS change threshold (default: 0.1)
-- `DEBUG_MODE`: enable verbose logging (default: False)
+The installer will prompt for your MOTU's IP address. To find it:
+1. Open MOTU web interface (usually `http://169.254.51.193`)
+2. Go to **Settings → About**
+3. Note the IP address
 
-Required config files for Source Switcher (examples are documented with the scripts):
-- `~/camilladsp/configs/toslink.yml`
-- `~/camilladsp/configs/streamer.yml`
-- `~/camilladsp/configs/gadget.yml`
+To change the IP later, edit `~/camilladsp/scripts/clock_sync.py`:
+```python
+MOTU_WS_URL = "ws://YOUR_MOTU_IP:1280"
+```
 
-## Managing services
+### Important Note on Sample Rates
+This script assumes:
+- **TOSLINK input = 48kHz** (TVs, game consoles, streaming devices typically use 48kHz)
+- **Other inputs = different rates** (44.1kHz for CD quality, 96kHz for high-res, etc.)
 
-View status:
+If your setup is different, modify the logic in `clock_sync.py`:
+```python
+if current_rate == 48000:
+    set_motu_clock("optical")
+else:
+    set_motu_clock("internal")
+```
+
+---
+
+## 🔄 Source Switcher
+
+### What It Does
+Automatically switches between CamillaDSP configs based on which audio source is playing.
+
+**Priority order:**
+1. **Streamer** (AirPlay/network streaming) - highest priority
+2. **USB Gadget** (direct USB connection) - middle priority
+3. **TOSLINK** (optical input) - fallback/default
+
+### Critical Configuration Requirements
+
+**You MUST create three config files with exact names:**
+
+1. **`~/camilladsp/configs/toslink.yml`**
+   - Configure for optical input
+   - **Must use 48kHz sample rate**
+   
+2. **`~/camilladsp/configs/streamer.yml`**
+   - Configure for ALSA Loopback (from Squeezelite/AirPlay)
+   - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
+   
+3. **`~/camilladsp/configs/gadget.yml`**
+   - Configure for USB Gadget
+   - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
+
+**Why different sample rates?** The MOTU Clock Sync utility uses sample rate to determine which clock source to use. If all configs use the same rate, clock switching won't work correctly.
+
+### How It Works
+1. Checks if hardware is active (device connected and ready)
+2. Switches to that source's config
+3. Monitors actual audio playback via RMS levels
+4. Waits 60 seconds of silence before switching to lower priority source
+5. Falls back to TOSLINK when no other source is active
+
+### Configuration
+
+Edit `~/camilladsp/scripts/source_switcher.py`:
+```python
+IDLE_TIMEOUT = 60          # Seconds of silence before switching sources
+RMS_DELTA_EPS = 0.1        # How sensitive to audio changes (lower = more sensitive)
+DEBUG_MODE = False         # Set to True to see detailed logging
+```
+
+### Debugging
+
+Enable debug mode to see what the switcher is doing:
+```python
+DEBUG_MODE = True
+```
+
+Then watch the logs:
+```bash
+journalctl -u cdsp-source-switcher -f
+```
+
+You'll see output like:
+```
+DEBUG: Streamer HW=True, Gadget HW=False, Last=streamer, ST=0, GT=0
+→ Streamer: Audio active
+→ Streamer: Idle 5/60s
+```
+
+---
+
+## Installation Details
+
+The installer menu provides these options:
+
+1. **Install All Utilities** - Recommended for first-time setup
+2. **Update Utilities** - Downloads latest scripts and updates pycamilladsp
+3. **Install Trigger Control** - GPIO relay control only
+4. **Install MOTU Clock Sync** - MOTU clock management only
+5. **Install Source Switcher** - Config switching only
+6. **Show Service Status** - Check if services are running
+7. **Uninstall All Utilities** - Remove everything
+
+### What Gets Installed
+
+**Directories created:**
+- `~/camilladsp/scripts/` - Python scripts
+- `~/camilladsp/configs/` - CamillaDSP config files (you must create these)
+- `~/camilladsp/.venv/` - Python virtual environment
+
+**System services:**
+- `cdsp-trigger.service`
+- `cdsp-motu-sync.service`
+- `cdsp-source-switcher.service`
+
+**Dependencies:**
+- `websocket-client` (Python package)
+- `pycamilladsp` (Python package)
+- `python3-rpi-lgpio` (system package)
+
+---
+
+## Managing Services
+
+### View Status
 ```bash
 systemctl status cdsp-trigger
 systemctl status cdsp-motu-sync
 systemctl status cdsp-source-switcher
 ```
 
-View logs (follow):
+### View Logs (Live)
 ```bash
 journalctl -u cdsp-trigger -f
 journalctl -u cdsp-motu-sync -f
 journalctl -u cdsp-source-switcher -f
 ```
 
-Start / stop / restart:
+### View Last 100 Log Lines
+```bash
+journalctl -u cdsp-trigger -n 100
+journalctl -u cdsp-motu-sync -n 100
+journalctl -u cdsp-source-switcher -n 100
+```
+
+### Start/Stop/Restart
 ```bash
 sudo systemctl start cdsp-trigger
 sudo systemctl stop cdsp-trigger
 sudo systemctl restart cdsp-trigger
-
-sudo systemctl start cdsp-motu-sync
-sudo systemctl stop cdsp-motu-sync
-sudo systemctl restart cdsp-motu-sync
-
-sudo systemctl start cdsp-source-switcher
-sudo systemctl stop cdsp-source-switcher
-sudo systemctl restart cdsp-source-switcher
 ```
 
-Enable / disable auto-start:
+### Enable/Disable Auto-Start on Boot
 ```bash
-sudo systemctl enable cdsp-trigger
-sudo systemctl disable cdsp-trigger
-
-sudo systemctl enable cdsp-motu-sync
-sudo systemctl disable cdsp-motu-sync
-
-sudo systemctl enable cdsp-source-switcher
-sudo systemctl disable cdsp-source-switcher
+sudo systemctl enable cdsp-trigger   # Start on boot
+sudo systemctl disable cdsp-trigger  # Don't start on boot
 ```
+
+---
 
 ## Troubleshooting
 
-Trigger not working:
-- Check GPIO wiring and relay connection.
-- Verify permissions: `ls -l /dev/gpiochip0`
-- Check logs: `journalctl -u cdsp-trigger -n 100`
+### Trigger Control Not Working
 
-MOTU sync not working:
-- Verify the MOTU IP address is correct.
-- Test basic connectivity: `ping <MOTU_IP>`
-- Check that the MOTU's web UI is reachable from the Pi.
-- Some MOTU models may use different binary payloads for control.
+**Check wiring:**
+- Verify GPIO 4 is connected to relay IN
+- Verify 5V and GND are connected correctly
+- Test relay manually: `gpio -g write 4 1` (requires wiringpi)
 
-Source switcher not switching:
-- Enable `DEBUG_MODE` in `source_switcher.py` to see decision logic in logs.
-- Verify config files exist and are valid YAML.
-- Check hardware detection lines in the script (e.g. Loopback/pcm status or amixer outputs).
+**Check permissions:**
+```bash
+ls -l /dev/gpiochip0
+# Should show: crw-rw---- 1 root gpio
+```
 
-## Technical details
+If not in gpio group:
+```bash
+sudo usermod -aG gpio $USER
+# Then logout and login again
+```
 
-For design rationale and deeper technical explanations, see [TECHNICAL.md](TECHNICAL.md).
+**Check logs:**
+```bash
+journalctl -u cdsp-trigger -n 100
+```
+
+Look for error messages about GPIO access or CamillaDSP connection.
+
+### MOTU Clock Sync Not Working
+
+**Verify MOTU IP address:**
+```bash
+ping 169.254.51.193  # Or your MOTU's IP
+```
+
+**Check if MOTU web interface is accessible:**
+```bash
+curl http://169.254.51.193
+# Should return HTML from MOTU
+```
+
+**Check logs:**
+```bash
+journalctl -u cdsp-motu-sync -n 100
+```
+
+**For other MOTU models:**
+The hex payloads may be different. You'll need to capture them from your MOTU's web UI:
+1. Open Chrome/Firefox Developer Tools (F12)
+2. Go to Network tab, filter by "WS" (WebSocket)
+3. Change clock source in MOTU web UI
+4. Inspect the binary WebSocket message
+5. Update `CLOCK_PAYLOADS` in `clock_sync.py`
+
+### Source Switcher Not Switching
+
+**Enable debug mode:**
+Edit `~/camilladsp/scripts/source_switcher.py`:
+```python
+DEBUG_MODE = True
+```
+
+Restart service:
+```bash
+sudo systemctl restart cdsp-source-switcher
+```
+
+Watch logs:
+```bash
+journalctl -u cdsp-source-switcher -f
+```
+
+**Verify config files exist:**
+```bash
+ls -l ~/camilladsp/configs/
+# Should show: toslink.yml, streamer.yml, gadget.yml
+```
+
+**Check if configs are valid:**
+```bash
+camilladsp -c ~/camilladsp/configs/toslink.yml
+```
+
+**Verify sample rates are different:**
+```bash
+grep samplerate ~/camilladsp/configs/*.yml
+# toslink.yml should show 48000
+# Others should show different rates
+```
+
+**Test hardware detection manually:**
+
+For Loopback (Streamer):
+```bash
+cat /proc/asound/Loopback/pcm0p0/sub0/status
+# Look for "state: RUNNING" when streaming
+```
+
+For USB Gadget:
+```bash
+amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
+# Should show non-zero rate when USB host connected
+```
+
+---
+
+## Manual Installation
+
+If you prefer not to use the installer, see the detailed manual installation steps in the README.
+
+---
+
+## Can I Use Just One Utility?
+
+**Yes!** The utilities are completely independent:
+- Install only **Trigger Control** for amp power management
+- Install only **MOTU Clock Sync** for clock source automation
+- Install only **Source Switcher** for config switching
+- Install any combination
+
+They don't interfere with each other and can run simultaneously.
+
+---
 
 ## Contributing
 
 Contributions welcome! Please:
 1. Fork the repository
 2. Create a feature branch
-3. Test your changes
+3. Test thoroughly on your hardware
 4. Submit a pull request
+
+---
 
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
 
+---
+
 ## Acknowledgments
 
-- [CamillaDSP](https://github.com/HEnquist/camilladsp)
+- [CamillaDSP](https://github.com/HEnquist/camilladsp) by HEnquist
 - [pycamilladsp](https://github.com/HEnquist/pycamilladsp) Python library
 - [RPi-CamillaDSP](https://github.com/mdsimon2/RPi-CamillaDSP) — RPi-focused CamillaDSP setup by mdsimon2
 - [Display, remote and trigger power for CamillaDSP streamer and preamp — Audio Science Review thread](https://www.audiosciencereview.com/forum/index.php?threads/display-remote-and-trigger-power-for-camilladsp-streamer-and-preamp-alternative-to-mdsimon2%E2%80%99s-implementation.52818/) — community discussion and alternative implementations
 
+---
+
 ## Support
 
-- Open an issue for bugs or feature requests
-- Use Discussions for questions and ideas
+- **Issues:** Open a GitHub issue for bugs
+- **Questions:** Use GitHub Discussions
+- **Ideas:** Start a discussion or open a feature request
