@@ -2,7 +2,7 @@
 
 Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and seamless source switching.
 
-## ⚠️ Prerequisites
+## Prerequisites
 
 Before installing, ensure you have:
 
