@@ -1,6 +1,6 @@
 # CamillaDSP Utilities for Raspberry Pi
 
-Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, and seamless source switching.
+Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, seamless source switching, and Bluetooth remote control.
 
 ## Prerequisites
 
@@ -27,6 +27,10 @@ Before installing, ensure you have:
   - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
 - **IMPORTANT:** Only the TOSLINK config should use 48kHz sample rate. Other configs must use different rates (e.g., 44.1kHz, 96kHz)
 
+**For Remote Control:**
+- Bluetooth or USB HID remote control ([like this](https://www.aliexpress.com/item/1005010182280772.html))
+- CamillaDSP config with `Bass` and `Treble` filters (for tone control)
+
 ## Quick Start
 
 Download and run the installer:
@@ -44,12 +48,120 @@ chmod +x install.sh
 
 ---
 
+## 🎮 Remote Control - Detailed Setup
+
+### What It Does
+
+Control CamillaDSP from a Bluetooth or USB HID remote. Adjust volume, mute, bass, and treble without touching your computer.
+
+### Hardware Requirements
+
+Any Bluetooth or USB remote that registers as an HID keyboard device. Common options:
+- Bluetooth media remotes ([example](https://www.aliexpress.com/item/1005010182280772.html))
+- USB IR remotes
+- Bluetooth presentation clickers
+
+### Button Mapping
+
+| Button | Action |
+|--------|--------|
+| **VOLUME UP** | Increase volume by 1 dB (hold for continuous) |
+| **VOLUME DOWN** | Decrease volume by 1 dB (hold for continuous) |
+| **MUTE** | Toggle mute on/off |
+| **UP arrow** | Increase treble by 0.5 dB (max +6 dB) |
+| **DOWN arrow** | Decrease treble by 0.5 dB (min -6 dB) |
+| **RIGHT arrow** | Increase bass by 0.5 dB (max +6 dB) |
+| **LEFT arrow** | Decrease bass by 0.5 dB (min -6 dB) |
+| **ENTER** (short press) | Print current status to log |
+| **ENTER** (hold ~1 sec) | Reset bass and treble to 0 dB |
+
+### Pairing a Bluetooth Remote
+
+Use the installer's built-in pairing option:
+
+```bash
+./install.sh
+# Choose option 7: Pair Bluetooth Remote
+```
+
+Or pair manually:
+
+```bash
+bluetoothctl power on
+bluetoothctl scan on
+# Wait for your remote to appear, note the MAC address
+bluetoothctl scan off
+bluetoothctl pair XX:XX:XX:XX:XX:XX
+bluetoothctl connect XX:XX:XX:XX:XX:XX
+bluetoothctl trust XX:XX:XX:XX:XX:XX
+```
+
+### Finding Your Remote's Device Name
+
+After pairing, find your remote's name:
+
+```bash
+python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
+```
+
+Example output:
+```
+['HID Remote01 Keyboard', 'HID Remote01 Mouse', 'vc4-hdmi-0', 'pwr_button']
+```
+
+The installer will prompt you to enter this name during installation.
+
+### Configuration
+
+Edit `~/camilladsp/scripts/cdsp_remote.py`:
+
+```python
+# Remote device name
+REMOTE_NAME = "HID Remote01 Keyboard"
+
+# Tone limits (in dB)
+TONE_MIN = -6
+TONE_MAX = 6
+TONE_STEP = 0.5  # Increment per button press
+
+# Volume limits (in dB)
+VOLUME_MIN = -80
+VOLUME_MAX = 0
+VOLUME_STEP = 1  # Increment per button press
+```
+
+### CamillaDSP Filter Requirements
+
+For tone controls to work, your CamillaDSP config must include `Bass` and `Treble` filters:
+
+```yaml
+filters:
+  Bass:
+    type: Biquad
+    parameters:
+      type: Lowshelf
+      freq: 85
+      gain: 0
+      q: 0.9
+  Treble:
+    type: Biquad
+    parameters:
+      type: Highshelf
+      freq: 6500
+      gain: 0
+      q: 0.7
+```
+
+---
+
 ## 🔌 Trigger Control - Detailed Setup
 
 ### What It Does
+
 Automatically powers your amplifier on/off via a 12V trigger signal based on audio activity.
 
 ### Hardware Requirements
+
 1. **5V Relay Module** - [Example](https://www.aliexpress.com/item/1005007109343076.html)
 2. **Mono 3.5mm Jack** - [Example](https://www.aliexpress.com/item/32704200322.html)
 3. Jumper wires
@@ -93,6 +205,7 @@ Automatically powers your amplifier on/off via a 12V trigger signal based on aud
 ### Configuration
 
 Edit `~/camilladsp/scripts/trigger.py`:
+
 ```python
 PowerGpio = 4              # GPIO pin number (change if using different pin)
 delay_time = 320           # Seconds of silence before turning off (320 = 5min 20sec)
@@ -100,6 +213,7 @@ check_interval = 0.2       # How often to check audio (0.2 = 200ms)
 ```
 
 ### How It Works
+
 - Detects music and turns relay ON (checks every 200ms)
 - Starts 320-second countdown when music stops
 - Only turns relay OFF if silence continues for full duration
@@ -112,15 +226,18 @@ check_interval = 0.2       # How often to check audio (0.2 = 200ms)
 ## 🎚️ MOTU Clock Sync
 
 ### What It Does
-Automatically switches your MOTU interface's clock source when CamillaDSP changes sample rates.
+
+Automatically switches your MOTU audio interface's clock source when CamillaDSP changes sample rates.
 
 ### How It Works
+
 - Detects sample rate changes in CamillaDSP
 - Sends WebSocket commands to MOTU to change clock source
 - **48kHz** → switches to **optical** clock
 - **Other rates** → switches to **internal** clock
 
 ### Requirements
+
 - MOTU UltraLite mk5 (other MOTU models may need different hex payloads)
 - MOTU must be accessible on your network
 - Your TOSLINK source must run at 48kHz
@@ -133,16 +250,19 @@ The installer will prompt for your MOTU's IP address. To find it:
 3. Note the IP address
 
 To change the IP later, edit `~/camilladsp/scripts/clock_sync.py`:
+
 ```python
 MOTU_WS_URL = "ws://YOUR_MOTU_IP:1280"
 ```
 
 ### Important Note on Sample Rates
+
 This script assumes:
 - **TOSLINK input = 48kHz** (TVs, game consoles, streaming devices typically use 48kHz)
 - **Other inputs = different rates** (44.1kHz for CD quality, 96kHz for high-res, etc.)
 
 If your setup is different, modify the logic in `clock_sync.py`:
+
 ```python
 if current_rate == 48000:
     set_motu_clock("optical")
@@ -155,6 +275,7 @@ else:
 ## 🔄 Source Switcher
 
 ### What It Does
+
 Automatically switches between CamillaDSP configs based on which audio source is playing.
 
 **Priority order:**
@@ -169,11 +290,11 @@ Automatically switches between CamillaDSP configs based on which audio source is
 1. **`~/camilladsp/configs/toslink.yml`**
    - Configure for optical input
    - **Must use 48kHz sample rate**
-   
+
 2. **`~/camilladsp/configs/streamer.yml`**
    - Configure for ALSA Loopback (from Squeezelite/AirPlay)
    - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
-   
+
 3. **`~/camilladsp/configs/gadget.yml`**
    - Configure for USB Gadget
    - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
@@ -181,6 +302,7 @@ Automatically switches between CamillaDSP configs based on which audio source is
 **Why different sample rates?** The MOTU Clock Sync utility uses sample rate to determine which clock source to use. If all configs use the same rate, clock switching won't work correctly.
 
 ### How It Works
+
 1. Checks if hardware is active (device connected and ready)
 2. Switches to that source's config
 3. Monitors actual audio playback via RMS levels
@@ -190,6 +312,7 @@ Automatically switches between CamillaDSP configs based on which audio source is
 ### Configuration
 
 Edit `~/camilladsp/scripts/source_switcher.py`:
+
 ```python
 IDLE_TIMEOUT = 60          # Seconds of silence before switching sources
 RMS_DELTA_EPS = 0.1        # How sensitive to audio changes (lower = more sensitive)
@@ -199,16 +322,19 @@ DEBUG_MODE = False         # Set to True to see detailed logging
 ### Debugging
 
 Enable debug mode to see what the switcher is doing:
+
 ```python
 DEBUG_MODE = True
 ```
 
 Then watch the logs:
+
 ```bash
 journalctl -u cdsp-source-switcher -f
 ```
 
 You'll see output like:
+
 ```
 DEBUG: Streamer HW=True, Gadget HW=False, Last=streamer, ST=0, GT=0
 → Streamer: Audio active
@@ -226,8 +352,10 @@ The installer menu provides these options:
 3. **Install Trigger Control** - GPIO relay control only
 4. **Install MOTU Clock Sync** - MOTU clock management only
 5. **Install Source Switcher** - Config switching only
-6. **Show Service Status** - Check if services are running
-7. **Uninstall All Utilities** - Remove everything
+6. **Install Remote Control** - Bluetooth/USB remote control only
+7. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
+8. **Show Service Status** - Check if services are running
+9. **Uninstall All Utilities** - Remove everything
 
 ### What Gets Installed
 
@@ -240,10 +368,12 @@ The installer menu provides these options:
 - `cdsp-trigger.service`
 - `cdsp-motu-sync.service`
 - `cdsp-source-switcher.service`
+- `cdsp-remote.service`
 
 **Dependencies:**
 - `websocket-client` (Python package)
 - `pycamilladsp` (Python package)
+- `evdev` (Python package)
 - `python3-rpi-lgpio` (system package)
 
 ---
@@ -251,42 +381,84 @@ The installer menu provides these options:
 ## Managing Services
 
 ### View Status
+
 ```bash
 systemctl status cdsp-trigger
 systemctl status cdsp-motu-sync
 systemctl status cdsp-source-switcher
+systemctl status cdsp-remote
 ```
 
 ### View Logs (Live)
+
 ```bash
 journalctl -u cdsp-trigger -f
 journalctl -u cdsp-motu-sync -f
 journalctl -u cdsp-source-switcher -f
+journalctl -u cdsp-remote -f
 ```
 
 ### View Last 100 Log Lines
+
 ```bash
 journalctl -u cdsp-trigger -n 100
 journalctl -u cdsp-motu-sync -n 100
 journalctl -u cdsp-source-switcher -n 100
+journalctl -u cdsp-remote -n 100
 ```
 
 ### Start/Stop/Restart
+
 ```bash
-sudo systemctl start cdsp-trigger
-sudo systemctl stop cdsp-trigger
-sudo systemctl restart cdsp-trigger
+sudo systemctl start cdsp-remote
+sudo systemctl stop cdsp-remote
+sudo systemctl restart cdsp-remote
 ```
 
 ### Enable/Disable Auto-Start on Boot
+
 ```bash
-sudo systemctl enable cdsp-trigger   # Start on boot
-sudo systemctl disable cdsp-trigger  # Don't start on boot
+sudo systemctl enable cdsp-remote   # Start on boot
+sudo systemctl disable cdsp-remote  # Don't start on boot
 ```
 
 ---
 
 ## Troubleshooting
+
+### Remote Control Not Working
+
+**Check if remote is detected:**
+
+```bash
+python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
+```
+
+Your remote should appear in the list. If not:
+- Check Bluetooth connection: `bluetoothctl devices Connected`
+- Re-pair the remote using the installer (option 7)
+
+**Check if the device name matches:**
+
+The name in the script must exactly match what appears in the device list. Edit `~/camilladsp/scripts/cdsp_remote.py` if needed.
+
+**Test remote input:**
+
+```bash
+python3 -m evdev.evtest
+```
+
+Select your remote and press buttons - you should see key events.
+
+**Check logs:**
+
+```bash
+journalctl -u cdsp-remote -n 100
+```
+
+**Tone controls not working:**
+
+Ensure your CamillaDSP config has `Bass` and `Treble` filters with a `gain` parameter.
 
 ### Trigger Control Not Working
 
@@ -296,18 +468,21 @@ sudo systemctl disable cdsp-trigger  # Don't start on boot
 - Test relay manually: `gpio -g write 4 1` (requires wiringpi)
 
 **Check permissions:**
+
 ```bash
 ls -l /dev/gpiochip0
 # Should show: crw-rw---- 1 root gpio
 ```
 
 If not in gpio group:
+
 ```bash
 sudo usermod -aG gpio $USER
 # Then logout and login again
 ```
 
 **Check logs:**
+
 ```bash
 journalctl -u cdsp-trigger -n 100
 ```
@@ -317,22 +492,26 @@ Look for error messages about GPIO access or CamillaDSP connection.
 ### MOTU Clock Sync Not Working
 
 **Verify MOTU IP address:**
+
 ```bash
 ping 169.254.51.193  # Or your MOTU's IP
 ```
 
 **Check if MOTU web interface is accessible:**
+
 ```bash
 curl http://169.254.51.193
 # Should return HTML from MOTU
 ```
 
 **Check logs:**
+
 ```bash
 journalctl -u cdsp-motu-sync -n 100
 ```
 
 **For other MOTU models:**
+
 The hex payloads may be different. You'll need to capture them from your MOTU's web UI:
 1. Open Chrome/Firefox Developer Tools (F12)
 2. Go to Network tab, filter by "WS" (WebSocket)
@@ -343,33 +522,40 @@ The hex payloads may be different. You'll need to capture them from your MOTU's 
 ### Source Switcher Not Switching
 
 **Enable debug mode:**
+
 Edit `~/camilladsp/scripts/source_switcher.py`:
+
 ```python
 DEBUG_MODE = True
 ```
 
 Restart service:
+
 ```bash
 sudo systemctl restart cdsp-source-switcher
 ```
 
 Watch logs:
+
 ```bash
 journalctl -u cdsp-source-switcher -f
 ```
 
 **Verify config files exist:**
+
 ```bash
 ls -l ~/camilladsp/configs/
 # Should show: toslink.yml, streamer.yml, gadget.yml
 ```
 
 **Check if configs are valid:**
+
 ```bash
 camilladsp -c ~/camilladsp/configs/toslink.yml
 ```
 
 **Verify sample rates are different:**
+
 ```bash
 grep samplerate ~/camilladsp/configs/*.yml
 # toslink.yml should show 48000
@@ -379,12 +565,14 @@ grep samplerate ~/camilladsp/configs/*.yml
 **Test hardware detection manually:**
 
 For Loopback (Streamer):
+
 ```bash
 cat /proc/asound/Loopback/pcm0p0/sub0/status
 # Look for "state: RUNNING" when streaming
 ```
 
 For USB Gadget:
+
 ```bash
 amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
 # Should show non-zero rate when USB host connected
@@ -392,18 +580,14 @@ amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
 
 ---
 
-## Manual Installation
-
-If you prefer not to use the installer, see the detailed manual installation steps in the README.
-
----
-
 ## Can I Use Just One Utility?
 
 **Yes!** The utilities are completely independent:
+
 - Install only **Trigger Control** for amp power management
 - Install only **MOTU Clock Sync** for clock source automation
 - Install only **Source Switcher** for config switching
+- Install only **Remote Control** for volume/tone adjustment
 - Install any combination
 
 They don't interfere with each other and can run simultaneously.
@@ -413,6 +597,7 @@ They don't interfere with each other and can run simultaneously.
 ## Contributing
 
 Contributions welcome! Please:
+
 1. Fork the repository
 2. Create a feature branch
 3. Test thoroughly on your hardware
