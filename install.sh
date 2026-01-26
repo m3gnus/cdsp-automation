@@ -130,6 +130,8 @@ install_remote() {
   echo "   - LEFT/RIGHT arrows: Adjust bass (±0.5 dB)"
   echo "   - ENTER (short): Show current status"
   echo "   - ENTER (hold ~1s): Reset bass/treble to 0 dB"
+  echo "   - POWER (hold ~1s): Restart all services"
+  echo "   - POWER (hold ~10s): Shutdown system"
   echo ""
   echo "⚠️  NOTE: Your CamillaDSP config must have 'Bass' and 'Treble' filters"
   echo "   for tone controls to work."
