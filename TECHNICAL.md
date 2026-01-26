@@ -132,6 +132,21 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 | Right Arrow | Bass +0.5dB | - |
 | Left Arrow | Bass -0.5dB | - |
 | Enter | Show status | Reset tone to 0dB |
+| Power | - | ~1s: Restart services, ~10s: Shutdown |
+
+**Power button service restart:**
+
+Holding the power button for ~1 second restarts all CamillaDSP-related services:
+- camilladsp.service
+- camillagui.service
+- cdsp-motu-sync.service
+- cdsp-source-switcher.service
+- cdsp-remote.service
+- cdsp-trigger.service (delayed by 1 second to allow amplifiers to power cycle properly)
+
+The trigger service restart uses `systemd-run` to create a transient timer that survives the cdsp-remote service restart. This ensures proper sequencing even though the restart command kills the script itself.
+
+Holding for ~10 seconds triggers a system shutdown (`shutdown -h now`).
 
 **Finding your remote:**
 
