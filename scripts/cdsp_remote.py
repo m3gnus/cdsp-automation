@@ -5,6 +5,7 @@ CamillaDSP USB HID Remote Control
 Controls CamillaDSP via a Bluetooth/USB HID remote:
 - Volume control (up/down/mute)
 - Tone adjustment (bass/treble via arrow keys)
+- Power button: hold 1s to restart services, hold 10s to shutdown
 
 Designed to work alongside other cdsp-automation utilities.
 
@@ -16,6 +17,7 @@ import asyncio
 import evdev
 import os
 import signal
+import subprocess
 import sys
 import time
 from camilladsp import CamillaClient
@@ -51,6 +53,7 @@ KEY_BINDINGS = {
     'LEFT': 'KEY_LEFT',      # Bass Down
     'RIGHT': 'KEY_RIGHT',    # Bass Up
     'ENTER': 'KEY_ENTER',    # Show status / Reset tone (hold)
+    'POWER': 'KEY_POWER',    # Restart services (1s hold) / Shutdown (10s hold)
 }
 
 # ====================== GLOBAL STATE ======================
@@ -175,6 +178,41 @@ def reset_tone():
         print(f"Error resetting tone: {e}")
 
 
+def restart_services():
+    """
+    Restart CamillaDSP and related services.
+    Continues even if some services are not available.
+    """
+    services = [
+        'camilladsp.service',
+        'camillagui.service',
+        'cdsp-trigger.service',
+        'cdsp-motu-sync.service',
+        'cdsp-source-switcher.service',
+        'cdsp-remote.service',
+    ]
+
+    print("Restarting services...")
+    for service in services:
+        try:
+            result = subprocess.run(
+                ['sudo', 'systemctl', 'restart', service],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                print(f"  Restarted: {service}")
+            else:
+                print(f"  Skipped: {service} (not available or failed)")
+        except subprocess.TimeoutExpired:
+            print(f"  Timeout: {service}")
+        except Exception as e:
+            print(f"  Error restarting {service}: {e}")
+
+    print("Service restart complete.")
+
+
 # ====================== EVENT HANDLING ======================
 
 async def handle_remote_events(device):
@@ -230,6 +268,17 @@ async def handle_remote_events(device):
                         if KEYDOWN >= 10:
                             reset_tone()
                             KEYDOWN = 0
+
+                    elif key == KEY_BINDINGS['POWER']:
+                        KEYDOWN += 1
+                        if KEYDOWN == 10:
+                            # ~1 second hold - restart services
+                            print("Power button held 1s - restarting services...")
+                            restart_services()
+                        elif KEYDOWN >= 100:
+                            # ~10 second hold - shutdown
+                            print("Power button held 10s - shutting down...")
+                            subprocess.run(['sudo', 'shutdown', '-h', 'now'])
 
                 # Key released (keystate == 0)
                 elif attrib.keystate == 0:
