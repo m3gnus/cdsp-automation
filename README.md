@@ -74,6 +74,8 @@ Any Bluetooth or USB remote that registers as an HID keyboard device. Common opt
 | **LEFT arrow** | Decrease bass by 0.5 dB (min -6 dB) |
 | **ENTER** (short press) | Print current status to log |
 | **ENTER** (hold ~1 sec) | Reset bass and treble to 0 dB |
+| **POWER** (hold ~1 sec) | Restart all CamillaDSP services |
+| **POWER** (hold ~10 sec) | Shutdown the system |
 
 ### Pairing a Bluetooth Remote
 
