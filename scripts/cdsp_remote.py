@@ -183,21 +183,33 @@ def restart_services():
     Restart CamillaDSP and related services.
     Continues even if some services are not available.
 
-    Note: cdsp-trigger is restarted last with a delay to allow
-    amplifiers to fully power down before the relay reopens.
+    Note: cdsp-trigger is restarted via a background process with a delay
+    to allow amplifiers to fully power down before the relay reopens.
+    cdsp-remote is restarted last (which kills this script, but the
+    background process survives to restart the trigger).
     """
-    # Services to restart immediately
+    # Delay before restarting trigger (allows amplifiers to power down)
+    trigger_delay = 5
+
+    # Spawn a background process to restart trigger service after delay
+    # This survives even when cdsp-remote.service is restarted
+    restart_script = f'sleep {trigger_delay} && sudo systemctl restart cdsp-trigger.service'
+    subprocess.Popen(
+        ['nohup', 'bash', '-c', restart_script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True
+    )
+    print(f"  Scheduled: cdsp-trigger.service (in {trigger_delay}s)")
+
+    # Services to restart immediately (cdsp-remote last since it kills this script)
     services = [
         'camilladsp.service',
         'camillagui.service',
         'cdsp-motu-sync.service',
         'cdsp-source-switcher.service',
-        'cdsp-remote.service',
+        'cdsp-remote.service',  # Must be last - restarts this script
     ]
-
-    # Service that controls the relay - restart last with delay
-    trigger_service = 'cdsp-trigger.service'
-    trigger_delay = 5  # seconds to wait for amplifiers to fully power down
 
     print("Restarting services...")
     for service in services:
@@ -216,27 +228,6 @@ def restart_services():
             print(f"  Timeout: {service}")
         except Exception as e:
             print(f"  Error restarting {service}: {e}")
-
-    # Restart trigger service last with delay for amplifier power-down
-    print(f"  Waiting {trigger_delay}s for amplifiers to power down...")
-    time.sleep(trigger_delay)
-    try:
-        result = subprocess.run(
-            ['sudo', 'systemctl', 'restart', trigger_service],
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        if result.returncode == 0:
-            print(f"  Restarted: {trigger_service}")
-        else:
-            print(f"  Skipped: {trigger_service} (not available or failed)")
-    except subprocess.TimeoutExpired:
-        print(f"  Timeout: {trigger_service}")
-    except Exception as e:
-        print(f"  Error restarting {trigger_service}: {e}")
-
-    print("Service restart complete.")
 
 
 # ====================== EVENT HANDLING ======================
