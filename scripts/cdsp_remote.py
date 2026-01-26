@@ -189,18 +189,23 @@ def restart_services():
     background process survives to restart the trigger).
     """
     # Delay before restarting trigger (allows amplifiers to power down)
-    trigger_delay = 5
+    trigger_delay = 8
 
     # Use systemd-run to create a transient timer that restarts trigger after delay
-    # This is more reliable than nohup+sudo as it runs as a proper systemd unit
+    # Use timestamp in unit name to avoid conflicts with previous runs
+    unit_name = f'cdsp-trigger-restart-{int(time.time())}'
     try:
-        subprocess.run(
+        result = subprocess.run(
             ['sudo', 'systemd-run', '--no-block', f'--on-active={trigger_delay}',
-             '--unit=cdsp-trigger-restart', 'systemctl', 'restart', 'cdsp-trigger.service'],
+             f'--unit={unit_name}', 'systemctl', 'restart', 'cdsp-trigger.service'],
             capture_output=True,
+            text=True,
             timeout=5
         )
-        print(f"  Scheduled: cdsp-trigger.service (in {trigger_delay}s)")
+        if result.returncode == 0:
+            print(f"  Scheduled: cdsp-trigger.service (in {trigger_delay}s)")
+        else:
+            print(f"  Warning: systemd-run failed: {result.stderr}")
     except Exception as e:
         print(f"  Warning: Could not schedule trigger restart: {e}")
 
