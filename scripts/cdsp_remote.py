@@ -197,7 +197,7 @@ def restart_services():
 
     # Service that controls the relay - restart last with delay
     trigger_service = 'cdsp-trigger.service'
-    trigger_delay = 8  # seconds to wait for amplifiers to fully power down
+    trigger_delay = 5  # seconds to wait for amplifiers to fully power down
 
     print("Restarting services...")
     for service in services:
