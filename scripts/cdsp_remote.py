@@ -189,7 +189,7 @@ def restart_services():
     background process survives to restart the trigger).
     """
     # Delay before restarting trigger (allows amplifiers to power down)
-    trigger_delay = 1
+    trigger_delay = 0.01
 
     # Use systemd-run to create a transient timer that restarts trigger after delay
     # Use timestamp in unit name to avoid conflicts with previous runs
