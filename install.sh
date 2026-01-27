@@ -49,14 +49,14 @@ create_unit() {
   cat > "$HOME/${sysname}.service" <<EOL
 [Unit]
 Description=CamillaDSP $name
-After=default.target
+After=default.target camilladsp.service
 [Service]
 User=$USER
 Type=simple
 WorkingDirectory=/home/$USER
 ExecStart=$exec
-#Restart=always
-#RestartSec=10
+Restart=always
+RestartSec=10
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=$sysname
