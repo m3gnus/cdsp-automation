@@ -188,34 +188,18 @@ def restart_services():
     cdsp-remote is restarted last (which kills this script, but the
     background process survives to restart the trigger).
     """
-    # Delay before restarting trigger (allows amplifiers to power down)
-    trigger_delay = 1
-
-    # Use systemd-run to create a transient timer that restarts trigger after delay
-    # Use timestamp in unit name to avoid conflicts with previous runs
-    unit_name = f'cdsp-trigger-restart-{int(time.time())}'
-    try:
-        result = subprocess.run(
-            ['sudo', 'systemd-run', '--no-block', f'--on-active={trigger_delay}',
-             f'--unit={unit_name}', 'systemctl', 'restart', 'cdsp-trigger.service'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            print(f"  Scheduled: cdsp-trigger.service (in {trigger_delay}s)")
-        else:
-            print(f"  Warning: systemd-run failed: {result.stderr}")
-    except Exception as e:
-        print(f"  Warning: Could not schedule trigger restart: {e}")
+    # Delay before restarting trigger (allows amplifiers to power down).
+    # This delay is relative to when CamillaDSP finishes restarting,
+    # ensuring CamillaDSP is ready before the trigger reconnects.
+    trigger_delay = 3
 
     # Services to restart immediately (cdsp-remote last since it kills this script)
+    # cdsp-trigger is handled separately below via systemd-run with a delay
     services = [
         'camilladsp.service',
         'camillagui.service',
         'cdsp-motu-sync.service',
         'cdsp-source-switcher.service',
-        'cdsp-remote.service',  # Must be last - restarts this script
     ]
 
     print("Restarting services...")
@@ -235,6 +219,41 @@ def restart_services():
             print(f"  Timeout: {service}")
         except Exception as e:
             print(f"  Error restarting {service}: {e}")
+
+    # Schedule trigger restart AFTER CamillaDSP has been restarted,
+    # with a delay to allow CamillaDSP to finish starting and amps to power down
+    unit_name = f'cdsp-trigger-restart-{int(time.time())}'
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemd-run', '--no-block', f'--on-active={trigger_delay}',
+             f'--unit={unit_name}', 'systemctl', 'restart', 'cdsp-trigger.service'],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            print(f"  Scheduled: cdsp-trigger.service (in {trigger_delay}s)")
+        else:
+            print(f"  Warning: systemd-run failed: {result.stderr}")
+    except Exception as e:
+        print(f"  Warning: Could not schedule trigger restart: {e}")
+
+    # Restart cdsp-remote last - this kills the current script
+    try:
+        result = subprocess.run(
+            ['sudo', 'systemctl', 'restart', 'cdsp-remote.service'],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode == 0:
+            print(f"  Restarted: cdsp-remote.service")
+        else:
+            print(f"  Skipped: cdsp-remote.service (not available or failed)")
+    except subprocess.TimeoutExpired:
+        print(f"  Timeout: cdsp-remote.service")
+    except Exception as e:
+        print(f"  Error restarting cdsp-remote.service: {e}")
 
 
 # ====================== EVENT HANDLING ======================
