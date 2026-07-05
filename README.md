@@ -115,21 +115,16 @@ The installer will prompt you to enter this name during installation.
 
 ### Configuration
 
-Edit `~/camilladsp/scripts/cdsp_remote.py`:
+User settings live in `~/camilladsp/cdsp-automation.env` and are preserved when you update the scripts. Common remote settings:
 
-```python
-# Remote device name
-REMOTE_NAME = "HID Remote01 Keyboard"
-
-# Tone limits (in dB)
-TONE_MIN = -6
-TONE_MAX = 6
-TONE_STEP = 0.5  # Increment per button press
-
-# Volume limits (in dB)
-VOLUME_MIN = -80
-VOLUME_MAX = 0
-VOLUME_STEP = 1  # Increment per button press
+```text
+REMOTE_NAME=HID Remote01 Keyboard
+REMOTE_TONE_MIN=-6
+REMOTE_TONE_MAX=6
+REMOTE_TONE_STEP=0.5
+REMOTE_VOLUME_MIN=-80
+REMOTE_VOLUME_MAX=0
+REMOTE_VOLUME_STEP=1
 ```
 
 ### CamillaDSP Filter Requirements
@@ -160,7 +155,7 @@ filters:
 
 ### What It Does
 
-Automatically powers your amplifier on/off via a 12V trigger signal based on audio activity.
+Automatically powers your amplifier on/off by sending the Pi's switched 5V signal into an amplifier trigger input.
 
 ### Hardware Requirements
 
@@ -206,12 +201,13 @@ Automatically powers your amplifier on/off via a 12V trigger signal based on aud
 
 ### Configuration
 
-Edit `~/camilladsp/scripts/trigger.py`:
+Edit `~/camilladsp/cdsp-automation.env`:
 
-```python
-PowerGpio = 4              # GPIO pin number (change if using different pin)
-delay_time = 320           # Seconds of silence before turning off (320 = 5min 20sec)
-check_interval = 0.2       # How often to check audio (0.2 = 200ms)
+```text
+POWER_GPIO=4
+TRIGGER_DELAY_SECONDS=320
+TRIGGER_CHECK_INTERVAL=0.2
+TRIGGER_AUDIO_THRESHOLD_DB=-80
 ```
 
 ### How It Works
@@ -251,10 +247,11 @@ The installer will prompt for your MOTU's IP address. To find it:
 2. Go to **Settings → About**
 3. Note the IP address
 
-To change the IP later, edit `~/camilladsp/scripts/clock_sync.py`:
+To change the IP later, edit `~/camilladsp/cdsp-automation.env`:
 
-```python
-MOTU_WS_URL = "ws://YOUR_MOTU_IP:1280"
+```text
+MOTU_WS_URL=ws://YOUR_MOTU_IP:1280
+MOTU_OPTICAL_RATE=48000
 ```
 
 ### Important Note on Sample Rates
@@ -263,14 +260,8 @@ This script assumes:
 - **TOSLINK input = 48kHz** (TVs, game consoles, streaming devices typically use 48kHz)
 - **Other inputs = different rates** (44.1kHz for CD quality, 96kHz for high-res, etc.)
 
-If your setup is different, modify the logic in `clock_sync.py`:
+If your setup uses a different optical sample rate, change `MOTU_OPTICAL_RATE` in `~/camilladsp/cdsp-automation.env`.
 
-```python
-if current_rate == 48000:
-    set_motu_clock("optical")
-else:
-    set_motu_clock("internal")
-```
 
 ---
 
@@ -313,20 +304,20 @@ Automatically switches between CamillaDSP configs based on which audio source is
 
 ### Configuration
 
-Edit `~/camilladsp/scripts/source_switcher.py`:
+Edit `~/camilladsp/cdsp-automation.env`:
 
-```python
-IDLE_TIMEOUT = 60          # Seconds of silence before switching sources
-RMS_DELTA_EPS = 0.1        # How sensitive to audio changes (lower = more sensitive)
-DEBUG_MODE = False         # Set to True to see detailed logging
+```text
+SOURCE_IDLE_TIMEOUT=60
+SOURCE_AUDIO_THRESHOLD_DB=-80
+SOURCE_DEBUG=false
 ```
 
 ### Debugging
 
 Enable debug mode to see what the switcher is doing:
 
-```python
-DEBUG_MODE = True
+```text
+SOURCE_DEBUG=true
 ```
 
 Then watch the logs:
@@ -339,8 +330,8 @@ You'll see output like:
 
 ```
 DEBUG: Streamer HW=True, Gadget HW=False, Last=streamer, ST=0, GT=0
-→ Streamer: Audio active
-→ Streamer: Idle 5/60s
+-> Streamer: audio active
+-> Streamer: idle 5/60s
 ```
 
 ---
@@ -365,6 +356,7 @@ The installer menu provides these options:
 - `~/camilladsp/scripts/` - Python scripts
 - `~/camilladsp/configs/` - CamillaDSP config files (you must create these)
 - `~/camilladsp/.venv/` - Python virtual environment
+- `~/camilladsp/cdsp-automation.env` - User settings preserved across script updates
 
 **System services:**
 - `cdsp-trigger.service`
@@ -377,6 +369,7 @@ The installer menu provides these options:
 - `pycamilladsp` (Python package)
 - `evdev` (Python package)
 - `python3-rpi-lgpio` (system package)
+- `alsa-utils`, `bluez`, `wget`, `python3-venv` (system packages)
 
 ---
 
@@ -442,7 +435,7 @@ Your remote should appear in the list. If not:
 
 **Check if the device name matches:**
 
-The name in the script must exactly match what appears in the device list. Edit `~/camilladsp/scripts/cdsp_remote.py` if needed.
+The `REMOTE_NAME` value in `~/camilladsp/cdsp-automation.env` must exactly match what appears in the device list.
 
 **Test remote input:**
 
@@ -525,10 +518,10 @@ The hex payloads may be different. You'll need to capture them from your MOTU's 
 
 **Enable debug mode:**
 
-Edit `~/camilladsp/scripts/source_switcher.py`:
+Edit `~/camilladsp/cdsp-automation.env`:
 
-```python
-DEBUG_MODE = True
+```text
+SOURCE_DEBUG=true
 ```
 
 Restart service:

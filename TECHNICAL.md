@@ -21,16 +21,16 @@ Automatically turns on a GPIO pin when music is playing and turns it off after 5
 
 ### How it works (detailed):
 
-The script continuously monitors CamillaDSP's capture RMS levels every 200ms. When any channel shows activity (RMS > -999dB), it immediately sets GPIO pin 4 HIGH. When silence is detected, it starts a 320-second countdown timer. Only if silence persists for the full duration does it set the pin LOW.
+The script continuously monitors CamillaDSP's capture RMS levels every 200ms by default. When any channel is above the configured activity threshold (`TRIGGER_AUDIO_THRESHOLD_DB`, default `-80` dB), it immediately sets GPIO pin 4 HIGH. When silence is detected, it starts a 320-second countdown timer. Only if silence persists for the full duration does it set the pin LOW.
 
 **Why this approach:**
 
 - **200ms polling interval** - Fast enough to catch audio immediately, but not so frequent it wastes CPU
 - **320-second timeout** - Long enough to handle natural gaps in music (between tracks, quiet passages) without constantly cycling your amplifier on/off, which could cause pops or reduce component life
-- **RMS threshold of -999dB** - This is CamillaDSP's indicator for "no signal," making it reliable even with various audio levels
+- **Configurable RMS threshold** - Defaults to `-80` dB, avoiding a hard dependency on sentinel values and keeping quiet-but-real audio detectable
 - **Uses lgpio** - The modern GPIO library that works with current Raspberry Pi OS versions (RPi.GPIO is deprecated)
 
-**Practical use:** Connect a 5V relay module to GPIO 4 and ground. Use the relay's normally-open contacts to control your amplifier's 12V trigger input or power circuit.
+**Practical use:** Connect a 5V relay module to GPIO 4 and ground. Use the relay's normally-open contacts to send the Pi's 5V output to an amplifier trigger input that accepts it.
 
 ---
 
@@ -78,7 +78,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **Two-phase detection** - First checks if hardware is "ready" (device connected/active), then uses RMS levels to detect actual audio playback. This prevents switching to a connected-but-silent device
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from your current source just because of a quiet passage or pause button
-- **RMS delta threshold** - Checking if RMS *changes* (not just absolute level) reliably detects active audio even at low volumes, while ignoring noise floor
+- **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
 
 **Priority logic explained:**
@@ -142,7 +142,7 @@ Holding the power button for ~1 second restarts all CamillaDSP-related services:
 - cdsp-motu-sync.service
 - cdsp-source-switcher.service
 - cdsp-remote.service
-- cdsp-trigger.service (delayed by 1 second to allow amplifiers to power cycle properly)
+- cdsp-trigger.service (delayed by 3 seconds by default to allow amplifiers to power cycle properly)
 
 The trigger service restart uses `systemd-run` to create a transient timer that survives the cdsp-remote service restart. This ensures proper sequencing even though the restart command kills the script itself.
 
@@ -156,7 +156,7 @@ After pairing a Bluetooth remote, find its device name:
 python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
 ```
 
-The script searches for the configured `REMOTE_NAME` and waits if it's not found (useful for remotes that auto-sleep).
+The script searches for the configured `REMOTE_NAME` from `~/camilladsp/cdsp-automation.env` and waits if it's not found (useful for remotes that auto-sleep).
 
 **CamillaDSP requirements:**
 
@@ -187,7 +187,7 @@ filters:
 All four utilities run as systemd services with these benefits:
 
 - **Auto-start on boot** - No need to manually launch them
-- **Automatic restart** - If a script crashes, systemd brings it back up within 1 second
+- **Automatic restart** - If a script crashes, systemd brings it back up after `RestartSec=2`
 - **Dependency management** - They won't start until CamillaDSP is running
 - **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-motu-sync`, `-source-switcher`, `-remote`)
 - **Easy control** - Standard `systemctl start/stop/restart` commands
@@ -196,10 +196,10 @@ All four utilities run as systemd services with these benefits:
 
 ## Debug Mode
 
-The Source Switcher includes a `DEBUG_MODE` flag. Set it to `True` in the script to see detailed output:
+The Source Switcher includes a `SOURCE_DEBUG` setting. Set it in `~/camilladsp/cdsp-automation.env` to see detailed output:
 
-```python
-DEBUG_MODE = True  # In source_switcher.py
+```text
+SOURCE_DEBUG=true
 ```
 
 This shows real-time status of hardware detection, timers, and switching decisions - helpful for troubleshooting or understanding the logic.

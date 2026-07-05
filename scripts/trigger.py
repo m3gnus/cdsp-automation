@@ -1,56 +1,89 @@
+#!/usr/bin/env python3
+"""GPIO trigger output controlled by CamillaDSP capture RMS levels."""
+
+from __future__ import annotations
+
 import asyncio
-import time
+import os
+import signal
+
 import RPi.GPIO as GPIO
 from camilladsp import CamillaClient
 
-PowerGpio = 4
 
-# GPIO setup
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(PowerGpio, GPIO.OUT, initial=GPIO.LOW)  # Relay off initially
+POWER_GPIO = int(os.environ.get("POWER_GPIO", "4"))
+CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
+CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
+DELAY_TIME = float(os.environ.get("TRIGGER_DELAY_SECONDS", "320"))
+CHECK_INTERVAL = float(os.environ.get("TRIGGER_CHECK_INTERVAL", "0.2"))
+AUDIO_THRESHOLD_DB = float(os.environ.get("TRIGGER_AUDIO_THRESHOLD_DB", "-80"))
 
-# CamillaDSP connection settings
-CAMILLA_IP = "127.0.0.1"
-CAMILLA_PORT = 1234
 
-delay_time = 320          # seconds to wait before turning relay off after music stops
-check_interval = 0.2     # check every 200 ms
+def music_is_playing(rms_levels: object) -> bool:
+    if not isinstance(rms_levels, (list, tuple)):
+        return False
+    return any(
+        isinstance(level, (int, float)) and level > AUDIO_THRESHOLD_DB
+        for level in rms_levels
+    )
 
-async def relay_control():
+
+async def relay_control(stop: asyncio.Event) -> None:
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
-    counter = 0
+    silence_seconds = 0.0
+    relay_on = False
 
-    while True:
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(POWER_GPIO, GPIO.OUT, initial=GPIO.LOW)
+
+    try:
+        while not stop.is_set():
+            try:
+                if not cdsp.is_connected():
+                    cdsp.connect()
+                    print("Connected to CamillaDSP", flush=True)
+
+                if music_is_playing(cdsp.levels.capture_rms()):
+                    silence_seconds = 0.0
+                    if not relay_on:
+                        GPIO.output(POWER_GPIO, GPIO.HIGH)
+                        relay_on = True
+                        print("Music playing - relay ON", flush=True)
+                elif relay_on:
+                    silence_seconds += CHECK_INTERVAL
+                    if silence_seconds >= DELAY_TIME:
+                        GPIO.output(POWER_GPIO, GPIO.LOW)
+                        relay_on = False
+                        silence_seconds = 0.0
+                        print("No music - relay OFF", flush=True)
+            except Exception as exc:
+                print(f"Error: {exc}", flush=True)
+                await asyncio.sleep(2)
+                continue
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=CHECK_INTERVAL)
+            except asyncio.TimeoutError:
+                pass
+    finally:
         try:
-            if not cdsp.is_connected():
-                cdsp.connect()
-                print("Connected to CamillaDSP")
+            GPIO.output(POWER_GPIO, GPIO.LOW)
+        finally:
+            GPIO.cleanup()
 
-            rms_levels = cdsp.levels.capture_rms()
-            music_playing = any(level > -999 for level in rms_levels)
 
-            if music_playing:
-                GPIO.output(PowerGpio, GPIO.HIGH)
-                counter = 0
-                print("Music playing - Relay ON")
-            else:
-                if GPIO.input(PowerGpio) == GPIO.HIGH:
-                    counter += check_interval
-                    if counter >= delay_time:
-                        GPIO.output(PowerGpio, GPIO.LOW)
-                        print("No music - Relay OFF")
-                        counter = 0
-        except Exception as e:
-            print(f"Error: {e}")
-            time.sleep(2)
-            continue
+async def main() -> int:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(signum, stop.set)
+        except NotImplementedError:
+            signal.signal(signum, lambda _sig, _frame: stop.set())
 
-        await asyncio.sleep(check_interval)
+    await relay_control(stop)
+    return 0
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(relay_control())
-    except KeyboardInterrupt:
-        print("Interrupted, cleaning up GPIO")
-    finally:
-        GPIO.cleanup()
+    raise SystemExit(asyncio.run(main()))
