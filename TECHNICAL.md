@@ -61,7 +61,7 @@ The script polls CamillaDSP's active configuration every second to read the curr
 
 ### What it does (simple):
 
-Automatically switches between three CamillaDSP configs based on which audio source is active. Priority: AirPlay Streamer → USB Gadget → TOSLINK (fallback).
+Automatically switches between CamillaDSP configs based on which audio source is active. Priority: manual override → AirPlay Streamer → USB Gadget → TOSLINK meter detection → optional analog meter detection.
 
 ### How it works (detailed):
 
@@ -69,7 +69,9 @@ The script checks multiple hardware indicators every second:
 
 1. **AirPlay/Streamer**: Reads `/proc/asound/Loopback/pcm*/sub*/status` to see if ALSA Loopback is in RUNNING state
 2. **USB Gadget**: Executes `amixer` to check if UAC2Gadget's capture rate is non-zero (indicating a connected USB host)
-3. **RMS monitoring**: After switching configs, it monitors RMS levels to detect actual audio activity vs. hardware just being "ready"
+3. **TOSLINK**: Reads passive MOTU UltraLite mk5 meter frames over the CueMix WebSocket and watches the configured optical input meter pairs
+4. **Analog**: Optionally reads MOTU meter pairs for analog inputs; disabled by default until the input mapping is verified
+5. **RMS monitoring**: After switching streamer or gadget configs, it monitors RMS levels to detect actual audio activity vs. hardware just being "ready"
 
 When a higher-priority source becomes active, it immediately switches configs. When a source goes silent, it waits 60 seconds before considering lower-priority sources, preventing rapid switching during track changes or brief pauses.
 
@@ -77,9 +79,12 @@ When a higher-priority source becomes active, it immediately switches configs. W
 
 - **Manual override first** - If `SOURCE_OVERRIDE_PATH` contains `toslink`, `streamer`, `gadget`, or `analog`, the switcher pins that config and skips automatic arbitration until the override is cleared or set to `auto`.
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
+- **MOTU meter detection** - TOSLINK is detected from live MOTU input meter frames instead of being treated as always active
 - **Two-phase detection** - First checks if hardware is "ready" (device connected/active), then uses RMS levels to detect actual audio playback. This prevents switching to a connected-but-silent device
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from your current source just because of a quiet passage or pause button
+- **Fast lower-priority handoff** - If streamer or gadget is silent while TOSLINK/analog MOTU meters are active, `SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` lets the switcher fall through sooner than the normal track-gap timeout.
 - **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
+- **Keep-last idle behavior** - When all sources are idle, the default is to leave the current config alone. Set `SOURCE_IDLE_MODE=toslink` to restore the older always-fallback behavior.
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
 
 **Priority logic explained:**
@@ -87,13 +92,18 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **Manual override** - Used for sources that are hard to auto-detect, such as analog input. The override file is transient by default under `/run`.
 - **Priority 1: Streamer** - Assumes AirPlay/network streaming is your primary source. When you start casting from your phone, it takes over immediately
 - **Priority 2: USB Gadget** - Direct USB connection (phone, laptop) is secondary. Useful when you plug in directly but don't want to interrupt if streaming is active
-- **Priority 3: TOSLINK** - Optical input is the fallback. Always available, so it's what you'll hear when nothing else is playing
+- **Priority 3: TOSLINK** - Optical input becomes active when configured MOTU meter pairs show signal
+- **Priority 4: Analog** - Optional, disabled by default. Enable only after confirming the correct MOTU meter pairs for the analog input channels
 
 **Config requirements:** You need to create three config files:
 
 - `toslink.yml` - Configured for optical input
 - `streamer.yml` - Configured for ALSA Loopback (from Squeezelite/AirPlay)
 - `gadget.yml` - Configured for USB Gadget (Pi Zero as USB sound card)
+
+Optional configs:
+
+- `analog.yml` - Configured for analog inputs, selectable manually or by setting `SOURCE_ANALOG_MOTU_METERS=true`
 
 ---
 

@@ -25,6 +25,7 @@ Before installing, ensure you have:
   - `~/camilladsp/configs/toslink.yml` - Must be configured for 48kHz
   - `~/camilladsp/configs/streamer.yml` - For AirPlay/network streaming
   - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
+- Optional `~/camilladsp/configs/analog.yml` for manual or meter-based analog input
 - **IMPORTANT:** Only the TOSLINK config should use 48kHz sample rate. Other configs must use different rates (e.g., 44.1kHz, 96kHz)
 
 **For Remote Control:**
@@ -275,7 +276,12 @@ Automatically switches between CamillaDSP configs based on which audio source is
 1. **Manual override** - optional pinned source selected by writing to `SOURCE_OVERRIDE_PATH`
 2. **Streamer** (AirPlay/network streaming) - highest automatic priority
 3. **USB Gadget** (direct USB connection) - middle priority
-4. **TOSLINK** (optical input) - fallback/default
+4. **TOSLINK** (optical input) - detected from MOTU input meters
+5. **Analog** (optional) - disabled by default; can be enabled for MOTU input meters
+
+When no automatic source is active, the default behavior is to keep the current
+config instead of forcing TOSLINK. Set `SOURCE_IDLE_MODE=toslink` if you prefer
+the older fallback behavior.
 
 ### Critical Configuration Requirements
 
@@ -295,7 +301,7 @@ Automatically switches between CamillaDSP configs based on which audio source is
 
 Optional manual-only configs can also be selected through the override file. For example,
 `~/camilladsp/configs/analog.yml` can be pinned manually even though analog is not
-auto-detected.
+auto-detected by default.
 
 **Why different sample rates?** The MOTU Clock Sync utility uses sample rate to determine which clock source to use. If all configs use the same rate, clock switching won't work correctly.
 
@@ -305,7 +311,13 @@ auto-detected.
 2. Switches to that source's config
 3. Monitors actual audio playback via RMS levels
 4. Waits 60 seconds of silence before switching to lower priority source
-5. Falls back to TOSLINK when no other source is active
+5. Uses passive MOTU meter frames to detect TOSLINK activity
+6. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
+
+If a lower-priority MOTU meter source is already active, the switcher uses
+`SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` to leave a silent higher-priority source
+faster than the normal track-gap timeout. The default is immediate handoff after
+the lower source has passed its own activity debounce.
 
 ### Configuration
 
@@ -313,8 +325,14 @@ Edit `~/camilladsp/cdsp-automation.env`:
 
 ```text
 SOURCE_IDLE_TIMEOUT=60
+SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
 SOURCE_AUDIO_THRESHOLD_DB=-80
 SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
+SOURCE_TOSLINK_MOTU_METERS=true
+SOURCE_ANALOG_MOTU_METERS=false
+SOURCE_IDLE_MODE=keep-last
+SOURCE_TOSLINK_METER_PAIRS=12,13
+SOURCE_ANALOG_METER_PAIRS=16,18
 SOURCE_DEBUG=false
 ```
 
@@ -339,7 +357,7 @@ journalctl -u cdsp-source-switcher -f
 You'll see output like:
 
 ```
-DEBUG: Streamer HW=True, Gadget HW=False, Last=streamer, ST=0, GT=0
+DEBUG: Streamer HW=True, Gadget HW=False, TOSLINK meter=False/0/5, Analog meter=False/0/30, Last=streamer, ST=0, GT=0
 -> Streamer: audio active
 -> Streamer: idle 5/60s
 ```
@@ -581,6 +599,12 @@ For USB Gadget:
 ```bash
 amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
 # Should show non-zero rate when USB host connected
+```
+
+For TOSLINK meter detection, check that the MOTU WebSocket is reachable:
+
+```bash
+journalctl -u cdsp-source-switcher -n 100 | grep "MOTU meters"
 ```
 
 ---
