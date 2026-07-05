@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import glob
 import os
 import subprocess
@@ -65,6 +66,8 @@ STREAMER_CFG = os.path.join(CONFIG_DIR, "streamer.yml")
 GADGET_CFG = os.path.join(CONFIG_DIR, "gadget.yml")
 ANALOG_CFG = os.path.join(CONFIG_DIR, "analog.yml")
 SOURCE_OVERRIDE_PATH = os.environ.get("SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source")
+WLED_ENV_PATH = os.environ.get("WLED_REACTIVE_ENV", "/etc/default/wled-music-reactive")
+DELAY_REAPPLY_SECONDS = float(os.environ.get("SOURCE_DELAY_REAPPLY_SECONDS", "5.0"))
 
 CONFIGS = {
     "toslink": TOSLINK_CFG,
@@ -257,6 +260,130 @@ def read_manual_source() -> str | None:
     return source
 
 
+# --- WLED light-sync delay ownership -------------------------------------
+# The WLED music-reactive controller used to inject this Delay filter into the
+# live CamillaDSP config every few seconds, racing this switcher's reloads
+# (every source switch dropped the filter for up to 5s, and the two writers
+# could clobber each other). The switcher is the SOLE writer of the config, so
+# it now owns the filter: it re-asserts it on every config apply and
+# periodically, with no second writer to race. Delay parameters are read from
+# the WLED env file so the control-UI "sync" sliders keep working unchanged.
+
+def read_wled_delay_settings() -> tuple[bool, float, str]:
+    enabled, delay_ms, name = True, 50.0, "wled_light_sync_delay"
+    try:
+        with open(WLED_ENV_PATH, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key, value = key.strip(), value.strip()
+                if key == "CAMILLA_DELAY_ENABLED":
+                    enabled = value.lower() in {"1", "true", "yes", "on"}
+                elif key == "CAMILLA_DELAY_MS":
+                    try:
+                        delay_ms = float(value)
+                    except ValueError:
+                        pass
+                elif key == "CAMILLA_DELAY_FILTER_NAME" and value:
+                    name = value
+    except FileNotFoundError:
+        pass
+    return enabled, delay_ms, name
+
+
+def _delay_channels(config: dict) -> list:
+    capture = config.get("devices", {}).get("capture", {})
+    channels = int(capture.get("channels") or 2)
+    return list(range(max(1, channels)))
+
+
+def _remove_delay(config: dict, name: str) -> tuple:
+    changed = False
+    new_config = copy.deepcopy(config)
+    filters = new_config.get("filters", {})
+    if name in filters:
+        del filters[name]
+        changed = True
+    pipeline = []
+    for step in new_config.get("pipeline", []):
+        names = step.get("names")
+        if isinstance(names, list) and name in names:
+            remaining = [n for n in names if n != name]
+            if remaining:
+                next_step = copy.deepcopy(step)
+                next_step["names"] = remaining
+                pipeline.append(next_step)
+            changed = True
+        else:
+            pipeline.append(step)
+    new_config["pipeline"] = pipeline
+    return new_config, changed
+
+
+def _has_requested_delay(config: dict, name: str, delay_ms: float) -> bool:
+    delay_filter = config.get("filters", {}).get(name)
+    if not delay_filter or delay_filter.get("type") != "Delay":
+        return False
+    params = delay_filter.get("parameters", {})
+    try:
+        delay_matches = abs(float(params.get("delay")) - delay_ms) < 0.001
+    except (TypeError, ValueError):
+        delay_matches = False
+    if not delay_matches or params.get("unit") != "ms":
+        return False
+    expected_channels = _delay_channels(config)
+    for step in config.get("pipeline", []):
+        names = step.get("names")
+        if isinstance(names, list) and name in names:
+            return step.get("channels") == expected_channels
+    return False
+
+
+def _add_delay(config: dict, name: str, delay_ms: float) -> dict:
+    new_config, _ = _remove_delay(config, name)
+    channels = _delay_channels(new_config)
+    filters = new_config.setdefault("filters", {})
+    filters[name] = {
+        "type": "Delay",
+        "parameters": {"delay": delay_ms, "unit": "ms", "subsample": False},
+    }
+    new_config.setdefault("pipeline", []).insert(
+        0,
+        {
+            "type": "Filter",
+            "channels": channels,
+            "names": [name],
+            "description": "WLED light sync delay (owned by source switcher)",
+            "bypassed": False,
+        },
+    )
+    return new_config
+
+
+def ensure_delay_filter(cdsp: CamillaClient) -> None:
+    """Make the live config's WLED sync-delay filter match the WLED env.
+
+    Idempotent: only calls set_active when the filter is missing/wrong (add) or
+    present-but-disabled (remove), so steady state performs no writes.
+    """
+    enabled, delay_ms, name = read_wled_delay_settings()
+    config = cdsp.config.active()
+    if not config:
+        return
+    if enabled:
+        if _has_requested_delay(config, name, delay_ms):
+            return
+        cdsp.config.set_active(_add_delay(config, name, delay_ms))
+        print(f"WLED light-sync delay applied: {delay_ms:.1f}ms", flush=True)
+    else:
+        new_config, changed = _remove_delay(config, name)
+        if changed:
+            cdsp.config.set_active(new_config)
+            print("WLED light-sync delay removed (disabled)", flush=True)
+
+
 def apply_config(cdsp: CamillaClient, file_path: str, settle_time: float = SETTLE_TIME) -> None:
     """Apply a CamillaDSP config file and wait for hardware to settle."""
     if not os.path.exists(file_path):
@@ -266,6 +393,11 @@ def apply_config(cdsp: CamillaClient, file_path: str, settle_time: float = SETTL
     cdsp.config.set_file_path(file_path)
     cdsp.general.reload()
     time.sleep(settle_time)
+    # Re-assert the WLED sync-delay immediately so there is no post-switch gap.
+    try:
+        ensure_delay_filter(cdsp)
+    except Exception as exc:
+        print(f"WLED delay ensure (post-switch) failed: {exc}", flush=True)
 
 
 def log_idle(source: str, seconds: float) -> None:
@@ -294,12 +426,23 @@ def main() -> int:
     last_manual_error = None
     error_log_deadline = 0.0
     last_error_message = None
+    next_delay_check = 0.0
 
     while True:
         try:
             if not cdsp.is_connected():
                 cdsp.connect()
                 print("Connected to CamillaDSP", flush=True)
+
+            # Own the WLED light-sync delay filter: re-assert periodically so it
+            # self-heals and picks up UI changes to CAMILLA_DELAY_MS/ENABLED.
+            now = time.monotonic()
+            if now >= next_delay_check:
+                next_delay_check = now + DELAY_REAPPLY_SECONDS
+                try:
+                    ensure_delay_filter(cdsp)
+                except Exception as exc:
+                    print(f"WLED delay ensure failed: {exc}", flush=True)
 
             current_config = cdsp.config.file_path()
             manual_source = read_manual_source()
