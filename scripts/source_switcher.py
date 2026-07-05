@@ -140,7 +140,10 @@ class MotuMeterReader:
                 self.log_error(f"MOTU meter read failed: {exc}")
                 break
 
-            payload = data.encode() if isinstance(data, str) else bytes(data or b"")
+            # MOTU meter frames are binary. A text frame here is never a valid
+            # meter payload; encoding it as UTF-8 would corrupt any byte >= 0x80
+            # (multi-byte), so decode 1:1 via latin-1 to preserve raw bytes.
+            payload = data.encode("latin-1") if isinstance(data, str) else bytes(data or b"")
             if len(payload) != 104 or payload[:4] != bytes.fromhex("17700000"):
                 continue
 
@@ -289,6 +292,8 @@ def main() -> int:
     analog_idle_timer = ANALOG_IDLE_SECONDS
     last_active_source = None
     last_manual_error = None
+    error_log_deadline = 0.0
+    last_error_message = None
 
     while True:
         try:
@@ -594,7 +599,15 @@ def main() -> int:
                 print(f"-> Idle: keeping {os.path.basename(current_config or '')}", flush=True)
 
         except Exception as exc:
-            print(f"Error: {exc}", flush=True)
+            # Throttle identical errors to once per 30s. A CamillaDSP outage
+            # otherwise floods the journal (~430 lines/incident observed) and
+            # wears the SD card; a newly-changed error still logs immediately.
+            message = str(exc)
+            now = time.monotonic()
+            if message != last_error_message or now >= error_log_deadline:
+                print(f"Error: {message}", flush=True)
+                last_error_message = message
+                error_log_deadline = now + 30.0
             time.sleep(2)
 
         time.sleep(CHECK_INTERVAL)
