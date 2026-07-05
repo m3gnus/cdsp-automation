@@ -272,9 +272,10 @@ If your setup uses a different optical sample rate, change `MOTU_OPTICAL_RATE` i
 Automatically switches between CamillaDSP configs based on which audio source is playing.
 
 **Priority order:**
-1. **Streamer** (AirPlay/network streaming) - highest priority
-2. **USB Gadget** (direct USB connection) - middle priority
-3. **TOSLINK** (optical input) - fallback/default
+1. **Manual override** - optional pinned source selected by writing to `SOURCE_OVERRIDE_PATH`
+2. **Streamer** (AirPlay/network streaming) - highest automatic priority
+3. **USB Gadget** (direct USB connection) - middle priority
+4. **TOSLINK** (optical input) - fallback/default
 
 ### Critical Configuration Requirements
 
@@ -291,6 +292,10 @@ Automatically switches between CamillaDSP configs based on which audio source is
 3. **`~/camilladsp/configs/gadget.yml`**
    - Configure for USB Gadget
    - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
+
+Optional manual-only configs can also be selected through the override file. For example,
+`~/camilladsp/configs/analog.yml` can be pinned manually even though analog is not
+auto-detected.
 
 **Why different sample rates?** The MOTU Clock Sync utility uses sample rate to determine which clock source to use. If all configs use the same rate, clock switching won't work correctly.
 
@@ -309,8 +314,13 @@ Edit `~/camilladsp/cdsp-automation.env`:
 ```text
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_AUDIO_THRESHOLD_DB=-80
+SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
 SOURCE_DEBUG=false
 ```
+
+To pin a source manually, write one of `toslink`, `streamer`, `gadget`, or `analog`
+to `SOURCE_OVERRIDE_PATH`. Remove the file, leave it empty, or write `auto` to return
+to automatic switching.
 
 ### Debugging
 

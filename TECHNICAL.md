@@ -75,6 +75,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 
 **Why this approach:**
 
+- **Manual override first** - If `SOURCE_OVERRIDE_PATH` contains `toslink`, `streamer`, `gadget`, or `analog`, the switcher pins that config and skips automatic arbitration until the override is cleared or set to `auto`.
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **Two-phase detection** - First checks if hardware is "ready" (device connected/active), then uses RMS levels to detect actual audio playback. This prevents switching to a connected-but-silent device
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from your current source just because of a quiet passage or pause button
@@ -83,6 +84,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 
 **Priority logic explained:**
 
+- **Manual override** - Used for sources that are hard to auto-detect, such as analog input. The override file is transient by default under `/run`.
 - **Priority 1: Streamer** - Assumes AirPlay/network streaming is your primary source. When you start casting from your phone, it takes over immediately
 - **Priority 2: USB Gadget** - Direct USB connection (phone, laptop) is secondary. Useful when you plug in directly but don't want to interrupt if streaming is active
 - **Priority 3: TOSLINK** - Optical input is the fallback. Always available, so it's what you'll hear when nothing else is playing

@@ -32,6 +32,15 @@ CONFIG_DIR = os.environ.get("CDSP_CONFIG_DIR", os.path.join(HOME, "camilladsp/co
 TOSLINK_CFG = os.path.join(CONFIG_DIR, "toslink.yml")
 STREAMER_CFG = os.path.join(CONFIG_DIR, "streamer.yml")
 GADGET_CFG = os.path.join(CONFIG_DIR, "gadget.yml")
+ANALOG_CFG = os.path.join(CONFIG_DIR, "analog.yml")
+SOURCE_OVERRIDE_PATH = os.environ.get("SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source")
+
+CONFIGS = {
+    "toslink": TOSLINK_CFG,
+    "streamer": STREAMER_CFG,
+    "gadget": GADGET_CFG,
+    "analog": ANALOG_CFG,
+}
 
 
 def is_alsa_active(card_name: str) -> bool:
@@ -89,6 +98,20 @@ def validate_configs() -> None:
         raise FileNotFoundError("Missing CamillaDSP config(s): " + ", ".join(missing))
 
 
+def read_manual_source() -> str | None:
+    try:
+        source = open(SOURCE_OVERRIDE_PATH, "r", encoding="utf-8").read().strip().lower()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        print(f"Could not read source override: {exc}", flush=True)
+        return None
+
+    if not source or source == "auto":
+        return None
+    return source
+
+
 def apply_config(cdsp: CamillaClient, file_path: str, settle_time: float = SETTLE_TIME) -> None:
     """Apply a CamillaDSP config file and wait for hardware to settle."""
     if not os.path.exists(file_path):
@@ -107,13 +130,14 @@ def log_idle(source: str, seconds: float) -> None:
 
 def main() -> int:
     print(">>> CamillaDSP Source Switcher Started <<<", flush=True)
-    print("Priority: 1) Streamer (AirPlay) -> 2) USB Gadget -> 3) TOSLINK", flush=True)
+    print("Priority: manual override -> 1) Streamer (AirPlay) -> 2) USB Gadget -> 3) TOSLINK", flush=True)
     validate_configs()
 
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
     streamer_silence_timer = 0.0
     gadget_silence_timer = 0.0
     last_active_source = None
+    last_manual_error = None
 
     while True:
         try:
@@ -122,6 +146,33 @@ def main() -> int:
                 print("Connected to CamillaDSP", flush=True)
 
             current_config = cdsp.config.file_path()
+            manual_source = read_manual_source()
+            if manual_source:
+                target = CONFIGS.get(manual_source)
+                if target is None:
+                    error = f"Unknown manual source override: {manual_source}"
+                    if error != last_manual_error:
+                        print(error, flush=True)
+                        last_manual_error = error
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                if not os.path.exists(target):
+                    error = f"Manual source config missing: {target}"
+                    if error != last_manual_error:
+                        print(error, flush=True)
+                        last_manual_error = error
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
+                last_manual_error = None
+                if not same_config(current_config, target):
+                    apply_config(cdsp, target)
+                    streamer_silence_timer = 0.0
+                    gadget_silence_timer = 0.0
+                    last_active_source = f"manual:{manual_source}"
+                time.sleep(CHECK_INTERVAL)
+                continue
+
             streamer_hw_active = is_alsa_active("Loopback")
             gadget_hw_available = is_gadget_available()
 
