@@ -17,6 +17,18 @@ from camilladsp import CamillaClient
 
 # ====================== CONFIGURATION ======================
 
+def resolve_binary(name: str, fallbacks: tuple[str, ...]) -> str:
+    found = shutil.which(name)
+    if found:
+        return found
+
+    for fallback in fallbacks:
+        if os.access(fallback, os.X_OK):
+            return fallback
+
+    return name
+
+
 REMOTE_NAME = os.environ.get("REMOTE_NAME", "HID Remote01 Keyboard")
 CDSP_HOST = os.environ.get("CDSP_HOST", "127.0.0.1")
 CDSP_PORT = int(os.environ.get("CDSP_PORT", "1234"))
@@ -34,9 +46,9 @@ RESTART_HOLD_SECONDS = float(os.environ.get("REMOTE_RESTART_HOLD_SECONDS", "1"))
 SHUTDOWN_HOLD_SECONDS = float(os.environ.get("REMOTE_SHUTDOWN_HOLD_SECONDS", "10"))
 TRIGGER_RESTART_DELAY_SECONDS = float(os.environ.get("REMOTE_TRIGGER_RESTART_DELAY_SECONDS", "3"))
 
-SYSTEMCTL_BIN = shutil.which("systemctl") or "systemctl"
-SYSTEMD_RUN_BIN = shutil.which("systemd-run") or "systemd-run"
-SHUTDOWN_BIN = shutil.which("shutdown") or "shutdown"
+SYSTEMCTL_BIN = resolve_binary("systemctl", ("/usr/bin/systemctl", "/bin/systemctl"))
+SYSTEMD_RUN_BIN = resolve_binary("systemd-run", ("/usr/bin/systemd-run", "/bin/systemd-run"))
+SHUTDOWN_BIN = resolve_binary("shutdown", ("/sbin/shutdown", "/usr/sbin/shutdown"))
 
 KEY_BINDINGS = {
     "VOLUMEDOWN": "KEY_VOLUMEDOWN",

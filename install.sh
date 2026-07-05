@@ -205,7 +205,19 @@ install_remote_sudoers() {
   local systemctl_bin systemd_run_bin shutdown_bin tmp
   systemctl_bin="$(command -v systemctl)"
   systemd_run_bin="$(command -v systemd-run)"
-  shutdown_bin="$(command -v shutdown)"
+  shutdown_bin="$(command -v shutdown || true)"
+  if [[ -z "$shutdown_bin" ]]; then
+    for candidate in /sbin/shutdown /usr/sbin/shutdown; do
+      if [[ -x "$candidate" ]]; then
+        shutdown_bin="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$shutdown_bin" ]]; then
+    echo "Could not find shutdown binary"
+    return 1
+  fi
   tmp="$(mktemp)"
 
   cat > "$tmp" <<EOF
