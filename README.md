@@ -274,10 +274,11 @@ Automatically switches between CamillaDSP configs based on which audio source is
 
 **Priority order:**
 1. **Manual override** - optional pinned source selected by writing to `SOURCE_OVERRIDE_PATH`
-2. **Streamer** (AirPlay/network streaming) - highest automatic priority
-3. **USB Gadget** (direct USB connection) - middle priority
-4. **TOSLINK** (optical input) - detected from MOTU input meters
-5. **Analog** (optional) - disabled by default; can be enabled for MOTU input meters
+2. **Current active source** - if the current source is still playing, it keeps control
+3. **Streamer** (AirPlay/network streaming) - first automatic choice when changing sources
+4. **USB Gadget** (direct USB connection)
+5. **TOSLINK** (optical input) - detected from MOTU input meters
+6. **Analog** (optional) - disabled by default; can be enabled for MOTU input meters
 
 When no automatic source is active, the default behavior is to keep the current
 config instead of forcing TOSLINK. Set `SOURCE_IDLE_MODE=toslink` if you prefer
@@ -310,9 +311,10 @@ auto-detected by default.
 1. Checks if hardware is active (device connected and ready)
 2. Switches to that source's config
 3. Monitors actual audio playback via RMS levels
-4. Waits 60 seconds of silence before switching to lower priority source
-5. Uses passive MOTU meter frames to detect TOSLINK activity
-6. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
+4. Keeps the current source while it is still playing
+5. Waits 60 seconds of silence before abandoning a higher-priority hardware source unless another meter-confirmed source is already active
+6. Uses passive MOTU meter frames to detect TOSLINK activity
+7. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
 
 If a lower-priority MOTU meter source is already active, the switcher uses
 `SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` to leave a silent higher-priority source

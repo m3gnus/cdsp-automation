@@ -61,7 +61,7 @@ The script polls CamillaDSP's active configuration every second to read the curr
 
 ### What it does (simple):
 
-Automatically switches between CamillaDSP configs based on which audio source is active. Priority: manual override → AirPlay Streamer → USB Gadget → TOSLINK meter detection → optional analog meter detection.
+Automatically switches between CamillaDSP configs based on which audio source is active. Priority: manual override → current active source → AirPlay Streamer → USB Gadget → TOSLINK meter detection → optional analog meter detection.
 
 ### How it works (detailed):
 
@@ -78,6 +78,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 **Why this approach:**
 
 - **Manual override first** - If `SOURCE_OVERRIDE_PATH` contains `toslink`, `streamer`, `gadget`, or `analog`, the switcher pins that config and skips automatic arbitration until the override is cleared or set to `auto`.
+- **Current source hold** - If the current source still has confirmed audio, it keeps control even if another source also appears active. The ordered priorities are used only when choosing a new source.
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **MOTU meter detection** - TOSLINK is detected from live MOTU input meter frames instead of being treated as always active
 - **Two-phase detection** - First checks if hardware is "ready" (device connected/active), then uses RMS levels to detect actual audio playback. This prevents switching to a connected-but-silent device
@@ -90,8 +91,9 @@ When a higher-priority source becomes active, it immediately switches configs. W
 **Priority logic explained:**
 
 - **Manual override** - Used for sources that are hard to auto-detect, such as analog input. The override file is transient by default under `/run`.
-- **Priority 1: Streamer** - Assumes AirPlay/network streaming is your primary source. When you start casting from your phone, it takes over immediately
-- **Priority 2: USB Gadget** - Direct USB connection (phone, laptop) is secondary. Useful when you plug in directly but don't want to interrupt if streaming is active
+- **Current active source** - The currently selected config keeps priority while its audio is still active
+- **Priority 1: Streamer** - First automatic choice when changing sources
+- **Priority 2: USB Gadget** - Direct USB connection (phone, laptop) is secondary
 - **Priority 3: TOSLINK** - Optical input becomes active when configured MOTU meter pairs show signal
 - **Priority 4: Analog** - Optional, disabled by default. Enable only after confirming the correct MOTU meter pairs for the analog input channels
 

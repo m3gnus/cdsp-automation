@@ -218,6 +218,13 @@ def same_config(current: str | None, target: str) -> bool:
     return os.path.abspath(current) == os.path.abspath(target)
 
 
+def source_for_config(current: str | None) -> str | None:
+    for source, target in CONFIGS.items():
+        if same_config(current, target):
+            return source
+    return None
+
+
 def audio_active(levels: object) -> bool:
     if not isinstance(levels, (list, tuple)):
         return False
@@ -266,7 +273,7 @@ def log_idle(source: str, seconds: float) -> None:
 def main() -> int:
     print(">>> CamillaDSP Source Switcher Started <<<", flush=True)
     print(
-        "Priority: manual override -> 1) Streamer (AirPlay) -> 2) USB Gadget "
+        "Priority: manual override -> active current source -> 1) Streamer (AirPlay) -> 2) USB Gadget "
         "-> 3) TOSLINK meters -> 4) Analog meters -> idle keep-last",
         flush=True,
     )
@@ -356,6 +363,7 @@ def main() -> int:
             lower_priority_meter_available = toslink_available or analog_available
             streamer_hw_active = is_alsa_active("Loopback")
             gadget_hw_available = is_gadget_available()
+            current_source = source_for_config(current_config)
 
             if DEBUG_MODE:
                 print(
@@ -365,14 +373,122 @@ def main() -> int:
                     f"TOSLINK meter={toslink_meter_active}/{toslink_active_timer:g}/{toslink_idle_timer:g}, "
                     f"Analog meter={analog_meter_active}/{analog_active_timer:g}/{analog_idle_timer:g}, "
                     f"Last={last_active_source}, "
+                    f"Current={current_source}, "
                     f"ST={streamer_silence_timer:g}, "
                     f"GT={gadget_silence_timer:g}, "
                     f"Config={os.path.basename(current_config or '')}",
                     flush=True,
                 )
 
-            # Priority 1: Streamer (AirPlay via ALSA Loopback).
-            if streamer_hw_active:
+            # Keep the current source while it still has confirmed audio.
+            if current_source == "streamer" and streamer_hw_active:
+                last_active_source = "streamer"
+                if audio_active(cdsp.levels.capture_rms()):
+                    streamer_silence_timer = 0.0
+                    if DEBUG_MODE:
+                        print("-> Streamer: current source active", flush=True)
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                else:
+                    streamer_silence_timer += CHECK_INTERVAL
+                    log_idle("Streamer", streamer_silence_timer)
+
+                if streamer_silence_timer < IDLE_TIMEOUT:
+                    if (
+                        not lower_priority_meter_available
+                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
+                    ):
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    if DEBUG_MODE:
+                        print(
+                            "Streamer silent while lower-priority meter source is active",
+                            flush=True,
+                        )
+
+                if DEBUG_MODE:
+                    print("Streamer idle timeout - checking other sources", flush=True)
+                last_active_source = None
+
+            elif current_source == "streamer" and last_active_source == "streamer":
+                streamer_silence_timer += CHECK_INTERVAL
+                log_idle("Streamer grace", streamer_silence_timer)
+                if streamer_silence_timer < IDLE_TIMEOUT:
+                    if (
+                        not lower_priority_meter_available
+                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
+                    ):
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    if DEBUG_MODE:
+                        print(
+                            "Streamer grace ended early for lower-priority meter source",
+                            flush=True,
+                        )
+                last_active_source = None
+
+            if current_source == "gadget" and gadget_hw_available:
+                last_active_source = "gadget"
+                if audio_active(cdsp.levels.capture_rms()):
+                    gadget_silence_timer = 0.0
+                    if DEBUG_MODE:
+                        print("-> Gadget: current source active", flush=True)
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                else:
+                    gadget_silence_timer += CHECK_INTERVAL
+                    log_idle("Gadget", gadget_silence_timer)
+
+                if gadget_silence_timer < IDLE_TIMEOUT:
+                    if (
+                        not lower_priority_meter_available
+                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
+                    ):
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    if DEBUG_MODE:
+                        print(
+                            "Gadget silent while lower-priority meter source is active",
+                            flush=True,
+                        )
+
+                if DEBUG_MODE:
+                    print("Gadget idle timeout - checking other sources", flush=True)
+                last_active_source = None
+
+            elif current_source == "gadget" and last_active_source == "gadget":
+                gadget_silence_timer += CHECK_INTERVAL
+                log_idle("Gadget grace", gadget_silence_timer)
+                if gadget_silence_timer < IDLE_TIMEOUT:
+                    if (
+                        not lower_priority_meter_available
+                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
+                    ):
+                        time.sleep(CHECK_INTERVAL)
+                        continue
+                    if DEBUG_MODE:
+                        print(
+                            "Gadget grace ended early for lower-priority meter source",
+                            flush=True,
+                        )
+                last_active_source = None
+
+            if current_source == "toslink" and (toslink_available or audio_active(cdsp.levels.capture_rms())):
+                last_active_source = "toslink"
+                if DEBUG_MODE:
+                    print("-> TOSLINK: current source active", flush=True)
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            if current_source == "analog" and (analog_available or audio_active(cdsp.levels.capture_rms())):
+                last_active_source = "analog"
+                if DEBUG_MODE:
+                    print("-> Analog: current source active", flush=True)
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            # Priority 1: Streamer (AirPlay via ALSA Loopback), only when changing sources.
+            if current_source != "streamer" and streamer_hw_active:
                 last_active_source = "streamer"
                 if not same_config(current_config, STREAMER_CFG):
                     apply_config(cdsp, STREAMER_CFG)
@@ -406,25 +522,8 @@ def main() -> int:
                     print("Streamer idle timeout - checking other sources", flush=True)
                 last_active_source = None
 
-            elif last_active_source == "streamer" and same_config(current_config, STREAMER_CFG):
-                streamer_silence_timer += CHECK_INTERVAL
-                log_idle("Streamer grace", streamer_silence_timer)
-                if streamer_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Streamer grace ended early for lower-priority meter source",
-                            flush=True,
-                        )
-                last_active_source = None
-
-            # Priority 2: USB Gadget.
-            if gadget_hw_available:
+            # Priority 2: USB Gadget, only when changing sources.
+            if current_source != "gadget" and gadget_hw_available:
                 last_active_source = "gadget"
                 if not same_config(current_config, GADGET_CFG):
                     apply_config(cdsp, GADGET_CFG, settle_time=1.5)
@@ -458,25 +557,8 @@ def main() -> int:
                     print("Gadget idle timeout - checking other sources", flush=True)
                 last_active_source = None
 
-            elif last_active_source == "gadget" and same_config(current_config, GADGET_CFG):
-                gadget_silence_timer += CHECK_INTERVAL
-                log_idle("Gadget grace", gadget_silence_timer)
-                if gadget_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Gadget grace ended early for lower-priority meter source",
-                            flush=True,
-                        )
-                last_active_source = None
-
             # Priority 3: TOSLINK via MOTU input meters.
-            if toslink_available:
+            if current_source != "toslink" and toslink_available:
                 last_active_source = "toslink"
                 if not same_config(current_config, TOSLINK_CFG):
                     apply_config(cdsp, TOSLINK_CFG)
@@ -490,7 +572,7 @@ def main() -> int:
                 continue
 
             # Priority 4: Analog via MOTU input meters, disabled by default.
-            if analog_available:
+            if current_source != "analog" and analog_available:
                 last_active_source = "analog"
                 if not same_config(current_config, ANALOG_CFG):
                     apply_config(cdsp, ANALOG_CFG)
