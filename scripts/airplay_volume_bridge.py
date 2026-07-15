@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Map Shairport Sync's AirPlay slider onto the CamillaDSP master fader."""
+"""Keep network-player volume controls aligned with CamillaDSP's master fader.
+
+AirPlay can report its sender volume but cannot accept an exact volume value back.
+Spotify Connect supports both directions when used with the patched librespot build.
+"""
 
 from __future__ import annotations
 
@@ -45,6 +49,13 @@ SOCKET_PATH = Path(
         "AIRPLAY_VOLUME_SOCKET_PATH", "/run/airplay-volume-bridge/input.sock"
     )
 )
+SPOTIFY_COMMAND_SOCKET_PATH = Path(
+    os.environ.get(
+        "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH",
+        "/run/raspotify/uglan-volume.sock",
+    )
+)
+POLL_INTERVAL = float(os.environ.get("VOLUME_SYNC_POLL_INTERVAL", "0.25"))
 
 
 def map_airplay_volume(
@@ -73,6 +84,43 @@ def map_airplay_volume(
     return round(mapped, 4), False
 
 
+def map_spotify_volume(
+    spotify_volume: int,
+    minimum_db: float = -50.0,
+    maximum_db: float = 0.0,
+) -> tuple[float, bool]:
+    """Map Spotify Connect's unsigned 16-bit volume onto the master fader."""
+    if not isinstance(spotify_volume, int) or not 0 <= spotify_volume <= 65535:
+        raise ValueError("Spotify volume must be an integer between 0 and 65535")
+    if not math.isfinite(minimum_db) or not math.isfinite(maximum_db):
+        raise ValueError("volume values must be finite")
+    if not -120.0 <= minimum_db <= -20.0 or not minimum_db < maximum_db <= 0:
+        raise ValueError("invalid CamillaDSP volume range")
+    position = spotify_volume / 65535.0
+    mapped = minimum_db + (maximum_db - minimum_db) * position
+    return round(mapped, 4), spotify_volume == 0
+
+
+def map_camilla_to_spotify(
+    camilla_db: float,
+    muted: bool,
+    minimum_db: float = -50.0,
+    maximum_db: float = 0.0,
+) -> int:
+    """Convert the master fader back to Spotify's exact Connect volume value."""
+    if muted:
+        return 0
+    if not all(math.isfinite(value) for value in (camilla_db, minimum_db, maximum_db)):
+        raise ValueError("volume values must be finite")
+    if not minimum_db < maximum_db:
+        raise ValueError("invalid CamillaDSP volume range")
+    position = (max(minimum_db, min(maximum_db, camilla_db)) - minimum_db) / (
+        maximum_db - minimum_db
+    )
+    # Keep a non-muted master distinct from Spotify's special zero/mute value.
+    return max(1, min(65535, round(position * 65535)))
+
+
 def write_status(payload: dict) -> None:
     """Best-effort atomic status for the control UI."""
     temporary: Path | None = None
@@ -94,16 +142,15 @@ def write_status(payload: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def set_client_volume(client, airplay_db: float) -> dict:
+def set_mapped_volume(
+    client, mapped_db: float, muted: bool, *, source: str, source_volume: float | int
+) -> dict:
     # Keep the Shairport callback path stdlib-only.  The callback executes the
     # copy in /usr/local/libexec merely to send a datagram; deployment helpers
     # used by the daemon live beside the daemon script and may not be installed
     # beside that callback copy.
     from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
 
-    mapped_db, muted = map_airplay_volume(
-        airplay_db, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE
-    )
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         if not muted:
             require_audio_unmute_allowed(AUDIO_READY_PATH)
@@ -111,11 +158,44 @@ def set_client_volume(client, airplay_db: float) -> dict:
         client.volume.set_main_mute(muted)
     result = {
         "ok": True,
-        "airplay_db": airplay_db,
+        "source": source,
+        "source_volume": source_volume,
         "camilla_db": mapped_db,
         "muted": muted,
         "updated_at": time.time(),
     }
+    write_status(result)
+    return result
+
+
+def set_client_volume(client, airplay_db: float) -> dict:
+    mapped_db, muted = map_airplay_volume(
+        airplay_db, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE
+    )
+    result = set_mapped_volume(
+        client,
+        mapped_db,
+        muted,
+        source="airplay",
+        source_volume=airplay_db,
+    )
+    result["airplay_db"] = airplay_db
+    write_status(result)
+    return result
+
+
+def set_spotify_volume(client, spotify_volume: int) -> dict:
+    mapped_db, muted = map_spotify_volume(
+        spotify_volume, VOLUME_MIN_DB, VOLUME_MAX_DB
+    )
+    result = set_mapped_volume(
+        client,
+        mapped_db,
+        muted,
+        source="spotify",
+        source_volume=spotify_volume,
+    )
+    result["spotify_volume"] = spotify_volume
     write_status(result)
     return result
 
@@ -140,40 +220,133 @@ def notify(airplay_db: str) -> None:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(airplay_db.encode("ascii"), str(SOCKET_PATH))
+        client.sendto(f"airplay:{airplay_db}".encode("ascii"), str(SOCKET_PATH))
     finally:
         client.close()
 
 
+def notify_spotify(environ: dict[str, str] | None = None) -> None:
+    """Forward librespot's volume_changed event to the persistent daemon."""
+    environ = os.environ if environ is None else environ
+    if environ.get("PLAYER_EVENT") != "volume_changed":
+        return
+    volume = int(environ["VOLUME"])
+    map_spotify_volume(volume, VOLUME_MIN_DB, VOLUME_MAX_DB)
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        client.sendto(f"spotify:{volume}".encode("ascii"), str(SOCKET_PATH))
+    finally:
+        client.close()
+
+
+def send_spotify_volume(volume: int) -> None:
+    """Set librespot's Connect volume through its local command socket."""
+    if not 0 <= volume <= 65535:
+        raise ValueError("Spotify volume must be between 0 and 65535")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        client.sendto(str(volume).encode("ascii"), str(SPOTIFY_COMMAND_SOCKET_PATH))
+    finally:
+        client.close()
+
+
+def read_camilla_volume(client) -> tuple[float, bool]:
+    return round(float(client.volume.main_volume()), 4), bool(
+        client.volume.main_mute()
+    )
+
+
 def run_daemon() -> int:
-    """Coalesce slider events and keep slow DSP RPC work outside Shairport."""
+    """Apply source events and mirror external master changes into Spotify."""
     map_airplay_volume(-30, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE)
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     SOCKET_PATH.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     server.bind(str(SOCKET_PATH))
     SOCKET_PATH.chmod(0o666)
+    server.settimeout(POLL_INTERVAL)
     camilla = None
+    last_camilla: tuple[float, bool] | None = None
+    status: dict = {
+        "ok": True,
+        "updated_at": time.time(),
+        "airplay": {
+            "source_to_cdsp": True,
+            "cdsp_to_source": False,
+            "reason": "AirPlay does not expose exact receiver-to-sender volume setting",
+        },
+        "spotify": {"source_to_cdsp": True, "cdsp_to_source": True},
+    }
     try:
         while True:
-            payload = server.recv(128)
-            server.setblocking(False)
-            try:
-                while True:
-                    payload = server.recv(128)
-            except BlockingIOError:
-                pass
-            finally:
-                server.setblocking(True)
             try:
                 if camilla is None:
                     if CamillaClient is None:
                         raise RuntimeError("pycamilladsp is not installed")
                     camilla = CamillaClient(CDSP_HOST, CDSP_PORT)
                     camilla.connect()
-                set_client_volume(
-                    camilla, float(payload.decode("ascii").split(",", 1)[0])
-                )
+                try:
+                    payload = server.recv(128)
+                except socket.timeout:
+                    payload = b""
+                if payload:
+                    server.setblocking(False)
+                    try:
+                        while True:
+                            payload = server.recv(128)
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        server.settimeout(POLL_INTERVAL)
+                    message = payload.decode("ascii")
+                    if ":" in message:
+                        source, value = message.split(":", 1)
+                    else:  # Compatibility with callbacks installed before this version.
+                        source, value = "airplay", message
+                    if source == "airplay":
+                        result = set_client_volume(
+                            camilla, float(value.split(",", 1)[0])
+                        )
+                        status["airplay"]["last_source_volume_db"] = result[
+                            "airplay_db"
+                        ]
+                    elif source == "spotify":
+                        result = set_spotify_volume(camilla, int(value))
+                        status["spotify"]["last_source_volume"] = result[
+                            "spotify_volume"
+                        ]
+                    else:
+                        raise ValueError(f"unsupported volume source: {source}")
+                    status.update(result)
+                    last_camilla = (result["camilla_db"], result["muted"])
+
+                current = read_camilla_volume(camilla)
+                if last_camilla is None or current != last_camilla:
+                    spotify_volume = map_camilla_to_spotify(
+                        current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
+                    )
+                    try:
+                        send_spotify_volume(spotify_volume)
+                        status["spotify"].update(
+                            {"command_socket": True, "last_cdsp_volume": spotify_volume}
+                        )
+                    except OSError as exc:
+                        status["spotify"].update(
+                            {"command_socket": False, "error": str(exc)}
+                        )
+                    status.update(
+                        {
+                            "ok": True,
+                            "source": "camilladsp",
+                            "camilla_db": current[0],
+                            "muted": current[1],
+                        }
+                    )
+                    last_camilla = current
+                status["updated_at"] = time.time()
+                write_status(status)
             except Exception as exc:
                 try:
                     if camilla is not None:
@@ -181,9 +354,11 @@ def run_daemon() -> int:
                 except Exception:
                     pass
                 camilla = None
-                write_status(
+                status.update(
                     {"ok": False, "error": str(exc), "updated_at": time.time()}
                 )
+                write_status(status)
+                time.sleep(min(1.0, max(0.05, POLL_INTERVAL)))
     finally:
         try:
             if camilla is not None:
@@ -198,6 +373,13 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--daemon"]:
         return run_daemon()
+    if argv == ["--notify-spotify"]:
+        try:
+            notify_spotify()
+            return 0
+        except Exception as exc:
+            print(f"Spotify volume notification failed: {exc}", file=sys.stderr)
+            return 1
     if len(argv) == 2 and argv[0] == "--notify":
         try:
             notify(argv[1])
@@ -207,7 +389,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if len(argv) != 1:
         print(
-            "usage: airplay_volume_bridge.py [--daemon | --notify] AIRPLAY_DB",
+            "usage: airplay_volume_bridge.py [--daemon | --notify AIRPLAY_DB | --notify-spotify]",
             file=sys.stderr,
         )
         return 2

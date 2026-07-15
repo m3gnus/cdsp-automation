@@ -16,6 +16,13 @@ class InstallerUnitTests(unittest.TestCase):
         installer = INSTALLER.read_text(encoding="utf-8")
         self.assertIn("speaker_config.py speaker_xo.py", installer)
 
+    def test_network_volume_install_covers_airplay_and_spotify(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("install_airplay_volume_bridge; install_spotify_volume_sync", installer)
+        self.assertIn("build_librespot_volume_sync.sh", installer)
+        self.assertIn("librespot-v0.8.0-volume-sync.patch", installer)
+        self.assertIn("SPOTIFY_VOLUME_COMMAND_SOCKET_PATH", installer)
+
     def test_create_unit_migrates_legacy_enablement_and_creates_runtime_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

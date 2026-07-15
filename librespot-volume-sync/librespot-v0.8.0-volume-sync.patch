@@ -1,0 +1,124 @@
+diff --git a/playback/src/mixer/softmixer.rs b/playback/src/mixer/softmixer.rs
+index 189fc15..a333536 100644
+--- a/playback/src/mixer/softmixer.rs
++++ b/playback/src/mixer/softmixer.rs
+@@ -1,4 +1,4 @@
+-use super::VolumeGetter;
++use super::{NoOpVolume, VolumeGetter};
+ use super::{MappedCtrl, VolumeCtrl};
+ use super::{Mixer, MixerConfig};
+ use librespot_core::Error;
+@@ -37,7 +37,13 @@ impl Mixer for SoftMixer {
+     }
+ 
+     fn get_soft_volume(&self) -> Box<dyn VolumeGetter + Send> {
+-        Box::new(SoftVolume(self.volume.clone()))
++        if matches!(self.volume_ctrl, VolumeCtrl::Fixed) {
++            // Preserve the Spotify Connect volume state while CamillaDSP is
++            // the only component applying gain to the audio samples.
++            Box::new(NoOpVolume)
++        } else {
++            Box::new(SoftVolume(self.volume.clone()))
++        }
+     }
+ }
+ 
+diff --git a/src/main.rs b/src/main.rs
+index fb85803..56efd75 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -35,7 +35,10 @@ use std::{
+ };
+ use sysinfo::{ProcessesToUpdate, System};
+ use thiserror::Error;
+-use tokio::sync::Semaphore;
++use tokio::{
++    net::UnixDatagram,
++    sync::{Semaphore, mpsc},
++};
+ use url::Url;
+ 
+ mod player_event_handler;
+@@ -1877,6 +1880,52 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+     drop(permit);
+ }
+ 
++fn start_volume_sync_socket(path: PathBuf) -> Option<mpsc::UnboundedReceiver<u16>> {
++    use std::os::unix::fs::PermissionsExt;
++
++    if let Err(e) = std::fs::remove_file(&path)
++        && e.kind() != std::io::ErrorKind::NotFound
++    {
++        warn!(
++            "Could not remove stale volume sync socket {}: {e}",
++            path.display()
++        );
++        return None;
++    }
++    let socket = match UnixDatagram::bind(&path) {
++        Ok(socket) => socket,
++        Err(e) => {
++            warn!("Could not bind volume sync socket {}: {e}", path.display());
++            return None;
++        }
++    };
++    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)) {
++        warn!("Could not set volume sync socket permissions: {e}");
++    }
++    let (sender, receiver) = mpsc::unbounded_channel();
++    tokio::spawn(async move {
++        let mut buffer = [0_u8; 32];
++        loop {
++            match socket.recv(&mut buffer).await {
++                Ok(size) => match std::str::from_utf8(&buffer[..size])
++                    .ok()
++                    .and_then(|value| value.trim().parse::<u16>().ok())
++                {
++                    Some(volume) if sender.send(volume).is_ok() => (),
++                    Some(_) => break,
++                    None => warn!("Ignoring invalid volume sync command"),
++                },
++                Err(e) => {
++                    warn!("Volume sync socket failed: {e}");
++                    break;
++                }
++            }
++        }
++    });
++    info!("Listening for volume sync commands on {}", path.display());
++    Some(receiver)
++}
++
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() {
+     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
+@@ -1897,6 +1946,9 @@ async fn main() {
+     let mut discovery = None;
+     let mut connecting = false;
+     let mut _event_handler: Option<EventHandler> = None;
++    let mut volume_sync = env::var_os("UGLAN_SPOTIFY_VOLUME_SOCKET")
++        .map(PathBuf::from)
++        .and_then(start_volume_sync_socket);
+ 
+     let mut session = Session::new(setup.session_config.clone(), setup.cache.clone());
+ 
+@@ -2007,6 +2059,18 @@ async fn main() {
+ 
+     loop {
+         tokio::select! {
++            Some(volume) = async {
++                match volume_sync.as_mut() {
++                    Some(receiver) => receiver.recv().await,
++                    None => None,
++                }
++            }, if volume_sync.is_some() => {
++                if let Some(spirc) = spirc.as_ref()
++                    && let Err(e) = spirc.set_volume(volume)
++                {
++                    warn!("Could not apply volume sync command: {e}");
++                }
++            },
+             credentials = async {
+                 match discovery.as_mut() {
+                     Some(d) => d.next().await,
+
