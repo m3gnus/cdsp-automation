@@ -12,6 +12,10 @@ INSTALLER = REPOSITORY / "install.sh"
 
 
 class InstallerUnitTests(unittest.TestCase):
+    def test_download_set_includes_complete_speaker_compiler(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        self.assertIn("speaker_config.py speaker_xo.py", installer)
+
     def test_create_unit_migrates_legacy_enablement_and_creates_runtime_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
