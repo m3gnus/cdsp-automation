@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 
 import RPi.GPIO as GPIO
 from camilladsp import CamillaClient
@@ -28,11 +29,22 @@ def music_is_playing(rms_levels: object) -> bool:
     )
 
 
+def reset_camilladsp_client(client: CamillaClient) -> CamillaClient:
+    """Replace a stale WebSocket client without changing relay state."""
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    return CamillaClient(CAMILLA_IP, CAMILLA_PORT)
+
+
 async def relay_control(stop: asyncio.Event, manual_off: asyncio.Event) -> None:
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
     silence_seconds = 0.0
     relay_on = False
     suppress_current_audio = False
+    next_error_log = 0.0
+    last_error_message = None
 
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(POWER_GPIO, GPIO.OUT, initial=GPIO.LOW)
@@ -74,7 +86,13 @@ async def relay_control(stop: asyncio.Event, manual_off: asyncio.Event) -> None:
                         silence_seconds = 0.0
                         print("No music - relay OFF", flush=True)
             except Exception as exc:
-                print(f"Error: {exc}", flush=True)
+                message = str(exc)
+                now = time.monotonic()
+                if message != last_error_message or now >= next_error_log:
+                    print(f"CamillaDSP error: {message}", flush=True)
+                    last_error_message = message
+                    next_error_log = now + 30
+                cdsp = reset_camilladsp_client(cdsp)
                 await asyncio.sleep(2)
                 continue
 

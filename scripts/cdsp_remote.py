@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -28,21 +28,15 @@ from speaker_profiles import (
 # ====================== CONFIGURATION ======================
 
 
-def resolve_binary(name: str, fallbacks: tuple[str, ...]) -> str:
-    found = shutil.which(name)
-    if found:
-        return found
-
-    for fallback in fallbacks:
-        if os.access(fallback, os.X_OK):
-            return fallback
-
-    return name
-
-
 REMOTE_NAME = os.environ.get("REMOTE_NAME", "HID Remote01 Keyboard")
 CDSP_HOST = os.environ.get("CDSP_HOST", "127.0.0.1")
 CDSP_PORT = int(os.environ.get("CDSP_PORT", "1234"))
+DEVICE_RETRY_SECONDS = max(
+    float(os.environ.get("REMOTE_DEVICE_RETRY_SECONDS", "2")), 0.1
+)
+STATUS_LOG_SECONDS = max(
+    float(os.environ.get("REMOTE_STATUS_LOG_SECONDS", "300")), 1.0
+)
 
 TONE_MIN = float(os.environ.get("REMOTE_TONE_MIN", "-6"))
 TONE_MAX = float(os.environ.get("REMOTE_TONE_MAX", "6"))
@@ -76,15 +70,10 @@ VOLUME_STEP = float(os.environ.get("REMOTE_VOLUME_STEP", "1"))
 ENTER_HOLD_SECONDS = float(os.environ.get("REMOTE_ENTER_HOLD_SECONDS", "1"))
 RESTART_HOLD_SECONDS = float(os.environ.get("REMOTE_RESTART_HOLD_SECONDS", "1"))
 SHUTDOWN_HOLD_SECONDS = float(os.environ.get("REMOTE_SHUTDOWN_HOLD_SECONDS", "10"))
-TRIGGER_RESTART_DELAY_SECONDS = float(
-    os.environ.get("REMOTE_TRIGGER_RESTART_DELAY_SECONDS", "3")
-)
-
-SYSTEMCTL_BIN = resolve_binary("systemctl", ("/usr/bin/systemctl", "/bin/systemctl"))
-SYSTEMD_RUN_BIN = resolve_binary(
-    "systemd-run", ("/usr/bin/systemd-run", "/bin/systemd-run")
-)
-SHUTDOWN_BIN = resolve_binary("shutdown", ("/sbin/shutdown", "/usr/sbin/shutdown"))
+# Fixed Raspberry Pi OS paths. Never derive NOPASSWD targets from PATH or the
+# user-controlled EnvironmentFile.
+SUDO_BIN = "/usr/bin/sudo"
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
 
 KEY_BINDINGS = {
     "VOLUMEDOWN": "KEY_VOLUMEDOWN",
@@ -117,24 +106,33 @@ def key_matches(keycode: str | list[str], binding: str) -> bool:
 def find_remote_device():
     """Search for the USB HID remote device by name."""
     print(f"Searching for remote '{REMOTE_NAME}'...", flush=True)
+    last_status: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    next_status_log = 0.0
 
     while True:
         seen: list[str] = []
+        problems: list[str] = []
         try:
             paths = evdev.list_devices()
         except OSError as exc:
-            print(
-                f"Cannot list input devices: {exc}. Retrying in 2 seconds...",
-                flush=True,
-            )
-            time.sleep(2)
+            now = time.monotonic()
+            status = ((), (f"Cannot list input devices: {exc}",))
+            if status != last_status or now >= next_status_log:
+                print(
+                    f"Cannot list input devices: {exc}. "
+                    f"Retrying in {DEVICE_RETRY_SECONDS:g} seconds...",
+                    flush=True,
+                )
+                last_status = status
+                next_status_log = now + STATUS_LOG_SECONDS
+            time.sleep(DEVICE_RETRY_SECONDS)
             continue
 
         for path in paths:
             try:
                 device = evdev.InputDevice(path)
             except OSError as exc:
-                print(f"Cannot open input device {path}: {exc}", flush=True)
+                problems.append(f"Cannot open {path}: {exc}")
                 continue
 
             seen.append(device.name)
@@ -147,50 +145,58 @@ def find_remote_device():
             except Exception:
                 pass
 
-        suffix = f" Seen: {', '.join(seen)}" if seen else ""
-        print(
-            f"Remote '{REMOTE_NAME}' not found. Retrying in 2 seconds.{suffix}",
-            flush=True,
-        )
-        time.sleep(2)
+        now = time.monotonic()
+        status = (tuple(sorted(seen)), tuple(sorted(problems)))
+        if status != last_status or now >= next_status_log:
+            seen_suffix = f" Seen: {', '.join(seen)}" if seen else ""
+            problem_suffix = f" Problems: {'; '.join(problems)}" if problems else ""
+            print(
+                f"Remote '{REMOTE_NAME}' not found. "
+                f"Retrying in {DEVICE_RETRY_SECONDS:g} seconds."
+                f"{seen_suffix}{problem_suffix}",
+                flush=True,
+            )
+            last_status = status
+            next_status_log = now + STATUS_LOG_SECONDS
+        time.sleep(DEVICE_RETRY_SECONDS)
 
 
 def connect_to_camilladsp() -> CamillaClient:
-    """Establish connection to CamillaDSP."""
+    """Try once to establish a CamillaDSP connection."""
     global cdsp
 
     print(f"Connecting to CamillaDSP at {CDSP_HOST}:{CDSP_PORT}...", flush=True)
-    cdsp = CamillaClient(CDSP_HOST, CDSP_PORT)
-
-    while True:
+    candidate = CamillaClient(CDSP_HOST, CDSP_PORT)
+    try:
+        candidate.connect()
+    except Exception:
         try:
-            cdsp.connect()
-            print("Connected to CamillaDSP successfully.", flush=True)
-            return cdsp
-        except Exception as exc:
-            print(f"Failed to connect: {exc}. Retrying in 2 seconds...", flush=True)
-            time.sleep(2)
+            candidate.disconnect()
+        except Exception:
+            pass
+        cdsp = None
+        raise
+    cdsp = candidate
+    print("Connected to CamillaDSP successfully.", flush=True)
+    return candidate
 
 
 def ensure_cdsp_connected() -> CamillaClient:
     """Return a connected CamillaDSP client, recreating it after failures."""
     global cdsp
 
-    if cdsp is None:
-        return connect_to_camilladsp()
-
-    try:
-        if not cdsp.is_connected():
-            cdsp.connect()
-        return cdsp
-    except Exception:
+    if cdsp is not None:
+        try:
+            if cdsp.is_connected():
+                return cdsp
+        except Exception:
+            pass
         try:
             cdsp.disconnect()
         except Exception:
             pass
-        cdsp = CamillaClient(CDSP_HOST, CDSP_PORT)
-        cdsp.connect()
-        return cdsp
+        cdsp = None
+    return connect_to_camilladsp()
 
 
 def format_db(value: float | None) -> str:
@@ -298,9 +304,29 @@ def show_status() -> None:
         print(f"Error getting status: {exc}", flush=True)
 
 
+def validate_trusted_executable(path: str) -> None:
+    if os.path.realpath(path) != path:
+        raise RuntimeError(f"privileged executable path is not canonical: {path}")
+    try:
+        metadata = os.stat(path)
+    except OSError as exc:
+        raise RuntimeError(f"privileged executable is unavailable: {path}") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not metadata.st_mode & stat.S_IXUSR
+    ):
+        raise RuntimeError(f"privileged executable is not trusted: {path}")
+
+
 def run_sudo(command: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+    if not command:
+        raise ValueError("privileged command cannot be empty")
+    validate_trusted_executable(SUDO_BIN)
+    validate_trusted_executable(command[0])
     return subprocess.run(
-        ["sudo", "-n", *command],
+        [SUDO_BIN, "-n", *command],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -312,8 +338,8 @@ def restart_services() -> None:
     """
     Restart CamillaDSP and related services.
 
-    cdsp-trigger is restarted through a delayed transient unit so this process
-    can restart cdsp-remote last without cancelling the trigger restart.
+    The trigger remains running and rebuilds its client in place, keeping the
+    amplifier relay latched throughout this recovery sequence.
     """
     services = [
         "camilladsp.service",
@@ -338,34 +364,13 @@ def restart_services() -> None:
         except Exception as exc:
             print(f"  Error restarting {service}: {exc}", flush=True)
 
-    unit_name = f"cdsp-trigger-restart-{int(time.time())}"
     try:
         result = run_sudo(
-            [
-                SYSTEMD_RUN_BIN,
-                "--no-block",
-                f"--on-active={TRIGGER_RESTART_DELAY_SECONDS:g}",
-                f"--unit={unit_name}",
-                SYSTEMCTL_BIN,
-                "restart",
-                "cdsp-trigger.service",
-            ],
+            [SYSTEMCTL_BIN, "--no-block", "restart", "cdsp-remote.service"],
             timeout=5,
         )
         if result.returncode == 0:
-            print(
-                f"  Scheduled: cdsp-trigger.service (in {TRIGGER_RESTART_DELAY_SECONDS:g}s)",
-                flush=True,
-            )
-        else:
-            print(f"  Warning: systemd-run failed: {result.stderr.strip()}", flush=True)
-    except Exception as exc:
-        print(f"  Warning: Could not schedule trigger restart: {exc}", flush=True)
-
-    try:
-        result = run_sudo([SYSTEMCTL_BIN, "restart", "cdsp-remote.service"], timeout=10)
-        if result.returncode == 0:
-            print("  Restarted: cdsp-remote.service", flush=True)
+            print("  Restart requested: cdsp-remote.service", flush=True)
         else:
             print(
                 f"  Skipped: cdsp-remote.service ({result.stderr.strip()})", flush=True
@@ -379,7 +384,7 @@ def restart_services() -> None:
 def shutdown_system() -> None:
     print("Power button held 10s - shutting down...", flush=True)
     try:
-        result = run_sudo([SHUTDOWN_BIN, "-h", "now"], timeout=5)
+        result = run_sudo([SYSTEMCTL_BIN, "poweroff"], timeout=5)
         if result.returncode != 0:
             print(
                 f"Shutdown failed: {result.stderr.strip() or result.stdout.strip()}",

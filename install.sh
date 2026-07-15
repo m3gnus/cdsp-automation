@@ -15,6 +15,15 @@ VENV_DIR="$BASE_DIR/.venv"
 ENV_FILE="$BASE_DIR/cdsp-automation.env"
 BASE_URL="https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+INSTALL_USER="$(/usr/bin/id -un)"
+if [[ ! "$INSTALL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "Could not determine a safe install username"
+  exit 1
+fi
+SYSTEMD_UNIT_DIR="${CDSP_AUTOMATION_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+LEGACY_UNIT_DIR="${CDSP_AUTOMATION_LEGACY_UNIT_DIR:-/lib/systemd/system}"
+SYSTEMCTL_BIN="/usr/bin/systemctl"
+VISUDO_BIN="/usr/sbin/visudo"
 
 CDSP_SERVICES=(
   cdsp-trigger
@@ -51,6 +60,8 @@ SOURCE_TOSLINK_IDLE_SECONDS=5
 SOURCE_ANALOG_ACTIVE_SECONDS=5
 SOURCE_ANALOG_IDLE_SECONDS=30
 SOURCE_DEBUG=false
+SOURCE_RECOVERY_RETRY_SECONDS=10
+SOURCE_RECOVERY_LOG_SECONDS=30
 AUDIO_EQ_PATH=/var/lib/cdsp-automation/audio-eq.json
 AUDIO_EQ_STATUS_PATH=/run/cdsp-source-switcher/audio-eq-status.json
 AUDIO_CONTROL_LOCK_PATH=/var/lib/cdsp-automation/audio-control.lock
@@ -72,6 +83,8 @@ AIRPLAY_VOLUME_STATUS_PATH=/run/airplay-volume-bridge/status.json
 AIRPLAY_VOLUME_SOCKET_PATH=/run/airplay-volume-bridge/input.sock
 ISO226_CAPABILITY_PATH=/var/lib/cdsp-automation/iso226-engine.json
 REMOTE_NAME=HID Remote01 Keyboard
+REMOTE_DEVICE_RETRY_SECONDS=2
+REMOTE_STATUS_LOG_SECONDS=300
 REMOTE_RESTART_HOLD_SECONDS=1
 REMOTE_SHUTDOWN_HOLD_SECONDS=10
 EOF
@@ -258,10 +271,11 @@ create_unit() {
   local script="$2"
   local sysname="$3"
   local script_args="${4:-}"
-  local unit_file="$HOME/${sysname}.service"
+  local unit_file
+  unit_file="$(mktemp "${TMPDIR:-/tmp}/${sysname}.service.XXXXXX")"
   local runtime_directory=""
   if [[ "$sysname" == "cdsp-source-switcher" ]]; then
-    runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755'
+    runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes'
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
   fi
@@ -273,7 +287,7 @@ Wants=network-online.target camilladsp.service
 After=network-online.target camilladsp.service
 
 [Service]
-User=$USER
+User=$INSTALL_USER
 Type=simple
 WorkingDirectory=$BASE_DIR
 EnvironmentFile=-$ENV_FILE
@@ -289,10 +303,12 @@ SyslogIdentifier=$sysname
 [Install]
 WantedBy=multi-user.target
 EOL
-  sudo install -m 0644 "$unit_file" "/etc/systemd/system/${sysname}.service"
+  sudo install -m 0644 "$unit_file" "${SYSTEMD_UNIT_DIR}/${sysname}.service"
   rm -f "$unit_file"
+  sudo rm -f "${LEGACY_UNIT_DIR}/${sysname}.service"
   sudo systemctl daemon-reload
-  sudo systemctl enable --now "${sysname}.service"
+  sudo systemctl reenable "${sysname}.service"
+  sudo systemctl restart "${sysname}.service"
 }
 
 install_trigger() {
@@ -324,29 +340,18 @@ install_source_switcher() {
 }
 
 install_remote_sudoers() {
-  local systemctl_bin systemd_run_bin shutdown_bin tmp
-  systemctl_bin="$(command -v systemctl)"
-  systemd_run_bin="$(command -v systemd-run)"
-  shutdown_bin="$(command -v shutdown || true)"
-  if [[ -z "$shutdown_bin" ]]; then
-    for candidate in /sbin/shutdown /usr/sbin/shutdown; do
-      if [[ -x "$candidate" ]]; then
-        shutdown_bin="$candidate"
-        break
-      fi
-    done
-  fi
-  if [[ -z "$shutdown_bin" ]]; then
-    echo "Could not find shutdown binary"
+  local tmp
+  if [[ ! -x "$SYSTEMCTL_BIN" || ! -x "$VISUDO_BIN" ]]; then
+    echo "Required root-owned system tools are missing"
     return 1
   fi
   tmp="$(mktemp)"
 
   cat > "$tmp" <<EOF
 # Allow cdsp-remote.service to perform only its documented power actions.
-$USER ALL=(root) NOPASSWD: $systemctl_bin restart camilladsp.service, $systemctl_bin restart camillagui.service, $systemctl_bin restart cdsp-motu-sync.service, $systemctl_bin restart cdsp-source-switcher.service, $systemctl_bin restart cdsp-trigger.service, $systemctl_bin restart cdsp-remote.service, $systemd_run_bin --no-block --on-active=* --unit=cdsp-trigger-restart-* $systemctl_bin restart cdsp-trigger.service, $shutdown_bin -h now
+$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
 EOF
-  sudo visudo -cf "$tmp"
+  sudo "$VISUDO_BIN" -cf "$tmp"
   sudo install -m 0440 "$tmp" /etc/sudoers.d/cdsp-automation
   rm -f "$tmp"
 }
@@ -355,7 +360,7 @@ install_remote() {
   echo "Installing Remote Control..."
 
   if getent group input >/dev/null; then
-    sudo usermod -aG input "$USER"
+    sudo usermod -aG input "$INSTALL_USER"
   fi
   install_remote_sudoers
 
@@ -600,4 +605,6 @@ main() {
   done
 }
 
-main
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

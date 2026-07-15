@@ -83,6 +83,13 @@ TOSLINK_IDLE_SECONDS = float(os.environ.get("SOURCE_TOSLINK_IDLE_SECONDS", "5"))
 ANALOG_ACTIVE_SECONDS = float(os.environ.get("SOURCE_ANALOG_ACTIVE_SECONDS", "5"))
 ANALOG_IDLE_SECONDS = float(os.environ.get("SOURCE_ANALOG_IDLE_SECONDS", "30"))
 SOURCE_IDLE_MODE = os.environ.get("SOURCE_IDLE_MODE", "keep-last").strip().lower()
+RECOVERY_RETRY_SECONDS = max(
+    float(os.environ.get("SOURCE_RECOVERY_RETRY_SECONDS", "10")), 1.0
+)
+RECOVERY_LOG_SECONDS = max(
+    float(os.environ.get("SOURCE_RECOVERY_LOG_SECONDS", "30")),
+    RECOVERY_RETRY_SECONDS,
+)
 
 TOSLINK_METER_PAIRS = tuple(
     int(value)
@@ -593,7 +600,62 @@ def validate_config_file(path: Path) -> None:
 
 def _processing_state(cdsp: CamillaClient) -> str:
     """Normalize pycamilladsp enum and string representations."""
-    return str(cdsp.general.state()).rsplit(".", 1)[-1].strip().lower()
+    state = cdsp.general.state()
+    name = getattr(state, "name", None)
+    if isinstance(name, str):
+        return name.strip().lower()
+    return str(state).rsplit(".", 1)[-1].strip().lower()
+
+
+class ConfigRecoveryGuard:
+    """Recover a remembered config that failed to activate during boot."""
+
+    def __init__(self, retry_seconds: float = RECOVERY_RETRY_SECONDS,
+                 log_seconds: float = RECOVERY_LOG_SECONDS) -> None:
+        self.retry_seconds = retry_seconds
+        self.log_seconds = log_seconds
+        self.next_attempt = 0.0
+        self.next_log = 0.0
+        self.last_message: str | None = None
+
+    def _log(self, message: str, now: float) -> None:
+        if message != self.last_message or now >= self.next_log:
+            print(message, flush=True)
+            self.last_message = message
+            self.next_log = now + self.log_seconds
+
+    def ready(self, cdsp: CamillaClient, now: float) -> bool:
+        state = _processing_state(cdsp)
+        active_config = None if state == "inactive" else cdsp.config.active()
+        if state != "inactive" and active_config:
+            self.next_attempt = 0.0
+            self.next_log = 0.0
+            self.last_message = None
+            return True
+        if now < self.next_attempt:
+            return False
+        self.next_attempt = now + self.retry_seconds
+
+        remembered = cdsp.config.file_path()
+        try:
+            config_path = os.fspath(remembered) if remembered else ""
+        except TypeError:
+            config_path = ""
+        reason = "processing state is inactive" if state == "inactive" else "active config is missing"
+        if not config_path or not os.path.isfile(config_path):
+            self._log(
+                f"CamillaDSP recovery waiting: {reason}; remembered config is not a file: "
+                f"{config_path or '<none>'}",
+                now,
+            )
+            return False
+        try:
+            cdsp.general.reload()
+        except Exception as exc:
+            self._log(f"CamillaDSP recovery reload failed for {config_path}: {exc}", now)
+        else:
+            self._log(f"CamillaDSP recovery: {reason}; reloading {config_path}", now)
+        return False
 
 
 def resolve_config_target(
@@ -721,7 +783,7 @@ def read_manual_source() -> str | None:
 
 
 def read_wled_delay_settings() -> tuple[bool, float, str]:
-    enabled, delay_ms, name = True, 50.0, "wled_light_sync_delay"
+    enabled, delay_ms, name = False, 0.0, "wled_light_sync_delay"
     try:
         with open(WLED_ENV_PATH, "r", encoding="utf-8") as handle:
             for line in handle:
@@ -736,7 +798,7 @@ def read_wled_delay_settings() -> tuple[bool, float, str]:
                     try:
                         delay_ms = float(value)
                     except ValueError:
-                        pass
+                        enabled, delay_ms = False, 0.0
                 elif key == "CAMILLA_DELAY_FILTER_NAME" and value:
                     name = value
     except FileNotFoundError:
@@ -787,11 +849,12 @@ def _has_requested_delay(config: dict, name: str, delay_ms: float) -> bool:
     if not delay_matches or params.get("unit") != "ms":
         return False
     expected_channels = _delay_channels(config)
+    matches = []
     for step in config.get("pipeline", []):
         names = step.get("names")
         if isinstance(names, list) and name in names:
-            return step.get("channels") == expected_channels
-    return False
+            matches.append(step)
+    return len(matches) == 1 and matches[0].get("channels") == expected_channels
 
 
 def _add_delay(config: dict, name: str, delay_ms: float) -> dict:
@@ -1264,12 +1327,17 @@ def main() -> int:
     next_audio_eq_check = 0.0
     startup_restore_mute: bool | None = None
     startup_configs_validated = False
+    recovery = ConfigRecoveryGuard()
 
     while True:
         try:
             if not cdsp.is_connected():
                 cdsp.connect()
                 print("Connected to CamillaDSP", flush=True)
+
+            if not recovery.ready(cdsp, time.monotonic()):
+                time.sleep(CHECK_INTERVAL)
+                continue
 
             if startup_restore_mute is None and audio_inhibit_active(AUDIO_READY_PATH):
                 startup_restore_mute = mute_for_startup_validation(cdsp)
