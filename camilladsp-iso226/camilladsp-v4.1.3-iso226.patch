@@ -1,0 +1,282 @@
+diff --git a/src/config/mod.rs b/src/config/mod.rs
+index b466d01..3d53a1f 100644
+--- a/src/config/mod.rs
++++ b/src/config/mod.rs
+@@ -995,6 +995,11 @@ pub enum Filter {
+         description: Option<String>,
+         parameters: LoudnessParameters,
+     },
++    Iso226 {
++        #[serde(default)]
++        description: Option<String>,
++        parameters: Iso226Parameters,
++    },
+     Dither {
+         #[serde(default)]
+         description: Option<String>,
+@@ -1303,6 +1308,28 @@ impl LoudnessParameters {
+     }
+ }
+ 
++#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
++#[serde(deny_unknown_fields)]
++pub struct Iso226Parameters {
++    pub reference_level: f32,
++    pub reference_phon: f32,
++    #[serde(default)]
++    pub strength: Option<f32>,
++    #[serde(default)]
++    pub max_bass_boost: Option<f32>,
++    #[serde(default)]
++    pub max_treble_boost: Option<f32>,
++    #[serde(default)]
++    pub fader: Option<LoudnessFader>,
++}
++
++impl Iso226Parameters {
++    pub fn strength(&self) -> f32 { self.strength.unwrap_or(1.0) }
++    pub fn max_bass_boost(&self) -> f32 { self.max_bass_boost.unwrap_or(12.0) }
++    pub fn max_treble_boost(&self) -> f32 { self.max_treble_boost.unwrap_or(6.0) }
++    pub fn fader(&self) -> usize { self.fader.unwrap_or(LoudnessFader::Main) as usize }
++}
++
+ #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+ #[serde(deny_unknown_fields)]
+ pub struct GainParameters {
+diff --git a/src/config/utils.rs b/src/config/utils.rs
+index cbd4098..5173f01 100644
+--- a/src/config/utils.rs
++++ b/src/config/utils.rs
+@@ -461,6 +461,7 @@ pub fn config_diff(currentconf: &Configuration, newconf: &Configuration) -> Conf
+                     | (Filter::DiffEq { .. }, Filter::DiffEq { .. })
+                     | (Filter::Volume { .. }, Filter::Volume { .. })
+                     | (Filter::Loudness { .. }, Filter::Loudness { .. })
++                    | (Filter::Iso226 { .. }, Filter::Iso226 { .. })
+                     | (Filter::Limiter { .. }, Filter::Limiter { .. }) => {}
+                     _ => {
+                         // A filter changed type, need to rebuild the pipeline
+diff --git a/src/filters/iso226.rs b/src/filters/iso226.rs
+new file mode 100644
+index 0000000..cc06412
+--- /dev/null
++++ b/src/filters/iso226.rs
+@@ -0,0 +1,179 @@
++// ISO 226 equal-loudness compensation tied directly to a CamillaDSP fader.
++use crate::config;
++use crate::filters::Filter;
++use crate::filters::basicfilters::Gain;
++use crate::filters::biquad;
++use crate::{PrcFmt, ProcessingParameters, Res};
++use std::sync::Arc;
++
++const FREQ: [f32; 29] = [20.0,25.0,31.5,40.0,50.0,63.0,80.0,100.0,125.0,160.0,200.0,250.0,315.0,400.0,500.0,630.0,800.0,1000.0,1250.0,1600.0,2000.0,2500.0,3150.0,4000.0,5000.0,6300.0,8000.0,10000.0,12500.0];
++const AF: [f32; 29] = [0.532,0.506,0.480,0.455,0.432,0.409,0.387,0.367,0.349,0.330,0.315,0.301,0.288,0.276,0.267,0.259,0.253,0.250,0.246,0.244,0.243,0.243,0.243,0.242,0.242,0.245,0.254,0.271,0.301];
++const LU: [f32; 29] = [-31.6,-27.2,-23.0,-19.1,-15.9,-13.0,-10.3,-8.1,-6.2,-4.5,-3.1,-2.0,-1.1,-0.4,0.0,0.3,0.5,0.0,-2.7,-4.1,-1.0,1.7,2.5,1.2,-2.1,-7.1,-11.2,-10.7,-3.1];
++const TF: [f32; 29] = [78.5,68.7,59.5,51.1,44.0,37.5,31.5,26.5,22.1,17.9,14.4,11.4,8.6,6.2,4.4,3.0,2.2,2.4,3.5,1.7,-1.3,-4.2,-6.0,-5.4,-1.5,6.0,12.6,13.9,12.3];
++const FILTER_INDEX: [usize; 9] = [2,5,8,11,14,20,23,26,28];
++
++fn contour_spl(phon: f32, index: usize) -> f32 {
++    let af = AF[index];
++    let term = 4.47e-3 * (10.0_f32.powf(0.025 * phon) - 1.15)
++        + (0.4 * 10.0_f32.powf(((TF[index] + LU[index]) / 10.0) - 9.0)).powf(af);
++    (10.0 / af) * term.log10() - LU[index] + 94.0
++}
++
++fn correction(conf: &config::Iso226Parameters, volume: f32, index: usize) -> f32 {
++    let target = (conf.reference_phon + volume - conf.reference_level).clamp(20.0, conf.reference_phon);
++    let reference_shape = contour_spl(conf.reference_phon, index) - conf.reference_phon;
++    let target_shape = contour_spl(target, index) - target;
++    let limit = if FREQ[index] < 1000.0 { conf.max_bass_boost() } else { conf.max_treble_boost() };
++    ((target_shape - reference_shape) * conf.strength()).clamp(-limit, limit)
++}
++
++fn cascade_gains(conf: &config::Iso226Parameters, volume: f32) -> [f32; 9] {
++    let mut gains = FILTER_INDEX.map(|index| correction(conf, volume, index));
++    let upper_bound = gains[0].max(0.0)
++        + gains.windows(2).map(|pair| (pair[1] - pair[0]).max(0.0)).sum::<f32>();
++    let available_headroom = (-volume).max(0.0);
++    let scale = if upper_bound > available_headroom && upper_bound > 0.0 {
++        available_headroom / upper_bound
++    } else { 1.0 };
++    gains.iter_mut().for_each(|gain| *gain *= scale);
++    gains
++}
++
++fn shelf_params(index: usize, gains: &[f32; 9]) -> config::BiquadParameters {
++    let left = FREQ[FILTER_INDEX[index]];
++    let right = FREQ[FILTER_INDEX[index + 1]];
++    config::BiquadParameters::Highshelf(config::ShelfSteepness::Slope {
++        freq: (left * right).sqrt() as f64,
++        slope: 6.0,
++        gain: (gains[index + 1] - gains[index]) as PrcFmt,
++    })
++}
++
++pub struct Iso226 {
++    name: String,
++    processing_params: Arc<ProcessingParameters>,
++    conf: config::Iso226Parameters,
++    current_volume: f32,
++    low_gain: Gain,
++    filters: Vec<biquad::Biquad>,
++}
++
++impl Iso226 {
++    pub fn from_config(name: &str, conf: config::Iso226Parameters, samplerate: usize, processing_params: Arc<ProcessingParameters>) -> Self {
++        let current_volume = processing_params.target_volume(conf.fader());
++        let gains = cascade_gains(&conf, current_volume);
++        let low_gain = Gain::from_config("iso226_base", config::GainParameters { gain: gains[0] as PrcFmt, inverted: None, mute: None, scale: None });
++        let filters = (0..8).map(|index| {
++            let params = shelf_params(index, &gains);
++            let coeffs = biquad::BiquadCoefficients::from_config(samplerate, params);
++            biquad::Biquad::new(&format!("iso226_transition_{index}"), samplerate, coeffs)
++        }).collect();
++        Self { name: name.to_string(), processing_params, conf, current_volume, low_gain, filters }
++    }
++
++    fn update_filters(&mut self, volume: f32) {
++        self.current_volume = volume;
++        let gains = cascade_gains(&self.conf, volume);
++        self.low_gain.update_parameters(config::Filter::Gain { description: None, parameters: config::GainParameters { gain: gains[0] as PrcFmt, inverted: None, mute: None, scale: None } });
++        for (index, filter) in self.filters.iter_mut().enumerate() {
++            filter.update_parameters(config::Filter::Biquad { description: None, parameters: shelf_params(index, &gains) });
++        }
++    }
++}
++
++impl Filter for Iso226 {
++    fn name(&self) -> &str { &self.name }
++
++    fn process_waveform(&mut self, waveform: &mut [PrcFmt]) -> Res<()> {
++        let volume = self.processing_params.current_volume(self.conf.fader());
++        if (volume - self.current_volume).abs() >= 0.25 { self.update_filters(volume); }
++        self.low_gain.process_waveform(waveform)?;
++        for filter in &mut self.filters { filter.process_waveform(waveform)?; }
++        Ok(())
++    }
++
++    fn update_parameters(&mut self, filter: config::Filter) {
++        if let config::Filter::Iso226 { parameters, .. } = filter {
++            self.conf = parameters;
++            let volume = self.processing_params.current_volume(self.conf.fader());
++            self.update_filters(volume);
++        } else { panic!("Invalid config change!"); }
++    }
++}
++
++pub fn validate_config(samplerate: usize, conf: &config::Iso226Parameters) -> Res<()> {
++    if samplerate < 32000 {
++        return Err(config::ConfigError::new("ISO 226 filter requires a sample rate of at least 32 kHz").into());
++    }
++    if !(-100.0..=20.0).contains(&conf.reference_level) {
++        return Err(config::ConfigError::new("Reference level must be between -100 and 20").into());
++    }
++    if !(40.0..=100.0).contains(&conf.reference_phon) {
++        return Err(config::ConfigError::new("Reference phon must be between 40 and 100").into());
++    }
++    if !(0.0..=1.0).contains(&conf.strength()) {
++        return Err(config::ConfigError::new("Strength must be between 0 and 1").into());
++    }
++    if !(0.0..=18.0).contains(&conf.max_bass_boost()) {
++        return Err(config::ConfigError::new("Maximum bass boost must be between 0 and 18").into());
++    }
++    if !(0.0..=12.0).contains(&conf.max_treble_boost()) {
++        return Err(config::ConfigError::new("Maximum treble boost must be between 0 and 12").into());
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn coeff_response_db(coeff: biquad::BiquadCoefficients, freq: f64) -> f64 {
++        let w = 2.0 * std::f64::consts::PI * freq / 48000.0;
++        let (c1, s1) = (w.cos(), w.sin());
++        let (c2, s2) = ((2.0*w).cos(), (2.0*w).sin());
++        let nr = coeff.b0 + coeff.b1*c1 + coeff.b2*c2;
++        let ni = -coeff.b1*s1 - coeff.b2*s2;
++        let dr = 1.0 + coeff.a1*c1 + coeff.a2*c2;
++        let di = -coeff.a1*s1 - coeff.a2*s2;
++        10.0 * ((nr*nr+ni*ni)/(dr*dr+di*di)).log10()
++    }
++
++    fn cascade_response_db(gains: &[f32; 9], freq: f64) -> f64 {
++        gains[0] as f64 + (0..8).map(|index| {
++            let coeff = biquad::BiquadCoefficients::from_config(48000, shelf_params(index, gains));
++            coeff_response_db(coeff, freq)
++        }).sum::<f64>()
++    }
++    #[test]
++    fn reference_is_flat_and_quiet_listening_boosts_bass() {
++        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
++        assert!(correction(&conf, -10.0, 5).abs() < 0.001);
++        assert!(correction(&conf, -40.0, 5) > 3.0);
++        assert!(correction(&conf, -40.0, 5) <= 12.0);
++        let gains = cascade_gains(&conf, -6.0);
++        let bound = gains[0].max(0.0) + gains.windows(2).map(|p| (p[1]-p[0]).max(0.0)).sum::<f32>();
++        assert!(bound <= 6.0001);
++    }
++
++    #[test]
++    fn rejects_sample_rates_that_put_the_top_band_near_nyquist() {
++        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
++        assert!(validate_config(24000, &conf).is_err());
++        assert!(validate_config(48000, &conf).is_ok());
++    }
++
++    #[test]
++    fn fitted_cascade_tracks_targets_and_never_exceeds_fader_headroom() {
++        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
++        for volume in [-6.0, -20.0, -40.0] {
++            let gains = cascade_gains(&conf, volume);
++            for (position, index) in FILTER_INDEX.iter().enumerate() {
++                let response = cascade_response_db(&gains, FREQ[*index] as f64);
++                assert!((response - gains[position] as f64).abs() < 3.5);
++            }
++            for step in 0..120 {
++                let freq = 20.0 * 1000.0_f64.powf(step as f64 / 119.0);
++                assert!(cascade_response_db(&gains, freq) <= (-volume) as f64 + 0.05);
++            }
++        }
++    }
++}
+diff --git a/src/filters/mod.rs b/src/filters/mod.rs
+index 7acb1cb..c4ecac1 100644
+--- a/src/filters/mod.rs
++++ b/src/filters/mod.rs
+@@ -22,6 +22,7 @@ pub mod dither;
+ pub mod fftconv;
+ pub mod limiter;
+ pub mod loudness;
++pub mod iso226;
+ 
+ use crate::config;
+ use crate::config::BinarySampleFormat;
+@@ -226,6 +227,7 @@ pub fn validate_filter(fs: usize, filter_config: &config::Filter) -> Res<()> {
+             basicfilters::validate_volume_config(parameters)
+         }
+         config::Filter::Loudness { parameters, .. } => loudness::validate_config(parameters),
++        config::Filter::Iso226 { parameters, .. } => iso226::validate_config(fs, parameters),
+         config::Filter::BiquadCombo { parameters, .. } => {
+             biquadcombo::validate_config(fs, parameters)
+         }
+diff --git a/src/pipeline.rs b/src/pipeline.rs
+index 3b4d0c4..fbf0b9f 100644
+--- a/src/pipeline.rs
++++ b/src/pipeline.rs
+@@ -87,6 +87,14 @@ impl FilterGroup {
+                         processing_params.clone(),
+                     ))
+                 }
++                config::Filter::Iso226 { parameters, .. } => {
++                    Box::new(filters::iso226::Iso226::from_config(
++                        name,
++                        parameters,
++                        sample_freq,
++                        processing_params.clone(),
++                    ))
++                }
+                 config::Filter::Dither { parameters, .. } => {
+                     Box::new(filters::dither::Dither::from_config(name, parameters))
+                 }
+

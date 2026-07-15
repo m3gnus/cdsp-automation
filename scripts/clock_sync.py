@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Synchronize MOTU clock source with CamillaDSP sample rate."""
+"""Synchronize MOTU clock ownership with the active audio source."""
 
 from __future__ import annotations
 
 import binascii
 import os
 import time
+from pathlib import Path
 
 import websocket
 from camilladsp import CamillaClient
@@ -14,7 +15,6 @@ from camilladsp import CamillaClient
 MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
 CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
-OPTICAL_RATE = int(os.environ.get("MOTU_OPTICAL_RATE", "48000"))
 CHECK_INTERVAL = float(os.environ.get("MOTU_CHECK_INTERVAL", "1"))
 
 # MOTU UltraLite mk5 clock-source payloads captured from the web UI.
@@ -22,13 +22,15 @@ CLOCK_PAYLOADS = {
     "internal": "000b0000000103",
     "optical": "000b0000000102",
 }
+_next_motu_error_log = 0.0
 
 
-def set_motu_clock(source: str) -> None:
+def set_motu_clock(source: str) -> bool:
+    global _next_motu_error_log
     payload_hex = CLOCK_PAYLOADS.get(source)
     if payload_hex is None:
         print(f"MOTU: unknown clock source {source}", flush=True)
-        return
+        return False
 
     ws = None
     try:
@@ -37,8 +39,13 @@ def set_motu_clock(source: str) -> None:
         ws.connect(MOTU_WS_URL, timeout=3)
         ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
         print(f"MOTU: clock source set to {source}", flush=True)
+        return True
     except Exception as exc:
-        print(f"MOTU error: {exc}", flush=True)
+        now = time.monotonic()
+        if now >= _next_motu_error_log:
+            print(f"MOTU error: {exc}", flush=True)
+            _next_motu_error_log = now + 30
+        return False
     finally:
         if ws is not None:
             try:
@@ -58,12 +65,19 @@ def current_sample_rate(active_config: object) -> int | None:
     return rate if rate > 0 else None
 
 
+def source_for_config_path(path: object) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    source = Path(path).stem.split("--", 1)[0]
+    return source if source in {"toslink", "streamer", "gadget", "analog"} else None
+
+
 def main() -> int:
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
-    last_rate = None
+    last_clock = None
     next_error_log = 0.0
 
-    print("MOTU Clock Sync (sample rate mode) started", flush=True)
+    print("MOTU Clock Sync (source identity mode) started", flush=True)
     print(f"MOTU WebSocket: {MOTU_WS_URL}", flush=True)
 
     while True:
@@ -73,17 +87,22 @@ def main() -> int:
                 print("Connected to CamillaDSP", flush=True)
 
             rate = current_sample_rate(cdsp.config.active())
-            if rate is None:
+            source = source_for_config_path(cdsp.config.file_path())
+            if rate is None or source is None:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if rate != last_rate:
-                print(f"CamillaDSP sample rate: {rate} Hz", flush=True)
-                set_motu_clock("optical" if rate == OPTICAL_RATE else "internal")
-                last_rate = rate
+            desired_clock = "optical" if source == "toslink" else "internal"
+            if desired_clock != last_clock:
+                if set_motu_clock(desired_clock):
+                    print(
+                        f"CamillaDSP source={source}, sample rate={rate} Hz",
+                        flush=True,
+                    )
+                    last_clock = desired_clock
 
         except Exception as exc:
-            last_rate = None
+            last_clock = None
             now = time.monotonic()
             if now >= next_error_log:
                 print(f"CamillaDSP error: {exc}", flush=True)

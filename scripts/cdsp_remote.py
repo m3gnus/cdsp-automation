@@ -10,12 +10,23 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import evdev
 from camilladsp import CamillaClient
+from audio_eq import read_audio_state, reset_tone_bands, update_tone_band
+from speaker_profiles import (
+    BUILTIN_SPEAKERS,
+    audio_control_lock,
+    read_speaker_selection,
+    require_audio_unmute_allowed,
+    resolve_profile_audio_path,
+    speaker_selection_lock,
+)
 
 
 # ====================== CONFIGURATION ======================
+
 
 def resolve_binary(name: str, fallbacks: tuple[str, ...]) -> str:
     found = shutil.which(name)
@@ -36,6 +47,27 @@ CDSP_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 TONE_MIN = float(os.environ.get("REMOTE_TONE_MIN", "-6"))
 TONE_MAX = float(os.environ.get("REMOTE_TONE_MAX", "6"))
 TONE_STEP = float(os.environ.get("REMOTE_TONE_STEP", "0.5"))
+AUDIO_EQ_PATH = Path(
+    os.environ.get("AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json")
+)
+SPEAKER_SELECTION_PATH = Path(
+    os.environ.get(
+        "SPEAKER_SELECTION_PATH", "/var/lib/cdsp-automation/speaker-selection.json"
+    )
+)
+SPEAKER_AUDIO_DIR = Path(
+    os.environ.get("SPEAKER_AUDIO_DIR", "/var/lib/cdsp-automation/speaker-audio")
+)
+AUDIO_CONTROL_LOCK_PATH = Path(
+    os.environ.get(
+        "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
+    )
+)
+AUDIO_READY_PATH = Path(
+    os.environ.get(
+        "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
+    )
+)
 
 VOLUME_MIN = float(os.environ.get("REMOTE_VOLUME_MIN", "-80"))
 VOLUME_MAX = float(os.environ.get("REMOTE_VOLUME_MAX", "0"))
@@ -44,10 +76,14 @@ VOLUME_STEP = float(os.environ.get("REMOTE_VOLUME_STEP", "1"))
 ENTER_HOLD_SECONDS = float(os.environ.get("REMOTE_ENTER_HOLD_SECONDS", "1"))
 RESTART_HOLD_SECONDS = float(os.environ.get("REMOTE_RESTART_HOLD_SECONDS", "1"))
 SHUTDOWN_HOLD_SECONDS = float(os.environ.get("REMOTE_SHUTDOWN_HOLD_SECONDS", "10"))
-TRIGGER_RESTART_DELAY_SECONDS = float(os.environ.get("REMOTE_TRIGGER_RESTART_DELAY_SECONDS", "3"))
+TRIGGER_RESTART_DELAY_SECONDS = float(
+    os.environ.get("REMOTE_TRIGGER_RESTART_DELAY_SECONDS", "3")
+)
 
 SYSTEMCTL_BIN = resolve_binary("systemctl", ("/usr/bin/systemctl", "/bin/systemctl"))
-SYSTEMD_RUN_BIN = resolve_binary("systemd-run", ("/usr/bin/systemd-run", "/bin/systemd-run"))
+SYSTEMD_RUN_BIN = resolve_binary(
+    "systemd-run", ("/usr/bin/systemd-run", "/bin/systemd-run")
+)
 SHUTDOWN_BIN = resolve_binary("shutdown", ("/sbin/shutdown", "/usr/sbin/shutdown"))
 
 KEY_BINDINGS = {
@@ -71,6 +107,7 @@ remote_device = None
 
 # ====================== HELPER FUNCTIONS ======================
 
+
 def key_matches(keycode: str | list[str], binding: str) -> bool:
     if isinstance(keycode, list):
         return binding in keycode
@@ -86,7 +123,10 @@ def find_remote_device():
         try:
             paths = evdev.list_devices()
         except OSError as exc:
-            print(f"Cannot list input devices: {exc}. Retrying in 2 seconds...", flush=True)
+            print(
+                f"Cannot list input devices: {exc}. Retrying in 2 seconds...",
+                flush=True,
+            )
             time.sleep(2)
             continue
 
@@ -108,7 +148,10 @@ def find_remote_device():
                 pass
 
         suffix = f" Seen: {', '.join(seen)}" if seen else ""
-        print(f"Remote '{REMOTE_NAME}' not found. Retrying in 2 seconds.{suffix}", flush=True)
+        print(
+            f"Remote '{REMOTE_NAME}' not found. Retrying in 2 seconds.{suffix}",
+            flush=True,
+        )
         time.sleep(2)
 
 
@@ -154,13 +197,28 @@ def format_db(value: float | None) -> str:
     return "n/a" if value is None else f"{value:+.1f}dB"
 
 
+def current_audio_eq_path() -> tuple[Path, str]:
+    selection = read_speaker_selection(
+        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
+    )
+    return (
+        resolve_profile_audio_path(
+            SPEAKER_AUDIO_DIR,
+            selection["selected"],
+            legacy_path=AUDIO_EQ_PATH,
+        ),
+        selection["selected"],
+    )
+
+
 def adjust_volume(change: float) -> None:
     """Adjust the main volume by the specified amount."""
     try:
         client = ensure_cdsp_connected()
-        current_volume = client.volume.main_volume()
-        new_volume = max(VOLUME_MIN, min(VOLUME_MAX, current_volume + change))
-        client.volume.set_main_volume(new_volume)
+        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+            current_volume = client.volume.main_volume()
+            new_volume = max(VOLUME_MIN, min(VOLUME_MAX, current_volume + change))
+            client.volume.set_main_volume(new_volume)
         print(f"Volume: {new_volume:.1f} dB", flush=True)
     except Exception as exc:
         print(f"Error adjusting volume: {exc}", flush=True)
@@ -170,75 +228,56 @@ def toggle_mute() -> None:
     """Toggle the mute state."""
     try:
         client = ensure_cdsp_connected()
-        is_muted = client.volume.main_mute()
-        client.volume.set_main_mute(not is_muted)
+        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+            is_muted = client.volume.main_mute()
+            if is_muted:
+                require_audio_unmute_allowed(AUDIO_READY_PATH)
+            client.volume.set_main_mute(not is_muted)
         print(f"Mute: {'ON' if not is_muted else 'OFF'}", flush=True)
     except Exception as exc:
         print(f"Error toggling mute: {exc}", flush=True)
 
 
 def adjust_tone(parameter: str, change: float) -> None:
-    """Adjust bass or treble gain in the active in-memory config."""
+    """Adjust bass or treble in the persistent source-independent overlay."""
     try:
-        client = ensure_cdsp_connected()
-        cdspconf = client.config.active()
-        if not cdspconf:
-            print("No active configuration", flush=True)
-            return
-
-        filters = cdspconf.get("filters", {})
-        filt = filters.get(parameter)
-        if not filt or "parameters" not in filt or "gain" not in filt["parameters"]:
-            print(f"Filter '{parameter}' with gain parameter not found in config", flush=True)
-            return
-
-        current_gain = float(filt["parameters"]["gain"])
-        new_gain = max(TONE_MIN, min(TONE_MAX, current_gain + change))
-        filt["parameters"]["gain"] = new_gain
-        client.config.set_active(cdspconf)
-        print(f"{parameter}: {new_gain:+.1f} dB", flush=True)
-
+        band_id = "low" if parameter == "Bass" else "high"
+        with speaker_selection_lock(SPEAKER_SELECTION_PATH):
+            audio_path, speaker_id = current_audio_eq_path()
+            state = update_tone_band(
+                audio_path, band_id, change, TONE_MIN, TONE_MAX
+            )
+        band = next(item for item in state["bands"] if item["id"] == band_id)
+        print(
+            f"{parameter} [{speaker_id}]: {band['gain']:+.1f} dB "
+            f"(EQ revision {state['revision']})",
+            flush=True,
+        )
     except Exception as exc:
         print(f"Error adjusting {parameter}: {exc}", flush=True)
 
 
 def get_current_tone() -> tuple[float | None, float | None]:
-    """Get current bass and treble values."""
+    """Get current bass and treble from the persistent overlay."""
     try:
-        client = ensure_cdsp_connected()
-        cdspconf = client.config.active()
-        if cdspconf:
-            filters = cdspconf.get("filters", {})
-            bass = filters.get("Bass", {}).get("parameters", {}).get("gain")
-            treble = filters.get("Treble", {}).get("parameters", {}).get("gain")
-            return (
-                None if bass is None else float(bass),
-                None if treble is None else float(treble),
-            )
+        with speaker_selection_lock(SPEAKER_SELECTION_PATH):
+            audio_path, _speaker_id = current_audio_eq_path()
+            state = read_audio_state(audio_path)
+        bass = next((b["gain"] for b in state["bands"] if b["id"] == "low"), None)
+        treble = next((b["gain"] for b in state["bands"] if b["id"] == "high"), None)
+        return bass, treble
     except Exception as exc:
         print(f"Error getting tone: {exc}", flush=True)
     return None, None
 
 
 def reset_tone() -> None:
-    """Reset both bass and treble to 0."""
+    """Reset both persistent shelf controls to 0."""
     try:
-        client = ensure_cdsp_connected()
-        cdspconf = client.config.active()
-        if not cdspconf:
-            return
-
-        filters = cdspconf.get("filters", {})
-        missing = [name for name in ("Bass", "Treble") if name not in filters]
-        if missing:
-            print(f"Tone reset skipped; missing filters: {', '.join(missing)}", flush=True)
-            return
-
-        filters["Bass"]["parameters"]["gain"] = 0
-        filters["Treble"]["parameters"]["gain"] = 0
-        client.config.set_active(cdspconf)
-        print("Tone reset: Bass=0 dB, Treble=0 dB", flush=True)
-
+        with speaker_selection_lock(SPEAKER_SELECTION_PATH):
+            audio_path, speaker_id = current_audio_eq_path()
+            reset_tone_bands(audio_path)
+        print(f"Tone reset [{speaker_id}]: Bass=0 dB, Treble=0 dB", flush=True)
     except Exception as exc:
         print(f"Error resetting tone: {exc}", flush=True)
 
@@ -290,7 +329,10 @@ def restart_services() -> None:
             if result.returncode == 0:
                 print(f"  Restarted: {service}", flush=True)
             else:
-                print(f"  Skipped: {service} ({result.stderr.strip() or result.stdout.strip()})", flush=True)
+                print(
+                    f"  Skipped: {service} ({result.stderr.strip() or result.stdout.strip()})",
+                    flush=True,
+                )
         except subprocess.TimeoutExpired:
             print(f"  Timeout: {service}", flush=True)
         except Exception as exc:
@@ -325,7 +367,9 @@ def restart_services() -> None:
         if result.returncode == 0:
             print("  Restarted: cdsp-remote.service", flush=True)
         else:
-            print(f"  Skipped: cdsp-remote.service ({result.stderr.strip()})", flush=True)
+            print(
+                f"  Skipped: cdsp-remote.service ({result.stderr.strip()})", flush=True
+            )
     except subprocess.TimeoutExpired:
         print("  Timeout: cdsp-remote.service", flush=True)
     except Exception as exc:
@@ -337,12 +381,16 @@ def shutdown_system() -> None:
     try:
         result = run_sudo([SHUTDOWN_BIN, "-h", "now"], timeout=5)
         if result.returncode != 0:
-            print(f"Shutdown failed: {result.stderr.strip() or result.stdout.strip()}", flush=True)
+            print(
+                f"Shutdown failed: {result.stderr.strip() or result.stdout.strip()}",
+                flush=True,
+            )
     except Exception as exc:
         print(f"Shutdown failed: {exc}", flush=True)
 
 
 # ====================== EVENT HANDLING ======================
+
 
 async def handle_remote_events(device) -> None:
     """Process events from the remote control device."""
@@ -361,16 +409,34 @@ async def handle_remote_events(device) -> None:
                 now = time.monotonic()
 
                 if attrib.keystate == 1:
-                    if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) or key_matches(key, KEY_BINDINGS["VOLUMEUP"]):
-                        change = -VOLUME_STEP if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) else VOLUME_STEP
+                    if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) or key_matches(
+                        key, KEY_BINDINGS["VOLUMEUP"]
+                    ):
+                        change = (
+                            -VOLUME_STEP
+                            if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"])
+                            else VOLUME_STEP
+                        )
                         adjust_volume(change)
                     elif key_matches(key, KEY_BINDINGS["MUTE"]):
                         toggle_mute()
-                    elif key_matches(key, KEY_BINDINGS["UP"]) or key_matches(key, KEY_BINDINGS["DOWN"]):
-                        change = TONE_STEP if key_matches(key, KEY_BINDINGS["UP"]) else -TONE_STEP
+                    elif key_matches(key, KEY_BINDINGS["UP"]) or key_matches(
+                        key, KEY_BINDINGS["DOWN"]
+                    ):
+                        change = (
+                            TONE_STEP
+                            if key_matches(key, KEY_BINDINGS["UP"])
+                            else -TONE_STEP
+                        )
                         adjust_tone("Treble", change)
-                    elif key_matches(key, KEY_BINDINGS["LEFT"]) or key_matches(key, KEY_BINDINGS["RIGHT"]):
-                        change = TONE_STEP if key_matches(key, KEY_BINDINGS["RIGHT"]) else -TONE_STEP
+                    elif key_matches(key, KEY_BINDINGS["LEFT"]) or key_matches(
+                        key, KEY_BINDINGS["RIGHT"]
+                    ):
+                        change = (
+                            TONE_STEP
+                            if key_matches(key, KEY_BINDINGS["RIGHT"])
+                            else -TONE_STEP
+                        )
                         adjust_tone("Bass", change)
                     elif key_matches(key, KEY_BINDINGS["ENTER"]):
                         hold_started_at["ENTER"] = now
@@ -380,20 +446,32 @@ async def handle_remote_events(device) -> None:
                         hold_handled.discard("POWER")
 
                 elif attrib.keystate == 2:
-                    if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) or key_matches(key, KEY_BINDINGS["VOLUMEUP"]):
+                    if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) or key_matches(
+                        key, KEY_BINDINGS["VOLUMEUP"]
+                    ):
                         counter_volume += 1
                         if counter_volume >= 2:
-                            change = -VOLUME_STEP if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"]) else VOLUME_STEP
+                            change = (
+                                -VOLUME_STEP
+                                if key_matches(key, KEY_BINDINGS["VOLUMEDOWN"])
+                                else VOLUME_STEP
+                            )
                             adjust_volume(change)
                             counter_volume = 0
                     elif key_matches(key, KEY_BINDINGS["ENTER"]):
                         started = hold_started_at.setdefault("ENTER", now)
-                        if now - started >= ENTER_HOLD_SECONDS and "ENTER" not in hold_handled:
+                        if (
+                            now - started >= ENTER_HOLD_SECONDS
+                            and "ENTER" not in hold_handled
+                        ):
                             reset_tone()
                             hold_handled.add("ENTER")
                     elif key_matches(key, KEY_BINDINGS["POWER"]):
                         started = hold_started_at.setdefault("POWER", now)
-                        if now - started >= SHUTDOWN_HOLD_SECONDS and "POWER" not in hold_handled:
+                        if (
+                            now - started >= SHUTDOWN_HOLD_SECONDS
+                            and "POWER" not in hold_handled
+                        ):
                             hold_handled.add("POWER")
                             shutdown_system()
 
@@ -415,7 +493,10 @@ async def handle_remote_events(device) -> None:
                             if held >= SHUTDOWN_HOLD_SECONDS:
                                 shutdown_system()
                             elif held >= RESTART_HOLD_SECONDS:
-                                print("Power button held 1s - restarting services...", flush=True)
+                                print(
+                                    "Power button held 1s - restarting services...",
+                                    flush=True,
+                                )
                                 restart_services()
                         hold_handled.discard("POWER")
 
@@ -429,6 +510,7 @@ async def handle_remote_events(device) -> None:
 
 
 # ====================== MAIN ======================
+
 
 def grab_device(device) -> None:
     try:
@@ -477,7 +559,10 @@ def main() -> int:
         volume = client.volume.main_volume()
         muted = client.volume.main_mute()
         config = os.path.basename(client.config.file_path())
-        print(f"Current: Volume={volume:.1f}dB, Mute={'ON' if muted else 'OFF'}, Config={config}", flush=True)
+        print(
+            f"Current: Volume={volume:.1f}dB, Mute={'ON' if muted else 'OFF'}, Config={config}",
+            flush=True,
+        )
     except Exception as exc:
         print(f"Could not get initial status: {exc}", flush=True)
 

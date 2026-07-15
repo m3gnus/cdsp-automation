@@ -1,0 +1,13 @@
+# A source base owns capture/rate only. It must not contain playback, mixers,
+# processors, crossovers, output delays, or speaker correction.
+devices:
+  samplerate: 48000
+  chunksize: 1024
+  capture:
+    type: Alsa
+    device: hw:Loopback,1
+    channels: 2
+    format: S32_LE
+  volume_limit: -20
+filters: {}
+pipeline: []

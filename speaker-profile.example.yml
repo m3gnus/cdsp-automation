@@ -1,0 +1,58 @@
+# Copy to SPEAKER_PROFILE_DIR/<id>.yml only after replacing every placeholder
+# with measured routing/XO data. Keep enabled false until camilladsp -c and the
+# hardware channel map have both been verified.
+#
+# Prefer the parametric form: replace the hand-written `camilladsp:` fragment
+# with a `crossover:` section (ways, slopes, trims, delays, outputs) and the
+# fragment plus all routing fields are generated and validated automatically —
+# editable from the control UI. See speaker-profiles/*.yml in uglan-lights.
+version: 1
+id: partymeh
+label: PartyMEH
+description: Three-way stereo system on outputs 1-6
+enabled: false
+supported_sources: [streamer, gadget, toslink, analog]
+output_channels: 8
+active_outputs: []
+muted_outputs: [0, 1, 2, 3, 4, 5, 6, 7]
+output_roles:
+  - unconfigured-1
+  - unconfigured-2
+  - unconfigured-3
+  - unconfigured-4
+  - unconfigured-5
+  - unconfigured-6
+  - unconfigured-7
+  - unconfigured-8
+max_volume_db: -60
+bypass_user_eq: false
+# Set true only for the Measurement profile. This rejects all source/profile
+# filters and leaves only the explicit output-routing mixer.
+raw_measurement: false
+capabilities:
+  secondary_program: false
+  # Publish these only when playback outputs genuinely represent XO bands.
+  # meter_bands: {low: [4, 5], mid: [2, 3], high: [0, 1]}
+camilladsp:
+  devices:
+    playback:
+      type: Alsa
+      device: hw:UltraLitemk5
+      channels: 8
+      format: S32_LE
+  filters: {}
+  mixers:
+    spk_partymeh_output:
+      channels: {in: 2, out: 8}
+      mapping:
+        - {dest: 0, mute: true, sources: []}
+        - {dest: 1, mute: true, sources: []}
+        - {dest: 2, mute: true, sources: []}
+        - {dest: 3, mute: true, sources: []}
+        - {dest: 4, mute: true, sources: []}
+        - {dest: 5, mute: true, sources: []}
+        - {dest: 6, mute: true, sources: []}
+        - {dest: 7, mute: true, sources: []}
+  processors: {}
+  pipeline:
+    - {type: Mixer, name: spk_partymeh_output}

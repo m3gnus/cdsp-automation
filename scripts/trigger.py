@@ -28,10 +28,11 @@ def music_is_playing(rms_levels: object) -> bool:
     )
 
 
-async def relay_control(stop: asyncio.Event) -> None:
+async def relay_control(stop: asyncio.Event, manual_off: asyncio.Event) -> None:
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
     silence_seconds = 0.0
     relay_on = False
+    suppress_current_audio = False
 
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(POWER_GPIO, GPIO.OUT, initial=GPIO.LOW)
@@ -43,7 +44,23 @@ async def relay_control(stop: asyncio.Event) -> None:
                     cdsp.connect()
                     print("Connected to CamillaDSP", flush=True)
 
-                if music_is_playing(cdsp.levels.capture_rms()):
+                playing = music_is_playing(cdsp.levels.capture_rms())
+
+                if manual_off.is_set():
+                    manual_off.clear()
+                    GPIO.output(POWER_GPIO, GPIO.LOW)
+                    relay_on = False
+                    silence_seconds = 0.0
+                    # If audio is still present, do not undo the manual command
+                    # on the next 200 ms poll. Silence re-arms normal triggering.
+                    suppress_current_audio = playing
+                    print("Manual request - relay OFF", flush=True)
+
+                if suppress_current_audio and not playing:
+                    suppress_current_audio = False
+                    print("Silence detected - automatic relay trigger re-armed", flush=True)
+
+                if playing and not suppress_current_audio:
                     silence_seconds = 0.0
                     if not relay_on:
                         GPIO.output(POWER_GPIO, GPIO.HIGH)
@@ -74,6 +91,7 @@ async def relay_control(stop: asyncio.Event) -> None:
 
 async def main() -> int:
     stop = asyncio.Event()
+    manual_off = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         try:
@@ -81,7 +99,12 @@ async def main() -> int:
         except NotImplementedError:
             signal.signal(signum, lambda _sig, _frame: stop.set())
 
-    await relay_control(stop)
+    try:
+        loop.add_signal_handler(signal.SIGUSR1, manual_off.set)
+    except NotImplementedError:
+        signal.signal(signal.SIGUSR1, lambda _sig, _frame: manual_off.set())
+
+    await relay_control(stop, manual_off)
     return 0
 
 

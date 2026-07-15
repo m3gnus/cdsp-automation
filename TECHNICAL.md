@@ -1,5 +1,41 @@
 # CamillaDSP Automation Utilities for Raspberry Pi
 
+## Speaker-profile contract
+
+Speaker selection is stored as a versioned, compare-and-swap document at
+`SPEAKER_SELECTION_PATH`. Non-Kantarellen definitions use profile schema 1 and
+must explicitly provide: `id`, `enabled`, `supported_sources`,
+`output_channels`, complete `active_outputs`/`muted_outputs`, one role per
+output, a non-positive `max_volume_db`, `bypass_user_eq`, `raw_measurement`,
+capabilities, and a
+CamillaDSP fragment. Profile-owned filter/mixer/processor names use the
+`spk_<id>_` prefix. The profile owns playback and output routing; the source
+base owns capture, samplerate, clock-related device settings, and (for normal
+speaker profiles) pre-routing source filters. Source bases may not own mixers
+or processors. A `raw_measurement: true` Measurement profile additionally
+requires `bypass_user_eq: true`, empty source filters/pipeline, and empty
+profile filters/processors; only its explicit output mixer remains.
+
+`capabilities.meter_bands` is optional and, when present, strictly maps the
+active playback outputs into non-overlapping low/mid/high groups. The applied
+profile publishes this map in its transactional status. Consumers disable
+frequency-dependent displays/effects when the map is absent or status is not
+fully applied.
+
+The compiler rejects coercion in safety fields: YAML booleans must be real
+booleans and channel/output indices must be real integers. The terminal mixer
+must cover exactly every playback destination, muted destinations must have no
+sources, and active destinations must have valid sources. CamillaDSP's offline
+checker is an additional validation layer, not a replacement for this semantic
+contract.
+
+Generated files live under
+`SPEAKER_GENERATED_DIR/<sha256>/<source>--<speaker>.yml`. Both the digest and
+managed-path provenance are checked before use. The ready-token and shared
+audio-control lock make reload a fail-closed transaction: inhibit → mute →
+validate/reload/verify → overlay → restore requested mute → publish ready.
+Rollback always re-inhibits and asserts mute before loading the previous graph.
+
 I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
 
 ## Installation
@@ -29,6 +65,9 @@ The script continuously monitors CamillaDSP's capture RMS levels every 200ms by 
 - **320-second timeout** - Long enough to handle natural gaps in music (between tracks, quiet passages) without constantly cycling your amplifier on/off, which could cause pops or reduce component life
 - **Configurable RMS threshold** - Defaults to `-80` dB, avoiding a hard dependency on sentinel values and keeping quiet-but-real audio detectable
 - **Uses lgpio** - The modern GPIO library that works with current Raspberry Pi OS versions (RPi.GPIO is deprecated)
+- **Manual off without disabling automation** - `SIGUSR1` drops the relay
+  immediately and suppresses the current continuous audio session; after
+  silence, the next audio activity turns the relay on normally
 
 **Practical use:** Connect a 5V relay module to GPIO 4 and ground. Use the relay's normally-open contacts to send the Pi's 5V output to an amplifier trigger input that accepts it.
 
@@ -38,20 +77,29 @@ The script continuously monitors CamillaDSP's capture RMS levels every 200ms by 
 
 ### What it does (simple):
 
-Automatically switches your MOTU audio interface's clock source based on CamillaDSP's sample rate. Sets it to "optical" for 48kHz, "internal" for everything else.
+Automatically switches your MOTU audio interface's clock source from the active
+managed source identity. TOSLINK selects optical; streamer, gadget, and analog
+select internal, regardless of sample rate.
 
 ### How it works (detailed):
 
-The script polls CamillaDSP's active configuration every second to read the current sample rate. When a rate change is detected, it sends binary WebSocket commands directly to the MOTU's web interface to change the clock source. The hex payloads (`000b0000000103` for internal, `000b0000000102` for optical) are reverse-engineered commands from MOTU's web UI.
+The script polls CamillaDSP's active managed config path every second. A
+`toslink` config selects optical clock; `streamer`, `gadget`, and `analog`
+select internal clock. The sample rate is checked for a valid running config
+but is not used to infer ownership. It sends binary WebSocket commands directly
+to the MOTU web interface. The hex payloads (`000b0000000103` for internal,
+`000b0000000102` for optical) are reverse-engineered commands from MOTU's web UI.
 
 **Why this approach:**
 
 - **WebSocket communication** - MOTU interfaces expose a WebSocket API that their web UI uses. By capturing and replaying these commands, we can control the device programmatically without any official API
-- **Sample rate detection** - Reading from CamillaDSP's config ensures we're always synchronized with the actual DSP state, not making assumptions
-- **48kHz = optical logic** - This assumes your TOSLINK/optical input runs at 48kHz (common for streaming devices, TVs, game consoles) while internal sources use different rates
+- **Source identity** - The immutable managed config name records the active
+  input, so equal-rate sources still select the correct owner
 - **Binary payloads** - The MOTU protocol uses binary WebSocket frames, not JSON/text, which is why we need `binascii.unhexlify()`
 
-**Practical use:** If you switch between a 48kHz TOSLINK source and a 44.1kHz USB input, the MOTU needs to match its clock source. This script eliminates manual switching and prevents audio dropouts from clock mismatch.
+**Practical use:** Switching between TOSLINK and USB changes the MOTU clock
+owner even when both graphs run at 48 kHz. Failed WebSocket sends are retried
+instead of being recorded as applied.
 
 **Note:** The hex payloads are for MOTU UltraLite. Other MOTU models may use different commands - you'd need to capture them from the web UI using browser developer tools.
 
@@ -130,8 +178,8 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 - **evdev for input** - Direct kernel-level access to input events, works with any HID device that registers as a keyboard
 - **Async event loop** - Non-blocking event processing allows the script to handle rapid button presses and long holds without lag
 - **Separate tone step** - Bass/treble use 0.5dB steps (configurable) for fine adjustment, while volume uses 1dB steps for faster changes
-- **Tone limits** - Hardcoded ±6dB range prevents accidentally over-boosting frequencies
-- **Filter-based tone control** - Modifies the `gain` parameter in Bass/Treble Biquad filters, which must exist in your CamillaDSP config
+- **Tone limits** - Configurable ±6dB default range prevents accidental over-boosting
+- **Persistent tone control** - Atomically updates reserved `low`/`high` shelf IDs in the shared audio overlay; the source switcher applies them and remains the sole live-config writer
 - **Device reconnection** - If the Bluetooth remote disconnects, the script automatically searches for it again
 
 **Button mapping:**
@@ -174,25 +222,11 @@ The script searches for the configured `REMOTE_NAME` from `~/camilladsp/cdsp-aut
 
 **CamillaDSP requirements:**
 
-For tone controls, your config must have filters named exactly `Bass` and `Treble` with a `gain` parameter:
-
-```yaml
-filters:
-  Bass:
-    type: Biquad
-    parameters:
-      type: Lowshelf
-      freq: 85
-      gain: 0
-      q: 0.9
-  Treble:
-    type: Biquad
-    parameters:
-      type: Highshelf
-      freq: 6500
-      gain: 0
-      q: 0.7
-```
+Tone control is stored in `/var/lib/cdsp-automation/audio-eq.json` and applied
+through the source switcher's owned `uglan_ui_eq_*` overlay. The remote adjusts
+the reserved low/high shelf bands. Source configs must not add separate
+`Bass`, `Treble`, `Loudness`, or `Iso226` stages because those would stack with
+the owned overlay; legacy stages are stripped when a config becomes active.
 
 ---
 

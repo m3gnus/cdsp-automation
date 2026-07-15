@@ -26,11 +26,13 @@ Before installing, ensure you have:
   - `~/camilladsp/configs/streamer.yml` - For AirPlay/network streaming
   - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
 - Optional `~/camilladsp/configs/analog.yml` for manual or meter-based analog input
-- **IMPORTANT:** Only the TOSLINK config should use 48kHz sample rate. Other configs must use different rates (e.g., 44.1kHz, 96kHz)
+- Clock ownership is derived from the managed source name, not sample rate:
+  TOSLINK selects optical; streamer, gadget, and analog select internal. Equal
+  sample rates across sources are therefore supported.
 
 **For Remote Control:**
 - Bluetooth or USB HID remote control ([like this](https://www.aliexpress.com/item/1005010182280772.html))
-- CamillaDSP config with `Bass` and `Treble` filters (for tone control)
+- The installed persistent audio-EQ overlay (tone control uses its reserved low/high shelves)
 
 ## Quick Start
 
@@ -47,13 +49,74 @@ chmod +x install.sh
 - The installer uses `sudo` where required, so you do not need to run the whole script as root
 - Choose option **1** to install all utilities at once, or install them individually
 
+## Audio control architecture
+
+The source switcher is the only writer of the active CamillaDSP configuration.
+It composes the selected speaker's persistent EQ/loudness overlay from
+`/var/lib/cdsp-automation/speaker-audio` into every source before that
+speaker's crossover. Kantarellen retains the legacy
+`/var/lib/cdsp-automation/audio-eq.json` path until an explicit quiesced
+migration. The browser and HID remote resolve the selected profile for every
+edit, so Bass/Treble, user EQ, and loudness remain independent per speaker.
+
+Speaker selection and source arbitration are orthogonal. Kantarellen uses the
+existing full configs. Non-legacy profiles are strict YAML fragments in
+`SPEAKER_PROFILE_DIR`; they are composed with capture-only YAML bases from
+`SOURCE_BASE_DIR`, written to digest-addressed immutable files, checked with
+`camilladsp -c`, and reloaded transactionally. A profile is unavailable until
+all of its declared source bases exist and `enabled: true` is explicit.
+
+The output contract requires every physical output to be declared active or
+muted and the final pipeline step to be a safety/output mixer. A typical
+three-way topology is: stereo source processing → expansion mixer → per-output
+crossover/delay/gain filters → final 1:1 output mixer. Do not enable PartyMEH,
+Bird, or Measurement definitions until measured crossover, polarity, delay,
+gain, and channel routing values are known. Measurement must set both
+`raw_measurement: true` and `bypass_user_eq: true`. That contract rejects all
+source and profile filters/processors and every source pipeline step, leaving
+only the profile's explicit direct output mixer; its output level remains the
+operator's responsibility.
+The repository's `speaker-profile.example.yml` is deliberately disabled and
+fully muted; `source-base.example.yml` shows the capture-only boundary.
+
+All master-volume writers share `AUDIO_CONTROL_LOCK_PATH`. A boot-scoped
+`AUDIO_READY_PATH` is absent by default and is created only as the final commit
+of a verified transition. While absent, AirPlay, the browser, and HID remote
+may mute but cannot unmute.
+
+The all-utilities install also:
+
+- builds the pinned CamillaDSP 4.1.3 ISO 226 patch, runs the full Rust library
+  suite plus deployed-config checks, and rolls back automatically if the new
+  process is not healthy;
+- installs a persistent AirPlay volume daemon and a non-blocking Shairport
+  callback, backs up/validates its configuration, and restores the original
+  volume settings on uninstall;
+- exposes low/mid/high analysis from crossover output meters declared by the
+  active speaker profile. This avoids a second ALSA capture path that would
+  otherwise see only streamer sources or contend with the main DSP instance.
+  Kantarellen publishes high 0–1, mid 2–3 and low 4–5; other profiles publish
+  their actual `capabilities.meter_bands` or omit it. Missing groups are
+  reported as unavailable rather than displayed as valid silence.
+
+ISO calibration: choose a comfortable reference master setting, measure SPL at
+the listening position, enter the measured value as the reference phon and then
+enable the engine. Fixed MOTU and amplifier trims remain calibration stages;
+day-to-day volume belongs to the CamillaDSP Main fader.
+
+The implementation uses the established ISO 226:2003 coefficient model as a
+practical approximation to the 2023 revision. The published revision analysis
+places the maximum difference at 0.6 dB; the licensed 2023 Annex B data is not
+copied into this repository.
+
 ---
 
 ## 🎮 Remote Control - Detailed Setup
 
 ### What It Does
 
-Control CamillaDSP from a Bluetooth or USB HID remote. Adjust volume, mute, bass, and treble without touching your computer.
+Control CamillaDSP from a Bluetooth or USB HID remote. Volume and mute drive the
+CamillaDSP Main fader; Bass and Treble update the shared persistent Audio overlay.
 
 ### Hardware Requirements
 
@@ -128,27 +191,13 @@ REMOTE_VOLUME_MAX=0
 REMOTE_VOLUME_STEP=1
 ```
 
-### CamillaDSP Filter Requirements
+### CamillaDSP Filter Ownership
 
-For tone controls to work, your CamillaDSP config must include `Bass` and `Treble` filters:
-
-```yaml
-filters:
-  Bass:
-    type: Biquad
-    parameters:
-      type: Lowshelf
-      freq: 85
-      gain: 0
-      q: 0.9
-  Treble:
-    type: Biquad
-    parameters:
-      type: Highshelf
-      freq: 6500
-      gain: 0
-      q: 0.7
-```
+Do not add legacy filters named `Bass`, `Treble`, or `loudness` to source
+configs. The source switcher owns the persistent `uglan_ui_eq_*` overlay and
+uses its reserved low/high shelves for remote tone control. It also removes
+legacy connected tone and loudness stages so they cannot stack with the GUI EQ
+or the optional ISO226 filter.
 
 ---
 
@@ -217,6 +266,9 @@ TRIGGER_AUDIO_THRESHOLD_DB=-80
 - Starts 320-second countdown when music stops
 - Only turns relay OFF if silence continues for full duration
 - Resets countdown if music resumes
+- Accepts `SIGUSR1` for an immediate manual OFF. If audio is still active it
+  stays off until silence is observed, then automatic triggering is re-armed
+  for the next audio session.
 
 **Why 320 seconds?** Long enough to handle gaps between tracks and quiet passages without constantly cycling your amplifier on/off.
 
@@ -226,20 +278,22 @@ TRIGGER_AUDIO_THRESHOLD_DB=-80
 
 ### What It Does
 
-Automatically switches your MOTU audio interface's clock source when CamillaDSP changes sample rates.
+Automatically switches your MOTU audio interface's clock source from the active
+managed source identity.
 
 ### How It Works
 
-- Detects sample rate changes in CamillaDSP
+- Reads the source name from CamillaDSP's managed config path
 - Sends WebSocket commands to MOTU to change clock source
-- **48kHz** → switches to **optical** clock
-- **Other rates** → switches to **internal** clock
+- **TOSLINK** → switches to **optical** clock
+- **Streamer, USB gadget, or analog** → switches to **internal** clock
+- Retries a failed MOTU command until it is confirmed sent
 
 ### Requirements
 
 - MOTU UltraLite mk5 (other MOTU models may need different hex payloads)
 - MOTU must be accessible on your network
-- Your TOSLINK source must run at 48kHz
+- The active config must use a managed source name
 
 ### Configuration
 
@@ -252,16 +306,10 @@ To change the IP later, edit `~/camilladsp/cdsp-automation.env`:
 
 ```text
 MOTU_WS_URL=ws://YOUR_MOTU_IP:1280
-MOTU_OPTICAL_RATE=48000
 ```
 
-### Important Note on Sample Rates
-
-This script assumes:
-- **TOSLINK input = 48kHz** (TVs, game consoles, streaming devices typically use 48kHz)
-- **Other inputs = different rates** (44.1kHz for CD quality, 96kHz for high-res, etc.)
-
-If your setup uses a different optical sample rate, change `MOTU_OPTICAL_RATE` in `~/camilladsp/cdsp-automation.env`.
+Clock ownership is independent of sample rate. Sources may all run at 48 kHz;
+the config identity still selects the correct clock.
 
 
 ---
@@ -290,21 +338,21 @@ the older fallback behavior.
 
 1. **`~/camilladsp/configs/toslink.yml`**
    - Configure for optical input
-   - **Must use 48kHz sample rate**
+   - Use the rate required by the source and DSP graph
 
 2. **`~/camilladsp/configs/streamer.yml`**
    - Configure for ALSA Loopback (from Squeezelite/AirPlay)
-   - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
+   - May use the same sample rate as TOSLINK
 
 3. **`~/camilladsp/configs/gadget.yml`**
    - Configure for USB Gadget
-   - Must use a different sample rate (e.g., 44.1kHz or 96kHz)
+   - May use the same sample rate as the other sources
 
 Optional manual-only configs can also be selected through the override file. For example,
 `~/camilladsp/configs/analog.yml` can be pinned manually even though analog is not
 auto-detected by default.
 
-**Why different sample rates?** The MOTU Clock Sync utility uses sample rate to determine which clock source to use. If all configs use the same rate, clock switching won't work correctly.
+The source name, not a sample-rate heuristic, controls clock ownership.
 
 ### How It Works
 
@@ -483,7 +531,9 @@ journalctl -u cdsp-remote -n 100
 
 **Tone controls not working:**
 
-Ensure your CamillaDSP config has `Bass` and `Treble` filters with a `gain` parameter.
+Check that `cdsp-source-switcher.service` is active and that
+`/var/lib/cdsp-automation/audio-eq.json` is writable by the service user. Do
+not add separate `Bass` or `Treble` filters.
 
 ### Trigger Control Not Working
 
@@ -579,12 +629,11 @@ ls -l ~/camilladsp/configs/
 camilladsp -c ~/camilladsp/configs/toslink.yml
 ```
 
-**Verify sample rates are different:**
+**Inspect configured sample rates:**
 
 ```bash
 grep samplerate ~/camilladsp/configs/*.yml
-# toslink.yml should show 48000
-# Others should show different rates
+# Equal rates are supported; each source should use the rate its graph expects.
 ```
 
 **Test hardware detection manually:**

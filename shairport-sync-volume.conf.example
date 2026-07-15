@@ -1,0 +1,8 @@
+// Merge these settings into the existing `general = { ... };` block.
+// The trailing space after the command is required: Shairport Sync appends
+// the AirPlay dB value (-30..0, with -144 meaning mute).
+general =
+{
+    ignore_volume_control = "yes";
+    run_this_when_volume_is_set = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify ";
+};
