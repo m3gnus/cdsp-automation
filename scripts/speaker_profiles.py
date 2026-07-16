@@ -23,6 +23,13 @@ from audio_eq import (
 
 SELECTION_VERSION = 1
 DEFAULT_SPEAKER_ID = "kantarellen"
+# These profiles are complete operator-owned CamillaDSP files in the normal
+# CamillaGUI config directory. They are intentionally editable in CamillaGUI;
+# the source switcher validates and loads the file directly instead of
+# generating an immutable config from the compact crossover schema.
+OPERATOR_CONFIG_SPEAKERS: dict[str, str] = {
+    "partymeh": "partymeh.yml",
+}
 BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
     "kantarellen": {
         "label": "Kantarellen",

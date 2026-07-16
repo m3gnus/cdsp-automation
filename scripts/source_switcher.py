@@ -40,6 +40,7 @@ from speaker_config import (
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
+    OPERATOR_CONFIG_SPEAKERS,
     audio_control_lock,
     audio_inhibit_active,
     clear_audio_inhibit,
@@ -377,10 +378,13 @@ def same_config(current: str | None, target: str) -> bool:
 
 
 def managed_config_identity(current: str | None) -> tuple[str, str] | None:
-    """Identify only exact legacy or digest-addressed generated configs."""
+    """Identify exact legacy, operator-owned, or generated configs."""
     for source, target in CONFIGS.items():
         if same_config(current, target):
             return source, DEFAULT_SPEAKER_ID
+    for speaker_id, filename in OPERATOR_CONFIG_SPEAKERS.items():
+        if same_config(current, os.path.join(CONFIG_DIR, filename)):
+            return "streamer", speaker_id
     if not current:
         return None
     path = Path(current).resolve(strict=False)
@@ -426,7 +430,7 @@ def current_speaker_selection() -> dict:
 
 
 def speaker_catalog() -> dict:
-    return profile_catalog(SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR)
+    return profile_catalog(SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, Path(CONFIG_DIR))
 
 
 def speaker_audio_state(speaker_id: str) -> dict:
@@ -701,6 +705,25 @@ def resolve_config_target(
     profile = load_profile(SPEAKER_PROFILE_DIR, speaker_id)
     if source not in profile["supported_sources"]:
         raise ValueError(f"speaker profile {speaker_id!r} does not support {source}")
+    operator_filename = OPERATOR_CONFIG_SPEAKERS.get(speaker_id)
+    if operator_filename:
+        path = Path(CONFIG_DIR) / operator_filename
+        expected_config = load_yaml_mapping(path, f"operator config {speaker_id}")
+        validate_config_file(path)
+        return {
+            "path": str(path),
+            "digest": config_digest(expected_config),
+            "source": source,
+            "speaker": speaker_id,
+            "max_volume_db": profile["max_volume_db"],
+            "bypass_user_eq": profile["bypass_user_eq"],
+            "legacy": False,
+            "operator_config": True,
+            "capabilities": profile["capabilities"],
+            "selection_revision": selection_revision,
+            "audio_state": speaker_audio_state(speaker_id),
+            "expected_config": expected_config,
+        }
     source_base = load_yaml_mapping(
         SOURCE_BASE_DIR / f"{source}.yml", f"source base {source}"
     )
@@ -1113,9 +1136,10 @@ def apply_config(
             selection_guard.__enter__()
             selection_guard_entered = True
         if target and not target.get("legacy", False):
-            on_disk = load_yaml_mapping(Path(file_path), "generated config")
+            label = "operator config" if target.get("operator_config") else "generated config"
+            on_disk = load_yaml_mapping(Path(file_path), label)
             if config_digest(on_disk) != target["digest"]:
-                raise RuntimeError("generated config integrity check failed")
+                raise RuntimeError(f"{label} integrity check failed")
         if target and target.get("selection_revision") is not None:
             current_selection = current_speaker_selection()
             if (
@@ -1198,7 +1222,11 @@ def apply_config(
         clear_audio_inhibit(AUDIO_READY_PATH)
         if not _spectrum_contends(target_config):
             _set_spectrum_service(True)
-        if target and not target.get("legacy", False):
+        if (
+            target
+            and not target.get("legacy", False)
+            and not target.get("operator_config", False)
+        ):
             removed = prune_generated_configs(
                 SPEAKER_GENERATED_DIR,
                 protected_paths=(Path(file_path),),

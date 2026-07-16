@@ -79,11 +79,42 @@ class VolumeSyncTests(unittest.TestCase):
                 mock.patch.object(volume_sync.time, "sleep"),
             ):
                 volume_sync.interrupt_scheduled_playback()
-                self.assertEqual(active.read_text().strip(), "active")
-                volume_sync.finish_airplay_playback()
+                self.assertEqual(active.read_text().strip(), "airplay-active")
+                volume_sync.finish_network_playback()
             self.assertFalse(active.exists())
             self.assertIn(("main", ["stop"]), calls)
             self.assertIn(("stereo", ["stop"]), calls)
+
+    def test_first_active_receiver_keeps_playback_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory) / "active"
+            services: list[tuple[str, bool]] = []
+            arbiter = volume_sync.PlaybackArbiter()
+            with (
+                mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
+                mock.patch.object(volume_sync, "_lms_request", return_value={}),
+                mock.patch.object(volume_sync.time, "sleep"),
+                mock.patch.object(
+                    volume_sync,
+                    "set_receiver_service",
+                    side_effect=lambda service, enabled: services.append(
+                        (service, enabled)
+                    ),
+                ),
+            ):
+                self.assertTrue(arbiter.start("spotify"))
+                self.assertFalse(arbiter.start("airplay"))
+                self.assertEqual(arbiter.owner, "spotify")
+                self.assertEqual(active.read_text().strip(), "spotify-active")
+                self.assertTrue(arbiter.stop("spotify"))
+            self.assertEqual(
+                services,
+                [
+                    (volume_sync.AIRPLAY_SERVICE, False),
+                    (volume_sync.AIRPLAY_SERVICE, False),
+                    (volume_sync.AIRPLAY_SERVICE, True),
+                ],
+            )
 
 
 if __name__ == "__main__":

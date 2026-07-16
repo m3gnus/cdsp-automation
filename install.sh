@@ -294,10 +294,12 @@ create_unit() {
   local unit_file
   unit_file="$(mktemp "${TMPDIR:-/tmp}/${sysname}.service.XXXXXX")"
   local runtime_directory=""
+  local unit_ordering=""
   if [[ "$sysname" == "cdsp-source-switcher" ]]; then
     runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes'
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
+    unit_ordering='Before=shairport-sync.service raspotify.service'
   fi
 
   cat > "$unit_file" <<EOL
@@ -305,6 +307,7 @@ create_unit() {
 Description=CamillaDSP $name
 Wants=network-online.target camilladsp.service
 After=network-online.target camilladsp.service
+$unit_ordering
 
 [Service]
 User=$INSTALL_USER
@@ -368,8 +371,8 @@ install_remote_sudoers() {
   tmp="$(mktemp)"
 
   cat > "$tmp" <<EOF
-# Allow cdsp-remote.service to perform only its documented power actions.
-$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
+# Allow the control services to perform only their documented service actions.
+$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN start shairport-sync.service, $SYSTEMCTL_BIN stop shairport-sync.service, $SYSTEMCTL_BIN start raspotify.service, $SYSTEMCTL_BIN stop raspotify.service, $SYSTEMCTL_BIN poweroff
 EOF
   sudo "$VISUDO_BIN" -cf "$tmp"
   sudo install -m 0440 "$tmp" /etc/sudoers.d/cdsp-automation

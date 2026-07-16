@@ -12,6 +12,7 @@ import json
 import math
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -75,6 +76,11 @@ AIRPLAY_ACTIVE_PATH = Path(
 )
 AIRPLAY_HANDOFF_TIMEOUT = float(os.environ.get("AIRPLAY_HANDOFF_TIMEOUT", "10.0"))
 AIRPLAY_RELEASE_DELAY = float(os.environ.get("AIRPLAY_RELEASE_DELAY", "1.25"))
+SYSTEMCTL_BIN = os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl")
+SUDO_BIN = os.environ.get("SUDO_BIN", "/usr/bin/sudo")
+BUSCTL_BIN = os.environ.get("BUSCTL_BIN", "/usr/bin/busctl")
+AIRPLAY_SERVICE = "shairport-sync.service"
+SPOTIFY_SERVICE = "raspotify.service"
 LMS_HOST = os.environ.get("LMS_HOST", "127.0.0.1")
 LMS_PORT = int(os.environ.get("LMS_PORT", "9000"))
 LMS_PLAYER_NAMES = tuple(
@@ -256,7 +262,7 @@ def notify(airplay_db: str) -> None:
 
 def notify_airplay_session(active: bool) -> None:
     """Ask the daemon to hand scheduled playback to or from AirPlay."""
-    target = "active" if active else ""
+    target = "airplay-active" if active else ""
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
@@ -272,12 +278,16 @@ def notify_airplay_session(active: bool) -> None:
             state = ""
         if state == target:
             return
+        if active and state.startswith("spotify-"):
+            raise RuntimeError("Spotify was already playing and keeps the receiver")
+        if not active and not state.startswith("airplay-"):
+            return
         time.sleep(0.05)
     action = "start" if active else "stop"
     raise TimeoutError(f"AirPlay {action} handoff was not acknowledged")
 
 
-def _write_airplay_state(value: str) -> None:
+def _write_playback_state(value: str) -> None:
     AIRPLAY_ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         "w",
@@ -308,9 +318,11 @@ def _lms_request(player: str, terms: list[object]) -> dict:
     return payload.get("result", {}) if isinstance(payload, dict) else {}
 
 
-def interrupt_scheduled_playback() -> None:
-    """Inhibit the scheduler, stop its players, then release ALSA to AirPlay."""
-    _write_airplay_state("starting")
+def interrupt_scheduled_playback(owner: str = "airplay") -> None:
+    """Inhibit scheduled playback and release ALSA to a network receiver."""
+    if owner not in {"airplay", "spotify"}:
+        raise ValueError(f"unsupported playback owner: {owner}")
+    _write_playback_state(f"{owner}-starting")
     try:
         players = _lms_request("", ["players", "0", "100"]).get(
             "players_loop", []
@@ -322,30 +334,140 @@ def interrupt_scheduled_playback() -> None:
                     _lms_request(player_id, ["stop"])
         # Squeezelite closes uglan_main after its one-second idle timeout.
         time.sleep(max(0.0, AIRPLAY_RELEASE_DELAY))
-        _write_airplay_state("active")
+        _write_playback_state(f"{owner}-active")
     except Exception:
         AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
         raise
 
 
-def finish_airplay_playback() -> None:
+def finish_network_playback() -> None:
     """Let the scheduler resume the currently active wall-clock event."""
     AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
 
 
 def notify_spotify(environ: dict[str, str] | None = None) -> None:
-    """Forward librespot's volume_changed event to the persistent daemon."""
+    """Forward librespot volume and playback lifecycle events to the daemon."""
     environ = os.environ if environ is None else environ
-    if environ.get("PLAYER_EVENT") != "volume_changed":
+    event = environ.get("PLAYER_EVENT")
+    if event == "volume_changed":
+        volume = int(environ["VOLUME"])
+        map_spotify_volume(volume, VOLUME_MIN_DB, VOLUME_MAX_DB)
+        message = f"spotify:{volume}"
+    elif event == "playing":
+        message = "spotify_session:start"
+    elif event in {"paused", "stopped"}:
+        message = "spotify_session:stop"
+    else:
         return
-    volume = int(environ["VOLUME"])
-    map_spotify_volume(volume, VOLUME_MIN_DB, VOLUME_MAX_DB)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(f"spotify:{volume}".encode("ascii"), str(SOCKET_PATH))
+        client.sendto(message.encode("ascii"), str(SOCKET_PATH))
     finally:
         client.close()
+
+
+def service_is_active(service: str) -> bool:
+    result = subprocess.run(
+        [SYSTEMCTL_BIN, "is-active", "--quiet", service],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def set_receiver_service(service: str, active: bool) -> None:
+    action = "start" if active else "stop"
+    result = subprocess.run(
+        [SUDO_BIN, "-n", SYSTEMCTL_BIN, action, service],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"could not {action} {service}: {detail}")
+
+
+def shairport_playback_active() -> bool:
+    result = subprocess.run(
+        [
+            BUSCTL_BIN,
+            "--system",
+            "get-property",
+            "org.gnome.ShairportSync",
+            "/org/gnome/ShairportSync",
+            "org.gnome.ShairportSync",
+            "Active",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip().endswith(" true")
+
+
+class PlaybackArbiter:
+    """Give the first active network receiver exclusive playback ownership."""
+
+    def __init__(self) -> None:
+        self.owner: str | None = None
+
+    def recover(self) -> str | None:
+        if shairport_playback_active():
+            self.owner = "airplay"
+            _write_playback_state("airplay-active")
+            set_receiver_service(SPOTIFY_SERVICE, False)
+        elif not service_is_active(AIRPLAY_SERVICE) and service_is_active(
+            SPOTIFY_SERVICE
+        ):
+            self.owner = "spotify"
+            _write_playback_state("spotify-active")
+        else:
+            self.owner = None
+            finish_network_playback()
+        return self.owner
+
+    def start(self, source: str) -> bool:
+        if source not in {"airplay", "spotify"}:
+            raise ValueError(f"unsupported playback source: {source}")
+        if self.owner == source:
+            return True
+        if self.owner is not None:
+            set_receiver_service(
+                AIRPLAY_SERVICE if source == "airplay" else SPOTIFY_SERVICE,
+                False,
+            )
+            return False
+        self.owner = source
+        other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
+        try:
+            interrupt_scheduled_playback(source)
+            set_receiver_service(other_service, False)
+        except Exception:
+            self.owner = None
+            finish_network_playback()
+            try:
+                set_receiver_service(other_service, True)
+            except Exception:
+                pass
+            raise
+        return True
+
+    def stop(self, source: str) -> bool:
+        if self.owner != source:
+            return False
+        other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
+        self.owner = None
+        finish_network_playback()
+        set_receiver_service(other_service, True)
+        return True
 
 
 def send_spotify_volume(command_id: int, volume: int) -> None:
@@ -476,6 +598,7 @@ def run_daemon() -> int:
     camilla = None
     last_camilla: tuple[float, bool] | None = None
     spotify_sync = SpotifyCommandTracker()
+    arbiter = PlaybackArbiter()
     status: dict = {
         "ok": True,
         "updated_at": time.time(),
@@ -486,6 +609,11 @@ def run_daemon() -> int:
         },
         "spotify": {"source_to_cdsp": True, "cdsp_to_source": True},
     }
+    try:
+        arbiter.recover()
+    except Exception as exc:
+        status.update({"ok": False, "error": f"playback recovery failed: {exc}"})
+    status["playback_owner"] = arbiter.owner
     try:
         while True:
             try:
@@ -506,17 +634,25 @@ def run_daemon() -> int:
                 volume_payloads = []
                 for payload in payloads:
                     source, value = parse_bridge_message(payload)
-                    if source != "airplay_session":
+                    if source not in {"airplay_session", "spotify_session"}:
                         volume_payloads.append(payload)
                         continue
+                    playback_source = (
+                        "airplay" if source == "airplay_session" else "spotify"
+                    )
                     if value == "start":
-                        interrupt_scheduled_playback()
-                        status["airplay"]["playback"] = "active"
+                        accepted = arbiter.start(playback_source)
+                        status[playback_source]["playback"] = (
+                            "active" if accepted else "held"
+                        )
                     elif value == "stop":
-                        finish_airplay_playback()
-                        status["airplay"]["playback"] = "idle"
+                        arbiter.stop(playback_source)
+                        status[playback_source]["playback"] = "idle"
                     else:
-                        raise ValueError(f"unsupported AirPlay session event: {value}")
+                        raise ValueError(
+                            f"unsupported {playback_source} session event: {value}"
+                        )
+                    status["playback_owner"] = arbiter.owner
                 payloads = volume_payloads
                 if camilla is None:
                     if CamillaClient is None:
@@ -539,6 +675,8 @@ def run_daemon() -> int:
                             status["spotify"].pop("error", None)
                         continue
                     if source == "airplay":
+                        if arbiter.owner == "spotify":
+                            continue
                         result = set_client_volume(
                             camilla,
                             float(str(value).split(",", 1)[0]),
@@ -548,6 +686,8 @@ def run_daemon() -> int:
                             "airplay_db"
                         ]
                     elif source == "spotify":
+                        if arbiter.owner == "airplay":
+                            continue
                         result = set_spotify_volume(
                             camilla, int(str(value)), persist=False
                         )
