@@ -7,6 +7,7 @@ Spotify Connect supports both directions when used with the patched librespot bu
 
 from __future__ import annotations
 
+import grp
 import json
 import math
 import os
@@ -14,6 +15,7 @@ import socket
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -56,6 +58,32 @@ SPOTIFY_COMMAND_SOCKET_PATH = Path(
     )
 )
 POLL_INTERVAL = float(os.environ.get("VOLUME_SYNC_POLL_INTERVAL", "0.25"))
+COMMAND_RETRY_SECONDS = float(
+    os.environ.get("VOLUME_SYNC_COMMAND_RETRY_SECONDS", "1.0")
+)
+COMMAND_ACK_TIMEOUT = float(
+    os.environ.get("VOLUME_SYNC_COMMAND_ACK_TIMEOUT", "3.0")
+)
+HEARTBEAT_INTERVAL = float(
+    os.environ.get("VOLUME_SYNC_HEARTBEAT_SECONDS", "10.0")
+)
+VOLUME_SYNC_GROUP = os.environ.get("VOLUME_SYNC_GROUP", "audio")
+AIRPLAY_ACTIVE_PATH = Path(
+    os.environ.get(
+        "AIRPLAY_ACTIVE_PATH", "/run/airplay-volume-bridge/playback-active"
+    )
+)
+AIRPLAY_HANDOFF_TIMEOUT = float(os.environ.get("AIRPLAY_HANDOFF_TIMEOUT", "10.0"))
+AIRPLAY_RELEASE_DELAY = float(os.environ.get("AIRPLAY_RELEASE_DELAY", "1.25"))
+LMS_HOST = os.environ.get("LMS_HOST", "127.0.0.1")
+LMS_PORT = int(os.environ.get("LMS_PORT", "9000"))
+LMS_PLAYER_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "AIRPLAY_INTERRUPTED_LMS_PLAYERS", "uglan,uglan-stereo"
+    ).split(",")
+    if name.strip()
+)
 
 
 def map_airplay_volume(
@@ -164,11 +192,10 @@ def set_mapped_volume(
         "muted": muted,
         "updated_at": time.time(),
     }
-    write_status(result)
     return result
 
 
-def set_client_volume(client, airplay_db: float) -> dict:
+def set_client_volume(client, airplay_db: float, *, persist: bool = True) -> dict:
     mapped_db, muted = map_airplay_volume(
         airplay_db, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE
     )
@@ -180,11 +207,12 @@ def set_client_volume(client, airplay_db: float) -> dict:
         source_volume=airplay_db,
     )
     result["airplay_db"] = airplay_db
-    write_status(result)
+    if persist:
+        write_status(result)
     return result
 
 
-def set_spotify_volume(client, spotify_volume: int) -> dict:
+def set_spotify_volume(client, spotify_volume: int, *, persist: bool = True) -> dict:
     mapped_db, muted = map_spotify_volume(
         spotify_volume, VOLUME_MIN_DB, VOLUME_MAX_DB
     )
@@ -196,7 +224,8 @@ def set_spotify_volume(client, spotify_volume: int) -> dict:
         source_volume=spotify_volume,
     )
     result["spotify_volume"] = spotify_volume
-    write_status(result)
+    if persist:
+        write_status(result)
     return result
 
 
@@ -225,6 +254,85 @@ def notify(airplay_db: str) -> None:
         client.close()
 
 
+def notify_airplay_session(active: bool) -> None:
+    """Ask the daemon to hand scheduled playback to or from AirPlay."""
+    target = "active" if active else ""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        event = "start" if active else "stop"
+        client.sendto(f"airplay_session:{event}".encode("ascii"), str(SOCKET_PATH))
+    finally:
+        client.close()
+    deadline = time.monotonic() + AIRPLAY_HANDOFF_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            state = AIRPLAY_ACTIVE_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            state = ""
+        if state == target:
+            return
+        time.sleep(0.05)
+    action = "start" if active else "stop"
+    raise TimeoutError(f"AirPlay {action} handoff was not acknowledged")
+
+
+def _write_airplay_state(value: str) -> None:
+    AIRPLAY_ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=AIRPLAY_ACTIVE_PATH.parent,
+        prefix=f".{AIRPLAY_ACTIVE_PATH.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(value + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(0o644)
+    temporary.replace(AIRPLAY_ACTIVE_PATH)
+
+
+def _lms_request(player: str, terms: list[object]) -> dict:
+    body = json.dumps(
+        {"id": 1, "method": "slim.request", "params": [player, terms]}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload.get("result", {}) if isinstance(payload, dict) else {}
+
+
+def interrupt_scheduled_playback() -> None:
+    """Inhibit the scheduler, stop its players, then release ALSA to AirPlay."""
+    _write_airplay_state("starting")
+    try:
+        players = _lms_request("", ["players", "0", "100"]).get(
+            "players_loop", []
+        )
+        for player in players or []:
+            if str(player.get("name", "")).strip() in LMS_PLAYER_NAMES:
+                player_id = str(player.get("playerid", "")).strip()
+                if player_id:
+                    _lms_request(player_id, ["stop"])
+        # Squeezelite closes uglan_main after its one-second idle timeout.
+        time.sleep(max(0.0, AIRPLAY_RELEASE_DELAY))
+        _write_airplay_state("active")
+    except Exception:
+        AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
+        raise
+
+
+def finish_airplay_playback() -> None:
+    """Let the scheduler resume the currently active wall-clock event."""
+    AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
+
+
 def notify_spotify(environ: dict[str, str] | None = None) -> None:
     """Forward librespot's volume_changed event to the persistent daemon."""
     environ = os.environ if environ is None else environ
@@ -240,14 +348,19 @@ def notify_spotify(environ: dict[str, str] | None = None) -> None:
         client.close()
 
 
-def send_spotify_volume(volume: int) -> None:
-    """Set librespot's Connect volume through its local command socket."""
+def send_spotify_volume(command_id: int, volume: int) -> None:
+    """Request a logical Connect volume and identify the eventual ack."""
+    if command_id < 1:
+        raise ValueError("Spotify command id must be positive")
     if not 0 <= volume <= 65535:
         raise ValueError("Spotify volume must be between 0 and 65535")
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(str(volume).encode("ascii"), str(SPOTIFY_COMMAND_SOCKET_PATH))
+        client.sendto(
+            f"{command_id}:{volume}".encode("ascii"),
+            str(SPOTIFY_COMMAND_SOCKET_PATH),
+        )
     finally:
         client.close()
 
@@ -258,6 +371,99 @@ def read_camilla_volume(client) -> tuple[float, bool]:
     )
 
 
+def read_mirrorable_camilla_volume(client) -> tuple[float, bool] | None:
+    """Read a stable master state, or pause while a config transition owns it."""
+    from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
+
+    with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+        try:
+            require_audio_unmute_allowed(AUDIO_READY_PATH)
+        except RuntimeError:
+            return None
+        return read_camilla_volume(client)
+
+
+def secure_socket(path: Path) -> None:
+    """Restrict local volume control to the installation's audio group."""
+    gid = grp.getgrnam(VOLUME_SYNC_GROUP).gr_gid
+    os.chown(path, -1, gid)
+    path.chmod(0o660)
+
+
+class SpotifyCommandTracker:
+    """Keep the newest desired Spotify state pending until librespot acks it."""
+
+    def __init__(self) -> None:
+        self.next_id = max(1, time.time_ns())
+        self.pending: dict[str, int | float | tuple[float, bool]] | None = None
+        self.last_ack_at = 0.0
+        self.last_ack_volume: int | None = None
+
+    def queue(
+        self, volume: int, camilla_state: tuple[float, bool], *, now: float
+    ) -> int:
+        self.next_id += 1
+        self.pending = {
+            "id": self.next_id,
+            "volume": volume,
+            "camilla_state": camilla_state,
+            "queued_at": now,
+            "last_sent_at": 0.0,
+            "attempts": 0,
+        }
+        return self.next_id
+
+    def should_send(self, now: float) -> bool:
+        return bool(
+            self.pending
+            and now - float(self.pending["last_sent_at"])
+            >= COMMAND_RETRY_SECONDS
+        )
+
+    def mark_sent(self, now: float) -> None:
+        if self.pending:
+            self.pending["last_sent_at"] = now
+            self.pending["attempts"] = int(self.pending["attempts"]) + 1
+
+    def acknowledge(self, command_id: int, volume: int, *, now: float) -> bool:
+        if not self.pending:
+            return False
+        if (
+            int(self.pending["id"]) != command_id
+            or int(self.pending["volume"]) != volume
+        ):
+            return False
+        self.pending = None
+        self.last_ack_at = now
+        self.last_ack_volume = volume
+        return True
+
+    def needs_heartbeat(self, now: float) -> bool:
+        return self.pending is None and now - self.last_ack_at >= HEARTBEAT_INTERVAL
+
+    def healthy(self, now: float) -> bool:
+        if self.pending and now - float(self.pending["queued_at"]) > COMMAND_ACK_TIMEOUT:
+            return False
+        return bool(
+            self.last_ack_at
+            and now - self.last_ack_at
+            <= HEARTBEAT_INTERVAL + COMMAND_ACK_TIMEOUT
+        )
+
+
+def parse_bridge_message(payload: bytes) -> tuple[str, tuple[int, ...] | str]:
+    message = payload.decode("ascii")
+    if message.startswith("spotify_ack:"):
+        fields = message.split(":")
+        if len(fields) != 3:
+            raise ValueError("invalid Spotify acknowledgement")
+        return "spotify_ack", (int(fields[1]), int(fields[2]))
+    if ":" in message:
+        source, value = message.split(":", 1)
+        return source, value
+    return "airplay", message
+
+
 def run_daemon() -> int:
     """Apply source events and mirror external master changes into Spotify."""
     map_airplay_volume(-30, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE)
@@ -265,10 +471,11 @@ def run_daemon() -> int:
     SOCKET_PATH.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     server.bind(str(SOCKET_PATH))
-    SOCKET_PATH.chmod(0o666)
+    secure_socket(SOCKET_PATH)
     server.settimeout(POLL_INTERVAL)
     camilla = None
     last_camilla: tuple[float, bool] | None = None
+    spotify_sync = SpotifyCommandTracker()
     status: dict = {
         "ok": True,
         "updated_at": time.time(),
@@ -282,38 +489,68 @@ def run_daemon() -> int:
     try:
         while True:
             try:
+                try:
+                    payload = server.recv(128)
+                except socket.timeout:
+                    payload = b""
+                payloads = [payload] if payload else []
+                if payload:
+                    server.setblocking(False)
+                    try:
+                        while len(payloads) < 64:
+                            payloads.append(server.recv(128))
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        server.settimeout(POLL_INTERVAL)
+                volume_payloads = []
+                for payload in payloads:
+                    source, value = parse_bridge_message(payload)
+                    if source != "airplay_session":
+                        volume_payloads.append(payload)
+                        continue
+                    if value == "start":
+                        interrupt_scheduled_playback()
+                        status["airplay"]["playback"] = "active"
+                    elif value == "stop":
+                        finish_airplay_playback()
+                        status["airplay"]["playback"] = "idle"
+                    else:
+                        raise ValueError(f"unsupported AirPlay session event: {value}")
+                payloads = volume_payloads
                 if camilla is None:
                     if CamillaClient is None:
                         raise RuntimeError("pycamilladsp is not installed")
                     camilla = CamillaClient(CDSP_HOST, CDSP_PORT)
                     camilla.connect()
-                try:
-                    payload = server.recv(128)
-                except socket.timeout:
-                    payload = b""
-                if payload:
-                    server.setblocking(False)
-                    try:
-                        while True:
-                            payload = server.recv(128)
-                    except BlockingIOError:
-                        pass
-                    finally:
-                        server.settimeout(POLL_INTERVAL)
-                    message = payload.decode("ascii")
-                    if ":" in message:
-                        source, value = message.split(":", 1)
-                    else:  # Compatibility with callbacks installed before this version.
-                        source, value = "airplay", message
+                for payload in payloads:
+                    source, value = parse_bridge_message(payload)
+                    now = time.time()
+                    if source == "spotify_ack":
+                        command_id, ack_volume = value
+                        if spotify_sync.acknowledge(command_id, ack_volume, now=now):
+                            status["spotify"].update(
+                                {
+                                    "command_socket": True,
+                                    "last_ack_at": now,
+                                    "last_cdsp_volume": ack_volume,
+                                }
+                            )
+                            status["spotify"].pop("error", None)
+                        continue
                     if source == "airplay":
                         result = set_client_volume(
-                            camilla, float(value.split(",", 1)[0])
+                            camilla,
+                            float(str(value).split(",", 1)[0]),
+                            persist=False,
                         )
                         status["airplay"]["last_source_volume_db"] = result[
                             "airplay_db"
                         ]
                     elif source == "spotify":
-                        result = set_spotify_volume(camilla, int(value))
+                        result = set_spotify_volume(
+                            camilla, int(str(value)), persist=False
+                        )
                         status["spotify"]["last_source_volume"] = result[
                             "spotify_volume"
                         ]
@@ -321,21 +558,34 @@ def run_daemon() -> int:
                         raise ValueError(f"unsupported volume source: {source}")
                     status.update(result)
                     last_camilla = (result["camilla_db"], result["muted"])
+                    spotify_volume = (
+                        int(result["spotify_volume"])
+                        if source == "spotify"
+                        else map_camilla_to_spotify(
+                            last_camilla[0],
+                            last_camilla[1],
+                            VOLUME_MIN_DB,
+                            VOLUME_MAX_DB,
+                        )
+                    )
+                    # This also supersedes any older command still queued while
+                    # librespot was disconnected. Silent application cannot echo.
+                    spotify_sync.queue(spotify_volume, last_camilla, now=now)
 
-                current = read_camilla_volume(camilla)
-                if last_camilla is None or current != last_camilla:
+                current = read_mirrorable_camilla_volume(camilla)
+                if current is None:
+                    status["spotify"]["paused_for_transition"] = True
+                else:
+                    status["spotify"].pop("paused_for_transition", None)
+                now = time.time()
+                if current is not None and (
+                    last_camilla is None or current != last_camilla
+                ):
                     spotify_volume = map_camilla_to_spotify(
                         current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
                     )
-                    try:
-                        send_spotify_volume(spotify_volume)
-                        status["spotify"].update(
-                            {"command_socket": True, "last_cdsp_volume": spotify_volume}
-                        )
-                    except OSError as exc:
-                        status["spotify"].update(
-                            {"command_socket": False, "error": str(exc)}
-                        )
+                    spotify_sync.queue(spotify_volume, current, now=now)
+                    last_camilla = current
                     status.update(
                         {
                             "ok": True,
@@ -344,7 +594,61 @@ def run_daemon() -> int:
                             "muted": current[1],
                         }
                     )
-                    last_camilla = current
+                elif current is not None and spotify_sync.needs_heartbeat(now):
+                    spotify_sync.queue(
+                        map_camilla_to_spotify(
+                            current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
+                        ),
+                        current,
+                        now=now,
+                    )
+
+                if spotify_sync.should_send(now):
+                    pending = spotify_sync.pending
+                    assert pending is not None
+                    try:
+                        send_spotify_volume(
+                            int(pending["id"]), int(pending["volume"])
+                        )
+                        spotify_sync.mark_sent(now)
+                    except OSError as exc:
+                        status["spotify"].update(
+                            {
+                                "receiver_socket": False,
+                                "command_socket": False,
+                                "state": "unavailable",
+                                "error": str(exc),
+                            }
+                        )
+                receiver_socket = SPOTIFY_COMMAND_SOCKET_PATH.is_socket()
+                command_ready = spotify_sync.healthy(now)
+                status["spotify"].update(
+                    {
+                        "receiver_socket": receiver_socket,
+                        "command_socket": command_ready,
+                        "state": (
+                            "live"
+                            if command_ready
+                            else "idle"
+                            if receiver_socket
+                            else "unavailable"
+                        ),
+                    }
+                )
+                if command_ready:
+                    status["spotify"].pop("reason", None)
+                    status["spotify"].pop("error", None)
+                elif receiver_socket:
+                    status["spotify"]["reason"] = (
+                        "waiting for an active Spotify Connect session"
+                    )
+                    status["spotify"].pop("error", None)
+                else:
+                    status["spotify"].pop("reason", None)
+                    status["spotify"].setdefault(
+                        "error", "Spotify receiver command socket is unavailable"
+                    )
+                status.pop("error", None)
                 status["updated_at"] = time.time()
                 write_status(status)
             except Exception as exc:
@@ -380,6 +684,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception as exc:
             print(f"Spotify volume notification failed: {exc}", file=sys.stderr)
             return 1
+    if argv in (["--airplay-start"], ["--airplay-stop"]):
+        try:
+            notify_airplay_session(argv == ["--airplay-start"])
+            return 0
+        except Exception as exc:
+            print(f"AirPlay playback handoff failed: {exc}", file=sys.stderr)
+            return 1
     if len(argv) == 2 and argv[0] == "--notify":
         try:
             notify(argv[1])
@@ -389,7 +700,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if len(argv) != 1:
         print(
-            "usage: airplay_volume_bridge.py [--daemon | --notify AIRPLAY_DB | --notify-spotify]",
+            "usage: airplay_volume_bridge.py [--daemon | --notify AIRPLAY_DB | --notify-spotify | --airplay-start | --airplay-stop]",
             file=sys.stderr,
         )
         return 2

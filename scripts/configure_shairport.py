@@ -15,6 +15,15 @@ from pathlib import Path
 GENERAL_KEYS = ("ignore_volume_control", "run_this_when_volume_is_set")
 GENERAL_BEGIN = "// UGLAN-AIRPLAY-BEGIN"
 GENERAL_END = "// UGLAN-AIRPLAY-END"
+SESSION_KEYS = (
+    "run_this_before_play_begins",
+    "run_this_after_play_ends",
+    "wait_for_completion",
+)
+SESSION_BEGIN = "// UGLAN-AIRPLAY-SESSION-BEGIN"
+SESSION_END = "// UGLAN-AIRPLAY-SESSION-END"
+SESSION_BLOCK_BEGIN = "// UGLAN-AIRPLAY-SESSION-BLOCK-BEGIN"
+SESSION_BLOCK_END = "// UGLAN-AIRPLAY-SESSION-BLOCK-END"
 DSP_KEYS = ("loudness", "loudness_reference_volume_db")
 DSP_BEGIN = "// UGLAN-LOUDNESS-BEGIN"
 DSP_END = "// UGLAN-LOUDNESS-END"
@@ -117,13 +126,57 @@ def update_general_block(text: str, callback: str | None) -> str:
         general,
     )
     try:
-        return _update_block(updated, "dsp", DSP_KEYS, DSP_BEGIN, DSP_END, dsp)
+        updated = _update_block(updated, "dsp", DSP_KEYS, DSP_BEGIN, DSP_END, dsp)
     except ValueError as exc:
         # A missing (or commented-only) DSP block means Shairport DSP loudness
         # cannot be enabled by this config, so there is nothing to manage.
         if str(exc) == "active dsp block not found":
+            pass
+        else:
+            raise
+
+    created_session = re.compile(
+        rf"\n?{re.escape(SESSION_BLOCK_BEGIN)}\n.*?{re.escape(SESSION_BLOCK_END)}\n?",
+        re.DOTALL,
+    )
+    updated = created_session.sub("\n", updated)
+    session_settings = None
+    if callback is not None:
+        suffix = " --notify"
+        if not callback.endswith(suffix):
+            raise ValueError("AirPlay callback must end with --notify")
+        command = callback[: -len(suffix)]
+        session_settings = [
+            f'    run_this_before_play_begins = "{command} --airplay-start";\n',
+            f'    run_this_after_play_ends = "{command} --airplay-stop";\n',
+            '    wait_for_completion = "yes";\n',
+        ]
+    try:
+        return _update_block(
+            updated,
+            "sessioncontrol",
+            SESSION_KEYS,
+            SESSION_BEGIN,
+            SESSION_END,
+            session_settings,
+        )
+    except ValueError as exc:
+        if str(exc) != "active sessioncontrol block not found":
+            raise
+        if session_settings is None:
             return updated
-        raise
+        separator = "" if not updated or updated.endswith("\n") else "\n"
+        return (
+            updated
+            + separator
+            + f"{SESSION_BLOCK_BEGIN}\n"
+            + "sessioncontrol =\n{\n"
+            + f"    {SESSION_BEGIN}\n"
+            + "".join(session_settings)
+            + f"    {SESSION_END}\n"
+            + "};\n"
+            + f"{SESSION_BLOCK_END}\n"
+        )
 
 
 def configure(

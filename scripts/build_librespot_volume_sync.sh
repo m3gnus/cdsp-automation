@@ -11,7 +11,23 @@ TARGET="/usr/local/bin/librespot-uglan"
 DROPIN_DIR="/etc/systemd/system/raspotify.service.d"
 DROPIN="$DROPIN_DIR/uglan-volume-sync.conf"
 CALLBACK="/usr/local/libexec/airplay_volume_bridge.py"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+deployment_started=false
+deployment_complete=false
+
+cleanup() {
+  local rc=$?
+  trap - EXIT
+  if [[ "$deployment_started" == true && "$deployment_complete" != true ]]; then
+    echo "Spotify volume-sync installation did not complete; rolling back." >&2
+    set +e
+    rollback
+  fi
+  rm -rf "$BUILD_DIR"
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 if [[ "${1:-}" == "--uninstall" ]]; then
   sudo rm -f "$DROPIN" "$TARGET"
@@ -31,7 +47,7 @@ git -C "$BUILD_DIR/librespot" checkout --detach "$UPSTREAM_COMMIT"
 git -C "$BUILD_DIR/librespot" apply --check "$PATCH_FILE"
 git -C "$BUILD_DIR/librespot" apply "$PATCH_FILE"
 cargo test --manifest-path "$BUILD_DIR/librespot/Cargo.toml" \
-  -p librespot-playback --no-default-features --features alsa-backend
+  -p librespot-playback --no-default-features --features alsa-backend,native-tls
 cargo build --release --manifest-path "$BUILD_DIR/librespot/Cargo.toml" \
   --no-default-features --features alsa-backend,native-tls,with-libmdns
 CANDIDATE="$BUILD_DIR/librespot/target/release/librespot"
@@ -70,27 +86,30 @@ After=airplay-volume-bridge.service
 
 [Service]
 ExecStart=
-ExecStart=$TARGET
+ExecStart=$TARGET --device uglan_main
 Environment=LIBRESPOT_MIXER=softvol
 Environment=LIBRESPOT_VOLUME_CTRL=fixed
 Environment="LIBRESPOT_ONEVENT=/usr/bin/python3 $CALLBACK --notify-spotify"
 Environment=UGLAN_SPOTIFY_VOLUME_SOCKET=/run/raspotify/uglan-volume.sock
+Environment=UGLAN_SPOTIFY_VOLUME_ACK_SOCKET=/run/airplay-volume-bridge/input.sock
+Group=audio
 EOF
 
+deployment_started=true
 sudo install -m 0755 "$CANDIDATE" "$TARGET.new"
 sudo mv "$TARGET.new" "$TARGET"
 sudo install -d -m 0755 "$DROPIN_DIR"
 sudo install -m 0644 "$dropin_candidate" "$DROPIN"
 sudo systemctl daemon-reload
-if ! sudo systemctl restart airplay-volume-bridge.service raspotify.service; then rollback; exit 1; fi
+sudo systemctl restart airplay-volume-bridge.service raspotify.service
 sleep 3
 pid="$(systemctl show -p MainPID --value raspotify.service)"
 if ! systemctl is-active --quiet raspotify.service \
   || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] \
   || [[ "$(sudo readlink -f "/proc/$pid/exe")" != "$TARGET" ]] \
   || [[ ! -S /run/raspotify/uglan-volume.sock ]]; then
-  echo "Patched librespot did not become healthy; rolling back." >&2
-  rollback
+  echo "Patched librespot did not become healthy." >&2
   exit 1
 fi
+deployment_complete=true
 echo "Installed bidirectional Spotify Connect volume sync through CamillaDSP."
