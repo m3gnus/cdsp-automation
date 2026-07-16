@@ -85,8 +85,8 @@ def default_audio_state() -> dict[str, Any]:
         },
         "volume": {
             "master": "camilladsp",
-            "airplay_unity_bridge": False,
-            "airplay_mapping": "perceptual",
+            "airplay_unity_bridge": True,
+            "airplay_mapping": "linear",
         },
         "loudness": {
             "engine": "iso226",
@@ -245,11 +245,11 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
         },
         "volume": {
             "master": "camilladsp",
-            "airplay_unity_bridge": _boolean(
-                volume_in.get("airplay_unity_bridge", False),
-                "airplay_unity_bridge",
-            ),
-            "airplay_mapping": "perceptual",
+            # These describe the installed architecture, not user preferences.
+            # Normalize legacy state written before the unity/linear bridge was
+            # deployed so the API cannot report the obsolete double-fader path.
+            "airplay_unity_bridge": True,
+            "airplay_mapping": "linear",
         },
         "loudness": {
             "engine": "iso226",

@@ -16,7 +16,12 @@ from typing import Any
 import yaml
 
 from audio_eq import apply_audio_overlay, audio_state_lock
-from speaker_profiles import BUILTIN_SPEAKERS, DEFAULT_SPEAKER_ID, normalize_speaker_id
+from speaker_profiles import (
+    BUILTIN_SPEAKERS,
+    DEFAULT_SPEAKER_ID,
+    OPERATOR_CONFIG_SPEAKERS,
+    normalize_speaker_id,
+)
 from speaker_xo import expand_crossover_profile
 
 
@@ -333,7 +338,13 @@ def load_profile(profile_dir: Path, profile_id: str) -> dict[str, Any]:
     )
 
 
-def profile_catalog(profile_dir: Path, source_base_dir: Path) -> dict[str, dict[str, Any]]:
+def profile_catalog(
+    profile_dir: Path,
+    source_base_dir: Path,
+    operator_config_dir: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    if operator_config_dir is None:
+        operator_config_dir = source_base_dir.parent
     result: dict[str, dict[str, Any]] = {}
     for profile_id, metadata in BUILTIN_SPEAKERS.items():
         if profile_id == DEFAULT_SPEAKER_ID:
@@ -349,14 +360,26 @@ def profile_catalog(profile_dir: Path, source_base_dir: Path) -> dict[str, dict[
             continue
         try:
             profile = load_profile(profile_dir, profile_id)
-            missing = [
-                source
-                for source in profile["supported_sources"]
-                if not (source_base_dir / f"{source}.yml").is_file()
-            ]
+            operator_config = OPERATOR_CONFIG_SPEAKERS.get(profile_id)
+            if operator_config:
+                missing = (
+                    []
+                    if (operator_config_dir / operator_config).is_file()
+                    else [operator_config]
+                )
+            else:
+                missing = [
+                    source
+                    for source in profile["supported_sources"]
+                    if not (source_base_dir / f"{source}.yml").is_file()
+                ]
             available = bool(profile["enabled"] and not missing)
             reason = "" if available else (
-                f"missing source bases: {', '.join(missing)}"
+                (
+                    f"operator config is missing: {', '.join(missing)}"
+                    if operator_config
+                    else f"missing source bases: {', '.join(missing)}"
+                )
                 if missing
                 else "profile is disabled"
             )
@@ -367,7 +390,8 @@ def profile_catalog(profile_dir: Path, source_base_dir: Path) -> dict[str, dict[
                 "available": available,
                 "legacy": False,
                 "installed": True,
-                "editable": profile["crossover"] is not None,
+                "editable": profile["crossover"] is not None or bool(operator_config),
+                "operator_config": operator_config,
                 "reason": reason,
                 "revision": profile["revision"],
                 "enabled": profile["enabled"],

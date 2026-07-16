@@ -47,6 +47,8 @@ chmod +x install.sh && ./install.sh
 
 The installer provides a menu to install utilities individually or all at once, and sets up systemd services for each one.
 
+Python 3.10 or newer is required.
+
 ---
 
 ## 1. Trigger Control (GPIO Relay)
@@ -135,6 +137,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
 - **Keep-last idle behavior** - When all sources are idle, the default is to leave the current config alone. Set `SOURCE_IDLE_MODE=toslink` to restore the older always-fallback behavior.
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
+- **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched
 
 **Priority logic explained:**
 
@@ -181,6 +184,8 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 - **Tone limits** - Configurable ±6dB default range prevents accidental over-boosting
 - **Persistent tone control** - Atomically updates reserved `low`/`high` shelf IDs in the shared audio overlay; the source switcher applies them and remains the sole live-config writer
 - **Device reconnection** - If the Bluetooth remote disconnects, the script automatically searches for it again
+- **Recovery controls stay available** - A failed CamillaDSP connection does not block the HID event loop, so the power-button restart and shutdown actions still work
+- **Throttled idle logging** - The remote is checked every two seconds while asleep, but unchanged "not found" status is logged only every five minutes by default
 
 **Button mapping:**
 
@@ -198,17 +203,21 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 
 **Power button service restart:**
 
-Holding the power button for ~1 second restarts all CamillaDSP-related services:
+Holding the power button for ~1 second restarts the CamillaDSP control stack:
 - camilladsp.service
 - camillagui.service
 - cdsp-motu-sync.service
 - cdsp-source-switcher.service
 - cdsp-remote.service
-- cdsp-trigger.service (delayed by 3 seconds by default to allow amplifiers to power cycle properly)
 
-The trigger service restart uses `systemd-run` to create a transient timer that survives the cdsp-remote service restart. This ensures proper sequencing even though the restart command kills the script itself.
+The trigger service deliberately stays running: it replaces its stale
+CamillaDSP client and reconnects in place, keeping the GPIO relay latched while
+the audio stack restarts. Remote self-restart uses one exact nonblocking
+`systemctl` command after the other restarts. This avoids waiting on the service
+issuing the command and keeps the sudo authorization narrow—there are no
+wildcard arguments that could be expanded into another root command.
 
-Holding for ~10 seconds triggers a system shutdown (`shutdown -h now`).
+Holding for ~10 seconds triggers `systemctl poweroff`.
 
 **Finding your remote:**
 
@@ -236,9 +245,16 @@ All four utilities run as systemd services with these benefits:
 
 - **Auto-start on boot** - No need to manually launch them
 - **Automatic restart** - If a script crashes, systemd brings it back up after `RestartSec=2`
-- **Dependency management** - They won't start until CamillaDSP is running
+- **Dependency management** - They are ordered after CamillaDSP and retry transient connection failures
 - **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-motu-sync`, `-source-switcher`, `-remote`)
 - **Easy control** - Standard `systemctl start/stop/restart` commands
+
+Current units are enabled from `multi-user.target`. On update, the installer
+removes the pre-2026-07 `/lib/systemd/system` fragments and rebuilds enablement
+with `systemctl reenable`, removing stale `default.target.wants` links.
+CamillaDSP's own unit must not specify `After=default.target` or
+`After=graphical.target`; either creates a boot ordering cycle when the service
+is enabled from that target.
 
 ---
 

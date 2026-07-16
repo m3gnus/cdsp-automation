@@ -1,0 +1,262 @@
+diff --git a/connect/src/spirc.rs b/connect/src/spirc.rs
+index 3f9a06f..0058d22 100644
+--- a/connect/src/spirc.rs
++++ b/connect/src/spirc.rs
+@@ -129,6 +129,11 @@ enum SpircCommand {
+     Disconnect { pause: bool },
+     SetPosition(u32),
+     SetVolume(u16),
++    SetVolumeExternal {
++        volume: u16,
++        id: u64,
++        acknowledgements: mpsc::Sender<(u64, u16)>,
++    },
+     Activate,
+     Transfer(Option<TransferRequest>),
+     Load(LoadRequest),
+@@ -369,6 +374,20 @@ impl Spirc {
+         Ok(self.commands.send(SpircCommand::SetVolume(volume))?)
+     }
+
++    /// Update logical Connect volume without emitting a sender-originated event.
++    pub fn set_volume_external(
++        &self,
++        volume: u16,
++        id: u64,
++        acknowledgements: mpsc::Sender<(u64, u16)>,
++    ) -> Result<(), Error> {
++        Ok(self.commands.send(SpircCommand::SetVolumeExternal {
++            volume,
++            id,
++            acknowledgements,
++        })?)
++    }
++
+     /// Updates the position to the given value.
+     ///
+     /// Does nothing if we are not the active device.
+@@ -678,6 +697,16 @@ impl SpircTask {
+             SpircCommand::RepeatTrack(repeat) => self.handle_repeat_track(repeat),
+             SpircCommand::SetPosition(position) => self.handle_seek(position),
+             SpircCommand::SetVolume(volume) => self.set_volume(volume),
++            SpircCommand::SetVolumeExternal {
++                volume,
++                id,
++                acknowledgements,
++            } => {
++                self.set_volume_without_event(volume);
++                self.notify().await?;
++                let _ = acknowledgements.try_send((id, volume));
++                return Ok(());
++            }
+             SpircCommand::Load(command) => self.handle_load(command, None, None).await?,
+         };
+
+@@ -1804,6 +1833,14 @@ impl SpircTask {
+     }
+
+     fn set_volume(&mut self, volume: u16) {
++        self.set_volume_inner(volume, true)
++    }
++
++    fn set_volume_without_event(&mut self, volume: u16) {
++        self.set_volume_inner(volume, false)
++    }
++
++    fn set_volume_inner(&mut self, volume: u16, emit_event: bool) {
+         debug!("SpircTask::set_volume({volume})");
+
+         let old_volume = self.connect_state.device_info().volume;
+@@ -1816,7 +1853,7 @@ impl SpircTask {
+             if let Some(cache) = self.session.cache() {
+                 cache.save_volume(volume)
+             }
+-            if self.connect_state.is_active() {
++            if emit_event && self.connect_state.is_active() {
+                 self.player.emit_volume_changed_event(volume);
+             }
+         }
+diff --git a/playback/src/mixer/softmixer.rs b/playback/src/mixer/softmixer.rs
+index 189fc15..95b1afd 100644
+--- a/playback/src/mixer/softmixer.rs
++++ b/playback/src/mixer/softmixer.rs
+@@ -1,6 +1,6 @@
+-use super::VolumeGetter;
+ use super::{MappedCtrl, VolumeCtrl};
+ use super::{Mixer, MixerConfig};
++use super::{NoOpVolume, VolumeGetter};
+ use librespot_core::Error;
+ use portable_atomic::AtomicU64;
+ use std::sync::Arc;
+@@ -37,7 +37,13 @@ impl Mixer for SoftMixer {
+     }
+
+     fn get_soft_volume(&self) -> Box<dyn VolumeGetter + Send> {
+-        Box::new(SoftVolume(self.volume.clone()))
++        if matches!(self.volume_ctrl, VolumeCtrl::Fixed) {
++            // Preserve the Spotify Connect volume state while CamillaDSP is
++            // the only component applying gain to the audio samples.
++            Box::new(NoOpVolume)
++        } else {
++            Box::new(SoftVolume(self.volume.clone()))
++        }
+     }
+ }
+
+diff --git a/src/main.rs b/src/main.rs
+index fb85803..5c78f2d 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -35,7 +35,11 @@ use std::{
+ };
+ use sysinfo::{ProcessesToUpdate, System};
+ use thiserror::Error;
+-use tokio::sync::Semaphore;
++use tokio::{
++    net::UnixDatagram,
++    sync::{Semaphore, mpsc},
++    time::MissedTickBehavior,
++};
+ use url::Url;
+
+ mod player_event_handler;
+@@ -1877,6 +1881,78 @@ async fn set_env_var<K: AsRef<OsStr>, V: AsRef<OsStr>>(key: K, value: V) {
+     drop(permit);
+ }
+
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct VolumeSyncCommand {
++    id: u64,
++    volume: u16,
++}
++
++fn start_volume_sync_socket(path: PathBuf) -> Option<mpsc::Receiver<VolumeSyncCommand>> {
++    use std::os::unix::fs::PermissionsExt;
++
++    if let Err(e) = std::fs::remove_file(&path)
++        && e.kind() != std::io::ErrorKind::NotFound
++    {
++        warn!(
++            "Could not remove stale volume sync socket {}: {e}",
++            path.display()
++        );
++        return None;
++    }
++    let socket = match UnixDatagram::bind(&path) {
++        Ok(socket) => socket,
++        Err(e) => {
++            warn!("Could not bind volume sync socket {}: {e}", path.display());
++            return None;
++        }
++    };
++    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)) {
++        warn!("Could not set volume sync socket permissions: {e}");
++    }
++    let (sender, receiver) = mpsc::channel(16);
++    tokio::spawn(async move {
++        let mut buffer = [0_u8; 64];
++        loop {
++            match socket.recv(&mut buffer).await {
++                Ok(size) => {
++                    let command = std::str::from_utf8(&buffer[..size])
++                        .ok()
++                        .and_then(|value| value.trim().split_once(':'))
++                        .and_then(|(id, volume)| {
++                            Some(VolumeSyncCommand {
++                                id: id.parse().ok()?,
++                                volume: volume.parse().ok()?,
++                            })
++                        });
++                    match command {
++                        Some(command) => match sender.try_send(command) {
++                            Ok(()) => (),
++                            Err(mpsc::error::TrySendError::Full(_)) => {
++                                warn!("Volume sync command queue is full")
++                            }
++                            Err(mpsc::error::TrySendError::Closed(_)) => break,
++                        },
++                        None => warn!("Ignoring invalid volume sync command"),
++                    }
++                }
++                Err(e) => {
++                    warn!("Volume sync socket failed: {e}");
++                    break;
++                }
++            }
++        }
++    });
++    info!("Listening for volume sync commands on {}", path.display());
++    Some(receiver)
++}
++
++async fn send_volume_sync_ack(path: &Path, command: VolumeSyncCommand) -> std::io::Result<()> {
++    let socket = UnixDatagram::unbound()?;
++    let payload = format!("spotify_ack:{}:{}", command.id, command.volume);
++    socket.send_to(payload.as_bytes(), path).await?;
++    Ok(())
++}
++
+ #[tokio::main(flavor = "current_thread")]
+ async fn main() {
+     const RUST_BACKTRACE: &str = "RUST_BACKTRACE";
+@@ -1897,6 +1973,14 @@ async fn main() {
+     let mut discovery = None;
+     let mut connecting = false;
+     let mut _event_handler: Option<EventHandler> = None;
++    let mut volume_sync = env::var_os("UGLAN_SPOTIFY_VOLUME_SOCKET")
++        .map(PathBuf::from)
++        .and_then(start_volume_sync_socket);
++    let volume_sync_ack_path = env::var_os("UGLAN_SPOTIFY_VOLUME_ACK_SOCKET").map(PathBuf::from);
++    let (volume_sync_ack_tx, mut volume_sync_ack_rx) = mpsc::channel(16);
++    let mut pending_volume_sync: Option<VolumeSyncCommand> = None;
++    let mut volume_sync_retry = tokio::time::interval(Duration::from_secs(1));
++    volume_sync_retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+     let mut session = Session::new(setup.session_config.clone(), setup.cache.clone());
+
+@@ -2007,6 +2091,45 @@ async fn main() {
+
+     loop {
+         tokio::select! {
++            Some(command) = async {
++                match volume_sync.as_mut() {
++                    Some(receiver) => receiver.recv().await,
++                    None => None,
++                }
++            }, if volume_sync.is_some() => {
++                pending_volume_sync = Some(command);
++                if let Some(spirc) = spirc.as_ref() {
++                    if let Err(e) = spirc.set_volume_external(
++                        command.volume,
++                        command.id,
++                        volume_sync_ack_tx.clone(),
++                    ) {
++                        warn!("Could not queue volume sync command: {e}");
++                    }
++                }
++            },
++            Some((id, volume)) = volume_sync_ack_rx.recv() => {
++                let acknowledged = VolumeSyncCommand { id, volume };
++                if pending_volume_sync == Some(acknowledged) {
++                    if let Some(path) = volume_sync_ack_path.as_deref() {
++                        match send_volume_sync_ack(path, acknowledged).await {
++                            Ok(()) => pending_volume_sync = None,
++                            Err(e) => warn!("Could not acknowledge volume sync command: {e}"),
++                        }
++                    }
++                }
++            },
++            _ = volume_sync_retry.tick(), if pending_volume_sync.is_some() => {
++                if let (Some(command), Some(spirc)) = (pending_volume_sync, spirc.as_ref()) {
++                    if let Err(e) = spirc.set_volume_external(
++                        command.volume,
++                        command.id,
++                        volume_sync_ack_tx.clone(),
++                    ) {
++                        warn!("Could not retry volume sync command: {e}");
++                    }
++                }
++            },
+             credentials = async {
+                 match discovery.as_mut() {
+                     Some(d) => d.next().await,

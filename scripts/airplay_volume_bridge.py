@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
-"""Map Shairport Sync's AirPlay slider onto the CamillaDSP master fader."""
+"""Keep network-player volume controls aligned with CamillaDSP's master fader.
+
+AirPlay can report its sender volume but cannot accept an exact volume value back.
+Spotify Connect supports both directions when used with the patched librespot build.
+"""
 
 from __future__ import annotations
 
+import grp
 import json
 import math
 import os
 import socket
+import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 from pathlib import Path
 
 try:
@@ -45,6 +52,44 @@ SOCKET_PATH = Path(
         "AIRPLAY_VOLUME_SOCKET_PATH", "/run/airplay-volume-bridge/input.sock"
     )
 )
+SPOTIFY_COMMAND_SOCKET_PATH = Path(
+    os.environ.get(
+        "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH",
+        "/run/raspotify/uglan-volume.sock",
+    )
+)
+POLL_INTERVAL = float(os.environ.get("VOLUME_SYNC_POLL_INTERVAL", "0.25"))
+COMMAND_RETRY_SECONDS = float(
+    os.environ.get("VOLUME_SYNC_COMMAND_RETRY_SECONDS", "1.0")
+)
+COMMAND_ACK_TIMEOUT = float(
+    os.environ.get("VOLUME_SYNC_COMMAND_ACK_TIMEOUT", "3.0")
+)
+HEARTBEAT_INTERVAL = float(
+    os.environ.get("VOLUME_SYNC_HEARTBEAT_SECONDS", "10.0")
+)
+VOLUME_SYNC_GROUP = os.environ.get("VOLUME_SYNC_GROUP", "audio")
+AIRPLAY_ACTIVE_PATH = Path(
+    os.environ.get(
+        "AIRPLAY_ACTIVE_PATH", "/run/airplay-volume-bridge/playback-active"
+    )
+)
+AIRPLAY_HANDOFF_TIMEOUT = float(os.environ.get("AIRPLAY_HANDOFF_TIMEOUT", "10.0"))
+AIRPLAY_RELEASE_DELAY = float(os.environ.get("AIRPLAY_RELEASE_DELAY", "1.25"))
+SYSTEMCTL_BIN = os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl")
+SUDO_BIN = os.environ.get("SUDO_BIN", "/usr/bin/sudo")
+BUSCTL_BIN = os.environ.get("BUSCTL_BIN", "/usr/bin/busctl")
+AIRPLAY_SERVICE = "shairport-sync.service"
+SPOTIFY_SERVICE = "raspotify.service"
+LMS_HOST = os.environ.get("LMS_HOST", "127.0.0.1")
+LMS_PORT = int(os.environ.get("LMS_PORT", "9000"))
+LMS_PLAYER_NAMES = tuple(
+    name.strip()
+    for name in os.environ.get(
+        "AIRPLAY_INTERRUPTED_LMS_PLAYERS", "uglan,uglan-stereo"
+    ).split(",")
+    if name.strip()
+)
 
 
 def map_airplay_volume(
@@ -73,6 +118,43 @@ def map_airplay_volume(
     return round(mapped, 4), False
 
 
+def map_spotify_volume(
+    spotify_volume: int,
+    minimum_db: float = -50.0,
+    maximum_db: float = 0.0,
+) -> tuple[float, bool]:
+    """Map Spotify Connect's unsigned 16-bit volume onto the master fader."""
+    if not isinstance(spotify_volume, int) or not 0 <= spotify_volume <= 65535:
+        raise ValueError("Spotify volume must be an integer between 0 and 65535")
+    if not math.isfinite(minimum_db) or not math.isfinite(maximum_db):
+        raise ValueError("volume values must be finite")
+    if not -120.0 <= minimum_db <= -20.0 or not minimum_db < maximum_db <= 0:
+        raise ValueError("invalid CamillaDSP volume range")
+    position = spotify_volume / 65535.0
+    mapped = minimum_db + (maximum_db - minimum_db) * position
+    return round(mapped, 4), spotify_volume == 0
+
+
+def map_camilla_to_spotify(
+    camilla_db: float,
+    muted: bool,
+    minimum_db: float = -50.0,
+    maximum_db: float = 0.0,
+) -> int:
+    """Convert the master fader back to Spotify's exact Connect volume value."""
+    if muted:
+        return 0
+    if not all(math.isfinite(value) for value in (camilla_db, minimum_db, maximum_db)):
+        raise ValueError("volume values must be finite")
+    if not minimum_db < maximum_db:
+        raise ValueError("invalid CamillaDSP volume range")
+    position = (max(minimum_db, min(maximum_db, camilla_db)) - minimum_db) / (
+        maximum_db - minimum_db
+    )
+    # Keep a non-muted master distinct from Spotify's special zero/mute value.
+    return max(1, min(65535, round(position * 65535)))
+
+
 def write_status(payload: dict) -> None:
     """Best-effort atomic status for the control UI."""
     temporary: Path | None = None
@@ -94,16 +176,15 @@ def write_status(payload: dict) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def set_client_volume(client, airplay_db: float) -> dict:
+def set_mapped_volume(
+    client, mapped_db: float, muted: bool, *, source: str, source_volume: float | int
+) -> dict:
     # Keep the Shairport callback path stdlib-only.  The callback executes the
     # copy in /usr/local/libexec merely to send a datagram; deployment helpers
     # used by the daemon live beside the daemon script and may not be installed
     # beside that callback copy.
     from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
 
-    mapped_db, muted = map_airplay_volume(
-        airplay_db, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE
-    )
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         if not muted:
             require_audio_unmute_allowed(AUDIO_READY_PATH)
@@ -111,12 +192,46 @@ def set_client_volume(client, airplay_db: float) -> dict:
         client.volume.set_main_mute(muted)
     result = {
         "ok": True,
-        "airplay_db": airplay_db,
+        "source": source,
+        "source_volume": source_volume,
         "camilla_db": mapped_db,
         "muted": muted,
         "updated_at": time.time(),
     }
-    write_status(result)
+    return result
+
+
+def set_client_volume(client, airplay_db: float, *, persist: bool = True) -> dict:
+    mapped_db, muted = map_airplay_volume(
+        airplay_db, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE
+    )
+    result = set_mapped_volume(
+        client,
+        mapped_db,
+        muted,
+        source="airplay",
+        source_volume=airplay_db,
+    )
+    result["airplay_db"] = airplay_db
+    if persist:
+        write_status(result)
+    return result
+
+
+def set_spotify_volume(client, spotify_volume: int, *, persist: bool = True) -> dict:
+    mapped_db, muted = map_spotify_volume(
+        spotify_volume, VOLUME_MIN_DB, VOLUME_MAX_DB
+    )
+    result = set_mapped_volume(
+        client,
+        mapped_db,
+        muted,
+        source="spotify",
+        source_volume=spotify_volume,
+    )
+    result["spotify_volume"] = spotify_volume
+    if persist:
+        write_status(result)
     return result
 
 
@@ -140,40 +255,542 @@ def notify(airplay_db: str) -> None:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(airplay_db.encode("ascii"), str(SOCKET_PATH))
+        client.sendto(f"airplay:{airplay_db}".encode("ascii"), str(SOCKET_PATH))
     finally:
         client.close()
 
 
+def notify_airplay_session(active: bool) -> None:
+    """Ask the daemon to hand scheduled playback to or from AirPlay."""
+    target = "airplay-active" if active else ""
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        event = "start" if active else "stop"
+        client.sendto(f"airplay_session:{event}".encode("ascii"), str(SOCKET_PATH))
+    finally:
+        client.close()
+    deadline = time.monotonic() + AIRPLAY_HANDOFF_TIMEOUT
+    while time.monotonic() < deadline:
+        try:
+            state = AIRPLAY_ACTIVE_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            state = ""
+        if state == target:
+            return
+        if active and state.startswith("spotify-"):
+            raise RuntimeError("Spotify was already playing and keeps the receiver")
+        if not active and not state.startswith("airplay-"):
+            return
+        time.sleep(0.05)
+    action = "start" if active else "stop"
+    raise TimeoutError(f"AirPlay {action} handoff was not acknowledged")
+
+
+def _write_playback_state(value: str) -> None:
+    AIRPLAY_ACTIVE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=AIRPLAY_ACTIVE_PATH.parent,
+        prefix=f".{AIRPLAY_ACTIVE_PATH.name}.",
+        delete=False,
+    ) as handle:
+        handle.write(value + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+        temporary = Path(handle.name)
+    temporary.chmod(0o644)
+    temporary.replace(AIRPLAY_ACTIVE_PATH)
+
+
+def _lms_request(player: str, terms: list[object]) -> dict:
+    body = json.dumps(
+        {"id": 1, "method": "slim.request", "params": [player, terms]}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://{LMS_HOST}:{LMS_PORT}/jsonrpc.js",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=2) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    return payload.get("result", {}) if isinstance(payload, dict) else {}
+
+
+def interrupt_scheduled_playback(owner: str = "airplay") -> None:
+    """Inhibit scheduled playback and release ALSA to a network receiver."""
+    if owner not in {"airplay", "spotify"}:
+        raise ValueError(f"unsupported playback owner: {owner}")
+    _write_playback_state(f"{owner}-starting")
+    try:
+        players = _lms_request("", ["players", "0", "100"]).get(
+            "players_loop", []
+        )
+        for player in players or []:
+            if str(player.get("name", "")).strip() in LMS_PLAYER_NAMES:
+                player_id = str(player.get("playerid", "")).strip()
+                if player_id:
+                    _lms_request(player_id, ["stop"])
+        # Squeezelite closes uglan_main after its one-second idle timeout.
+        time.sleep(max(0.0, AIRPLAY_RELEASE_DELAY))
+        _write_playback_state(f"{owner}-active")
+    except Exception:
+        AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
+        raise
+
+
+def finish_network_playback() -> None:
+    """Let the scheduler resume the currently active wall-clock event."""
+    AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
+
+
+def notify_spotify(environ: dict[str, str] | None = None) -> None:
+    """Forward librespot volume and playback lifecycle events to the daemon."""
+    environ = os.environ if environ is None else environ
+    event = environ.get("PLAYER_EVENT")
+    if event == "volume_changed":
+        volume = int(environ["VOLUME"])
+        map_spotify_volume(volume, VOLUME_MIN_DB, VOLUME_MAX_DB)
+        message = f"spotify:{volume}"
+    elif event == "playing":
+        message = "spotify_session:start"
+    elif event in {"paused", "stopped"}:
+        message = "spotify_session:stop"
+    else:
+        return
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        client.sendto(message.encode("ascii"), str(SOCKET_PATH))
+    finally:
+        client.close()
+
+
+def service_is_active(service: str) -> bool:
+    result = subprocess.run(
+        [SYSTEMCTL_BIN, "is-active", "--quiet", service],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def set_receiver_service(service: str, active: bool) -> None:
+    action = "start" if active else "stop"
+    result = subprocess.run(
+        [SUDO_BIN, "-n", SYSTEMCTL_BIN, action, service],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        timeout=15,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stdout.strip() or f"exit {result.returncode}"
+        raise RuntimeError(f"could not {action} {service}: {detail}")
+
+
+def shairport_playback_active() -> bool:
+    result = subprocess.run(
+        [
+            BUSCTL_BIN,
+            "--system",
+            "get-property",
+            "org.gnome.ShairportSync",
+            "/org/gnome/ShairportSync",
+            "org.gnome.ShairportSync",
+            "Active",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=3,
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.strip().endswith(" true")
+
+
+class PlaybackArbiter:
+    """Give the first active network receiver exclusive playback ownership."""
+
+    def __init__(self) -> None:
+        self.owner: str | None = None
+
+    def recover(self) -> str | None:
+        if shairport_playback_active():
+            self.owner = "airplay"
+            _write_playback_state("airplay-active")
+            set_receiver_service(SPOTIFY_SERVICE, False)
+        elif not service_is_active(AIRPLAY_SERVICE) and service_is_active(
+            SPOTIFY_SERVICE
+        ):
+            self.owner = "spotify"
+            _write_playback_state("spotify-active")
+        else:
+            self.owner = None
+            finish_network_playback()
+        return self.owner
+
+    def start(self, source: str) -> bool:
+        if source not in {"airplay", "spotify"}:
+            raise ValueError(f"unsupported playback source: {source}")
+        if self.owner == source:
+            return True
+        if self.owner is not None:
+            set_receiver_service(
+                AIRPLAY_SERVICE if source == "airplay" else SPOTIFY_SERVICE,
+                False,
+            )
+            return False
+        self.owner = source
+        other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
+        try:
+            interrupt_scheduled_playback(source)
+            set_receiver_service(other_service, False)
+        except Exception:
+            self.owner = None
+            finish_network_playback()
+            try:
+                set_receiver_service(other_service, True)
+            except Exception:
+                pass
+            raise
+        return True
+
+    def stop(self, source: str) -> bool:
+        if self.owner != source:
+            return False
+        other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
+        self.owner = None
+        finish_network_playback()
+        set_receiver_service(other_service, True)
+        return True
+
+
+def send_spotify_volume(command_id: int, volume: int) -> None:
+    """Request a logical Connect volume and identify the eventual ack."""
+    if command_id < 1:
+        raise ValueError("Spotify command id must be positive")
+    if not 0 <= volume <= 65535:
+        raise ValueError("Spotify volume must be between 0 and 65535")
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        client.settimeout(0.1)
+        client.sendto(
+            f"{command_id}:{volume}".encode("ascii"),
+            str(SPOTIFY_COMMAND_SOCKET_PATH),
+        )
+    finally:
+        client.close()
+
+
+def read_camilla_volume(client) -> tuple[float, bool]:
+    return round(float(client.volume.main_volume()), 4), bool(
+        client.volume.main_mute()
+    )
+
+
+def read_mirrorable_camilla_volume(client) -> tuple[float, bool] | None:
+    """Read a stable master state, or pause while a config transition owns it."""
+    from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
+
+    with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+        try:
+            require_audio_unmute_allowed(AUDIO_READY_PATH)
+        except RuntimeError:
+            return None
+        return read_camilla_volume(client)
+
+
+def secure_socket(path: Path) -> None:
+    """Restrict local volume control to the installation's audio group."""
+    gid = grp.getgrnam(VOLUME_SYNC_GROUP).gr_gid
+    os.chown(path, -1, gid)
+    path.chmod(0o660)
+
+
+class SpotifyCommandTracker:
+    """Keep the newest desired Spotify state pending until librespot acks it."""
+
+    def __init__(self) -> None:
+        self.next_id = max(1, time.time_ns())
+        self.pending: dict[str, int | float | tuple[float, bool]] | None = None
+        self.last_ack_at = 0.0
+        self.last_ack_volume: int | None = None
+
+    def queue(
+        self, volume: int, camilla_state: tuple[float, bool], *, now: float
+    ) -> int:
+        self.next_id += 1
+        self.pending = {
+            "id": self.next_id,
+            "volume": volume,
+            "camilla_state": camilla_state,
+            "queued_at": now,
+            "last_sent_at": 0.0,
+            "attempts": 0,
+        }
+        return self.next_id
+
+    def should_send(self, now: float) -> bool:
+        return bool(
+            self.pending
+            and now - float(self.pending["last_sent_at"])
+            >= COMMAND_RETRY_SECONDS
+        )
+
+    def mark_sent(self, now: float) -> None:
+        if self.pending:
+            self.pending["last_sent_at"] = now
+            self.pending["attempts"] = int(self.pending["attempts"]) + 1
+
+    def acknowledge(self, command_id: int, volume: int, *, now: float) -> bool:
+        if not self.pending:
+            return False
+        if (
+            int(self.pending["id"]) != command_id
+            or int(self.pending["volume"]) != volume
+        ):
+            return False
+        self.pending = None
+        self.last_ack_at = now
+        self.last_ack_volume = volume
+        return True
+
+    def needs_heartbeat(self, now: float) -> bool:
+        return self.pending is None and now - self.last_ack_at >= HEARTBEAT_INTERVAL
+
+    def healthy(self, now: float) -> bool:
+        if self.pending and now - float(self.pending["queued_at"]) > COMMAND_ACK_TIMEOUT:
+            return False
+        return bool(
+            self.last_ack_at
+            and now - self.last_ack_at
+            <= HEARTBEAT_INTERVAL + COMMAND_ACK_TIMEOUT
+        )
+
+
+def parse_bridge_message(payload: bytes) -> tuple[str, tuple[int, ...] | str]:
+    message = payload.decode("ascii")
+    if message.startswith("spotify_ack:"):
+        fields = message.split(":")
+        if len(fields) != 3:
+            raise ValueError("invalid Spotify acknowledgement")
+        return "spotify_ack", (int(fields[1]), int(fields[2]))
+    if ":" in message:
+        source, value = message.split(":", 1)
+        return source, value
+    return "airplay", message
+
+
 def run_daemon() -> int:
-    """Coalesce slider events and keep slow DSP RPC work outside Shairport."""
+    """Apply source events and mirror external master changes into Spotify."""
     map_airplay_volume(-30, VOLUME_MIN_DB, VOLUME_MAX_DB, VOLUME_CURVE)
     SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
     SOCKET_PATH.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     server.bind(str(SOCKET_PATH))
-    SOCKET_PATH.chmod(0o666)
+    secure_socket(SOCKET_PATH)
+    server.settimeout(POLL_INTERVAL)
     camilla = None
+    last_camilla: tuple[float, bool] | None = None
+    spotify_sync = SpotifyCommandTracker()
+    arbiter = PlaybackArbiter()
+    status: dict = {
+        "ok": True,
+        "updated_at": time.time(),
+        "airplay": {
+            "source_to_cdsp": True,
+            "cdsp_to_source": False,
+            "reason": "AirPlay does not expose exact receiver-to-sender volume setting",
+        },
+        "spotify": {"source_to_cdsp": True, "cdsp_to_source": True},
+    }
+    try:
+        arbiter.recover()
+    except Exception as exc:
+        status.update({"ok": False, "error": f"playback recovery failed: {exc}"})
+    status["playback_owner"] = arbiter.owner
     try:
         while True:
-            payload = server.recv(128)
-            server.setblocking(False)
             try:
-                while True:
+                try:
                     payload = server.recv(128)
-            except BlockingIOError:
-                pass
-            finally:
-                server.setblocking(True)
-            try:
+                except socket.timeout:
+                    payload = b""
+                payloads = [payload] if payload else []
+                if payload:
+                    server.setblocking(False)
+                    try:
+                        while len(payloads) < 64:
+                            payloads.append(server.recv(128))
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        server.settimeout(POLL_INTERVAL)
+                volume_payloads = []
+                for payload in payloads:
+                    source, value = parse_bridge_message(payload)
+                    if source not in {"airplay_session", "spotify_session"}:
+                        volume_payloads.append(payload)
+                        continue
+                    playback_source = (
+                        "airplay" if source == "airplay_session" else "spotify"
+                    )
+                    if value == "start":
+                        accepted = arbiter.start(playback_source)
+                        status[playback_source]["playback"] = (
+                            "active" if accepted else "held"
+                        )
+                    elif value == "stop":
+                        arbiter.stop(playback_source)
+                        status[playback_source]["playback"] = "idle"
+                    else:
+                        raise ValueError(
+                            f"unsupported {playback_source} session event: {value}"
+                        )
+                    status["playback_owner"] = arbiter.owner
+                payloads = volume_payloads
                 if camilla is None:
                     if CamillaClient is None:
                         raise RuntimeError("pycamilladsp is not installed")
                     camilla = CamillaClient(CDSP_HOST, CDSP_PORT)
                     camilla.connect()
-                set_client_volume(
-                    camilla, float(payload.decode("ascii").split(",", 1)[0])
+                for payload in payloads:
+                    source, value = parse_bridge_message(payload)
+                    now = time.time()
+                    if source == "spotify_ack":
+                        command_id, ack_volume = value
+                        if spotify_sync.acknowledge(command_id, ack_volume, now=now):
+                            status["spotify"].update(
+                                {
+                                    "command_socket": True,
+                                    "last_ack_at": now,
+                                    "last_cdsp_volume": ack_volume,
+                                }
+                            )
+                            status["spotify"].pop("error", None)
+                        continue
+                    if source == "airplay":
+                        if arbiter.owner == "spotify":
+                            continue
+                        result = set_client_volume(
+                            camilla,
+                            float(str(value).split(",", 1)[0]),
+                            persist=False,
+                        )
+                        status["airplay"]["last_source_volume_db"] = result[
+                            "airplay_db"
+                        ]
+                    elif source == "spotify":
+                        if arbiter.owner == "airplay":
+                            continue
+                        result = set_spotify_volume(
+                            camilla, int(str(value)), persist=False
+                        )
+                        status["spotify"]["last_source_volume"] = result[
+                            "spotify_volume"
+                        ]
+                    else:
+                        raise ValueError(f"unsupported volume source: {source}")
+                    status.update(result)
+                    last_camilla = (result["camilla_db"], result["muted"])
+                    spotify_volume = (
+                        int(result["spotify_volume"])
+                        if source == "spotify"
+                        else map_camilla_to_spotify(
+                            last_camilla[0],
+                            last_camilla[1],
+                            VOLUME_MIN_DB,
+                            VOLUME_MAX_DB,
+                        )
+                    )
+                    # This also supersedes any older command still queued while
+                    # librespot was disconnected. Silent application cannot echo.
+                    spotify_sync.queue(spotify_volume, last_camilla, now=now)
+
+                current = read_mirrorable_camilla_volume(camilla)
+                if current is None:
+                    status["spotify"]["paused_for_transition"] = True
+                else:
+                    status["spotify"].pop("paused_for_transition", None)
+                now = time.time()
+                if current is not None and (
+                    last_camilla is None or current != last_camilla
+                ):
+                    spotify_volume = map_camilla_to_spotify(
+                        current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
+                    )
+                    spotify_sync.queue(spotify_volume, current, now=now)
+                    last_camilla = current
+                    status.update(
+                        {
+                            "ok": True,
+                            "source": "camilladsp",
+                            "camilla_db": current[0],
+                            "muted": current[1],
+                        }
+                    )
+                elif current is not None and spotify_sync.needs_heartbeat(now):
+                    spotify_sync.queue(
+                        map_camilla_to_spotify(
+                            current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
+                        ),
+                        current,
+                        now=now,
+                    )
+
+                if spotify_sync.should_send(now):
+                    pending = spotify_sync.pending
+                    assert pending is not None
+                    try:
+                        send_spotify_volume(
+                            int(pending["id"]), int(pending["volume"])
+                        )
+                        spotify_sync.mark_sent(now)
+                    except OSError as exc:
+                        status["spotify"].update(
+                            {
+                                "receiver_socket": False,
+                                "command_socket": False,
+                                "state": "unavailable",
+                                "error": str(exc),
+                            }
+                        )
+                receiver_socket = SPOTIFY_COMMAND_SOCKET_PATH.is_socket()
+                command_ready = spotify_sync.healthy(now)
+                status["spotify"].update(
+                    {
+                        "receiver_socket": receiver_socket,
+                        "command_socket": command_ready,
+                        "state": (
+                            "live"
+                            if command_ready
+                            else "idle"
+                            if receiver_socket
+                            else "unavailable"
+                        ),
+                    }
                 )
+                if command_ready:
+                    status["spotify"].pop("reason", None)
+                    status["spotify"].pop("error", None)
+                elif receiver_socket:
+                    status["spotify"]["reason"] = (
+                        "waiting for an active Spotify Connect session"
+                    )
+                    status["spotify"].pop("error", None)
+                else:
+                    status["spotify"].pop("reason", None)
+                    status["spotify"].setdefault(
+                        "error", "Spotify receiver command socket is unavailable"
+                    )
+                status.pop("error", None)
+                status["updated_at"] = time.time()
+                write_status(status)
             except Exception as exc:
                 try:
                     if camilla is not None:
@@ -181,9 +798,11 @@ def run_daemon() -> int:
                 except Exception:
                     pass
                 camilla = None
-                write_status(
+                status.update(
                     {"ok": False, "error": str(exc), "updated_at": time.time()}
                 )
+                write_status(status)
+                time.sleep(min(1.0, max(0.05, POLL_INTERVAL)))
     finally:
         try:
             if camilla is not None:
@@ -198,6 +817,20 @@ def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if argv == ["--daemon"]:
         return run_daemon()
+    if argv == ["--notify-spotify"]:
+        try:
+            notify_spotify()
+            return 0
+        except Exception as exc:
+            print(f"Spotify volume notification failed: {exc}", file=sys.stderr)
+            return 1
+    if argv in (["--airplay-start"], ["--airplay-stop"]):
+        try:
+            notify_airplay_session(argv == ["--airplay-start"])
+            return 0
+        except Exception as exc:
+            print(f"AirPlay playback handoff failed: {exc}", file=sys.stderr)
+            return 1
     if len(argv) == 2 and argv[0] == "--notify":
         try:
             notify(argv[1])
@@ -207,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     if len(argv) != 1:
         print(
-            "usage: airplay_volume_bridge.py [--daemon | --notify] AIRPLAY_DB",
+            "usage: airplay_volume_bridge.py [--daemon | --notify AIRPLAY_DB | --notify-spotify | --airplay-start | --airplay-stop]",
             file=sys.stderr,
         )
         return 2

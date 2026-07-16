@@ -81,6 +81,12 @@ AIRPLAY_VOLUME_MAX_DB=0
 AIRPLAY_VOLUME_CURVE=1.0
 AIRPLAY_VOLUME_STATUS_PATH=/run/airplay-volume-bridge/status.json
 AIRPLAY_VOLUME_SOCKET_PATH=/run/airplay-volume-bridge/input.sock
+SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/uglan-volume.sock
+VOLUME_SYNC_POLL_INTERVAL=0.25
+VOLUME_SYNC_COMMAND_RETRY_SECONDS=1.0
+VOLUME_SYNC_COMMAND_ACK_TIMEOUT=3.0
+VOLUME_SYNC_HEARTBEAT_SECONDS=10.0
+VOLUME_SYNC_GROUP=audio
 ISO226_CAPABILITY_PATH=/var/lib/cdsp-automation/iso226-engine.json
 REMOTE_NAME=HID Remote01 Keyboard
 REMOTE_DEVICE_RETRY_SECONDS=2
@@ -174,12 +180,26 @@ download_scripts() {
     wget -q "https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts/build_camilladsp_iso226.sh" -O "$SCRIPTS_DIR/build_camilladsp_iso226.sh.tmp"
   fi
   mv "$SCRIPTS_DIR/build_camilladsp_iso226.sh.tmp" "$SCRIPTS_DIR/build_camilladsp_iso226.sh"
+  if [[ -f "$REPO_DIR/scripts/build_librespot_volume_sync.sh" ]]; then
+    cp "$REPO_DIR/scripts/build_librespot_volume_sync.sh" "$SCRIPTS_DIR/build_librespot_volume_sync.sh.tmp"
+  else
+    wget -q "https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts/build_librespot_volume_sync.sh" -O "$SCRIPTS_DIR/build_librespot_volume_sync.sh.tmp"
+  fi
+  mv "$SCRIPTS_DIR/build_librespot_volume_sync.sh.tmp" "$SCRIPTS_DIR/build_librespot_volume_sync.sh"
   mkdir -p "$BASE_DIR/camilladsp-iso226"
   if [[ -f "$REPO_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch" ]]; then
     cp "$REPO_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch" "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch.tmp"
   else
     wget -q "https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch" -O "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch.tmp"
   fi
+  mkdir -p "$BASE_DIR/librespot-volume-sync"
+  if [[ -f "$REPO_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch" ]]; then
+    cp "$REPO_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch.tmp"
+  else
+    wget -q "https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch" -O "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch.tmp"
+  fi
+  mv "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch.tmp" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch"
+  chmod +x "$SCRIPTS_DIR/build_librespot_volume_sync.sh"
   mv "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch.tmp" "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch"
   chmod +x "$SCRIPTS_DIR"/*.py
   chmod +x "$SCRIPTS_DIR"/*.sh
@@ -274,10 +294,12 @@ create_unit() {
   local unit_file
   unit_file="$(mktemp "${TMPDIR:-/tmp}/${sysname}.service.XXXXXX")"
   local runtime_directory=""
+  local unit_ordering=""
   if [[ "$sysname" == "cdsp-source-switcher" ]]; then
     runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes'
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
+    unit_ordering='Before=shairport-sync.service raspotify.service'
   fi
 
   cat > "$unit_file" <<EOL
@@ -285,6 +307,7 @@ create_unit() {
 Description=CamillaDSP $name
 Wants=network-online.target camilladsp.service
 After=network-online.target camilladsp.service
+$unit_ordering
 
 [Service]
 User=$INSTALL_USER
@@ -348,8 +371,8 @@ install_remote_sudoers() {
   tmp="$(mktemp)"
 
   cat > "$tmp" <<EOF
-# Allow cdsp-remote.service to perform only its documented power actions.
-$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
+# Allow the control services to perform only their documented service actions.
+$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN start shairport-sync.service, $SYSTEMCTL_BIN stop shairport-sync.service, $SYSTEMCTL_BIN start raspotify.service, $SYSTEMCTL_BIN stop raspotify.service, $SYSTEMCTL_BIN poweroff
 EOF
   sudo "$VISUDO_BIN" -cf "$tmp"
   sudo install -m 0440 "$tmp" /etc/sudoers.d/cdsp-automation
@@ -416,6 +439,11 @@ install_airplay_volume_bridge() {
   echo "Shairport Sync now sends unity audio and controls the CamillaDSP master fader."
 }
 
+install_spotify_volume_sync() {
+  echo "Building the pinned Spotify Connect volume-sync receiver..."
+  "$SCRIPTS_DIR/build_librespot_volume_sync.sh" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch"
+}
+
 install_iso226_engine() {
   echo "Building the pinned CamillaDSP 4.1.3 ISO 226 engine..."
   "$SCRIPTS_DIR/build_camilladsp_iso226.sh" "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch"
@@ -459,6 +487,9 @@ refresh_installed_units() {
     sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
     create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon
   fi
+  if [[ -f /etc/systemd/system/raspotify.service.d/uglan-volume-sync.conf ]]; then
+    install_spotify_volume_sync
+  fi
 }
 
 show_status() {
@@ -483,6 +514,9 @@ uninstall_all() {
   sudo rm -f /etc/sudoers.d/cdsp-automation
   if [[ -x "$SCRIPTS_DIR/build_camilladsp_iso226.sh" ]]; then
     "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
+  fi
+  if [[ -x "$SCRIPTS_DIR/build_librespot_volume_sync.sh" ]]; then
+    "$SCRIPTS_DIR/build_librespot_volume_sync.sh" --uninstall || true
   fi
   if [[ -f /etc/shairport-sync.conf && -f "$SCRIPTS_DIR/configure_shairport.py" ]]; then
     sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" --remove /etc/shairport-sync.conf
@@ -574,7 +608,7 @@ CamillaDSP Utilities - Choose an Option
 6)  Install Remote Control
 7)  Pair Bluetooth Remote
 8)  Show Service Status
-9)  Install AirPlay Volume Bridge
+9)  Install AirPlay + Spotify Volume Sync
 10) Install ISO 226 Loudness Engine
 11) Uninstall All Utilities
 0)  Exit
@@ -588,7 +622,7 @@ main() {
     print_menu
     read -r -p "Enter your choice: " choice
     case "$choice" in
-      1) prepare_install; install_iso226_engine; install_trigger; install_motu_sync; install_source_switcher; install_remote; install_airplay_volume_bridge ;;
+      1) prepare_install; install_iso226_engine; install_trigger; install_motu_sync; install_source_switcher; install_remote; install_airplay_volume_bridge; install_spotify_volume_sync ;;
       2) update_utilities ;;
       3) prepare_install; install_trigger ;;
       4) prepare_install; install_motu_sync ;;
@@ -596,7 +630,7 @@ main() {
       6) prepare_install; install_remote ;;
       7) pair_bluetooth_remote ;;
       8) show_status ;;
-      9) prepare_install; install_airplay_volume_bridge ;;
+      9) prepare_install; install_airplay_volume_bridge; install_spotify_volume_sync ;;
       10) prepare_install; install_iso226_engine ;;
       11) uninstall_all ;;
       0) echo "Exiting."; exit 0 ;;

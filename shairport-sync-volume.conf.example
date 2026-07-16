@@ -6,3 +6,11 @@ general =
     ignore_volume_control = "yes";
     run_this_when_volume_is_set = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify ";
 };
+
+// AirPlay interrupts the installation schedule while its stream is active.
+sessioncontrol =
+{
+    run_this_before_play_begins = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --airplay-start";
+    run_this_after_play_ends = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --airplay-stop";
+    wait_for_completion = "yes";
+};
