@@ -19,8 +19,8 @@ from audio_eq import apply_audio_overlay, audio_state_lock
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
-    OPERATOR_CONFIG_SPEAKERS,
     normalize_speaker_id,
+    operator_configs_for_speaker,
 )
 from speaker_xo import expand_crossover_profile
 
@@ -360,13 +360,14 @@ def profile_catalog(
             continue
         try:
             profile = load_profile(profile_dir, profile_id)
-            operator_config = OPERATOR_CONFIG_SPEAKERS.get(profile_id)
-            if operator_config:
-                missing = (
-                    []
-                    if (operator_config_dir / operator_config).is_file()
-                    else [operator_config]
-                )
+            operator_configs = operator_configs_for_speaker(profile_id)
+            if operator_configs:
+                missing = [
+                    operator_configs.get(source) or f"{source} (not mapped)"
+                    for source in profile["supported_sources"]
+                    if not operator_configs.get(source)
+                    or not (operator_config_dir / operator_configs[source]).is_file()
+                ]
             else:
                 missing = [
                     source
@@ -377,7 +378,7 @@ def profile_catalog(
             reason = "" if available else (
                 (
                     f"operator config is missing: {', '.join(missing)}"
-                    if operator_config
+                    if operator_configs
                     else f"missing source bases: {', '.join(missing)}"
                 )
                 if missing
@@ -390,8 +391,8 @@ def profile_catalog(
                 "available": available,
                 "legacy": False,
                 "installed": True,
-                "editable": profile["crossover"] is not None or bool(operator_config),
-                "operator_config": operator_config,
+                "editable": profile["crossover"] is not None or bool(operator_configs),
+                "operator_config": operator_configs or None,
                 "reason": reason,
                 "revision": profile["revision"],
                 "enabled": profile["enabled"],

@@ -48,6 +48,8 @@ from speaker_profiles import (
     read_speaker_selection,
     set_audio_inhibit,
     speaker_selection_lock,
+    operator_config_for_source,
+    operator_configs_for_speaker,
 )
 
 
@@ -382,9 +384,10 @@ def managed_config_identity(current: str | None) -> tuple[str, str] | None:
     for source, target in CONFIGS.items():
         if same_config(current, target):
             return source, DEFAULT_SPEAKER_ID
-    for speaker_id, filename in OPERATOR_CONFIG_SPEAKERS.items():
-        if same_config(current, os.path.join(CONFIG_DIR, filename)):
-            return "streamer", speaker_id
+    for speaker_id in OPERATOR_CONFIG_SPEAKERS:
+        for source, filename in operator_configs_for_speaker(speaker_id).items():
+            if same_config(current, os.path.join(CONFIG_DIR, filename)):
+                return source, speaker_id
     if not current:
         return None
     path = Path(current).resolve(strict=False)
@@ -705,7 +708,7 @@ def resolve_config_target(
     profile = load_profile(SPEAKER_PROFILE_DIR, speaker_id)
     if source not in profile["supported_sources"]:
         raise ValueError(f"speaker profile {speaker_id!r} does not support {source}")
-    operator_filename = OPERATOR_CONFIG_SPEAKERS.get(speaker_id)
+    operator_filename = operator_config_for_source(speaker_id, source)
     if operator_filename:
         path = Path(CONFIG_DIR) / operator_filename
         expected_config = load_yaml_mapping(path, f"operator config {speaker_id}")

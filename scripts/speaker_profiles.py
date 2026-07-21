@@ -27,8 +27,13 @@ DEFAULT_SPEAKER_ID = "kantarellen"
 # CamillaGUI config directory. They are intentionally editable in CamillaGUI;
 # the source switcher validates and loads the file directly instead of
 # generating an immutable config from the compact crossover schema.
-OPERATOR_CONFIG_SPEAKERS: dict[str, str] = {
-    "partymeh": "partymeh.yml",
+OPERATOR_CONFIG_SPEAKERS: dict[str, str | dict[str, str]] = {
+    "partymeh": {
+        "streamer": "partymeh-streamer.yml",
+        "gadget": "partymeh-gadget.yml",
+        "toslink": "partymeh-toslink.yml",
+        "analog": "partymeh-analog.yml",
+    },
 }
 BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
     "kantarellen": {
@@ -48,6 +53,22 @@ BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
         "description": "PartyMEH on outputs 1–6 and Bird on outputs 7–8",
     },
 }
+
+
+def operator_configs_for_speaker(speaker_id: str) -> dict[str, str]:
+    """Return source -> filename for an operator-owned speaker profile.
+
+    A legacy string entry remains a streamer-only shorthand so older local
+    deployments can be upgraded without changing their profile definition.
+    """
+    spec = OPERATOR_CONFIG_SPEAKERS.get(speaker_id)
+    if isinstance(spec, str):
+        return {"streamer": spec}
+    return dict(spec or {})
+
+
+def operator_config_for_source(speaker_id: str, source: str) -> str | None:
+    return operator_configs_for_speaker(speaker_id).get(source)
 
 
 def normalize_speaker_id(value: Any) -> str:
