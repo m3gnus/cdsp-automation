@@ -115,8 +115,6 @@ ANALOG_CFG = os.path.join(CONFIG_DIR, "analog.yml")
 SOURCE_OVERRIDE_PATH = os.environ.get(
     "SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source"
 )
-WLED_ENV_PATH = os.environ.get("WLED_REACTIVE_ENV", "/etc/default/wled-music-reactive")
-DELAY_REAPPLY_SECONDS = float(os.environ.get("SOURCE_DELAY_REAPPLY_SECONDS", "5.0"))
 AUDIO_EQ_PATH = os.environ.get(
     "AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json"
 )
@@ -538,50 +536,6 @@ def _write_speaker_status(payload: dict) -> None:
         atomic_write_json(SPEAKER_STATUS_PATH, payload)
 
 
-SPECTRUM_SERVICE = os.environ.get("SPECTRUM_SERVICE", "camilladsp-spectrum.service")
-# Substring of a capture device that the spectrum analyzer's dsnoop tap
-# contends with (e.g. "UltraLitemk5"). Empty disables all lifecycle handling.
-SPECTRUM_CONTENDS_WITH = os.environ.get("SPECTRUM_CONTENDS_WITH", "")
-
-
-def _spectrum_contends(config: dict | None) -> bool:
-    if not SPECTRUM_CONTENDS_WITH or not isinstance(config, dict):
-        return False
-    capture = (config.get("devices") or {}).get("capture") or {}
-    return SPECTRUM_CONTENDS_WITH in str(capture.get("device") or "")
-
-
-def _set_spectrum_service(active: bool) -> None:
-    """Best-effort analyzer start/stop; it must never block a source apply."""
-    if not SPECTRUM_CONTENDS_WITH:
-        return
-    if active:
-        try:
-            enabled = subprocess.run(
-                ["systemctl", "is-enabled", "--quiet", SPECTRUM_SERVICE],
-                timeout=5,
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as exc:
-            print(f"spectrum service enable check failed: {exc}", flush=True)
-            return
-        if enabled.returncode != 0:
-            return
-    action = "start" if active else "stop"
-    try:
-        subprocess.run(
-            ["systemctl", action, SPECTRUM_SERVICE],
-            timeout=15,
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    except Exception as exc:
-        print(f"spectrum service {action} failed: {exc}", flush=True)
-
-
 def _speaker_status_revision() -> int | None:
     """Selection revision of the last successful apply, if recorded."""
     try:
@@ -812,134 +766,6 @@ def read_manual_source() -> str | None:
     return source
 
 
-# --- WLED light-sync delay ownership -------------------------------------
-# The WLED music-reactive controller used to inject this Delay filter into the
-# live CamillaDSP config every few seconds, racing this switcher's reloads
-# (every source switch dropped the filter for up to 5s, and the two writers
-# could clobber each other). The switcher is the SOLE writer of the config, so
-# it now owns the filter: it re-asserts it on every config apply and
-# periodically, with no second writer to race. Delay parameters are read from
-# the WLED env file so the control-UI "sync" sliders keep working unchanged.
-
-
-def read_wled_delay_settings() -> tuple[bool, float, str]:
-    enabled, delay_ms, name = False, 0.0, "wled_light_sync_delay"
-    try:
-        with open(WLED_ENV_PATH, "r", encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key, value = key.strip(), value.strip()
-                if key == "CAMILLA_DELAY_ENABLED":
-                    enabled = value.lower() in {"1", "true", "yes", "on"}
-                elif key == "CAMILLA_DELAY_MS":
-                    try:
-                        delay_ms = float(value)
-                    except ValueError:
-                        enabled, delay_ms = False, 0.0
-                elif key == "CAMILLA_DELAY_FILTER_NAME" and value:
-                    name = value
-    except FileNotFoundError:
-        pass
-    return enabled, delay_ms, name
-
-
-def _delay_channels(config: dict) -> list:
-    capture = config.get("devices", {}).get("capture", {})
-    channels = int(capture.get("channels") or 2)
-    # The installation's second stereo program does not drive the WLED strip.
-    # Keep light-sync latency on the main stereo input only.
-    return list(range(min(2, max(1, channels))))
-
-
-def _remove_delay(config: dict, name: str) -> tuple:
-    changed = False
-    new_config = copy.deepcopy(config)
-    filters = new_config.get("filters", {})
-    if name in filters:
-        del filters[name]
-        changed = True
-    pipeline = []
-    for step in new_config.get("pipeline", []):
-        names = step.get("names")
-        if isinstance(names, list) and name in names:
-            remaining = [n for n in names if n != name]
-            if remaining:
-                next_step = copy.deepcopy(step)
-                next_step["names"] = remaining
-                pipeline.append(next_step)
-            changed = True
-        else:
-            pipeline.append(step)
-    new_config["pipeline"] = pipeline
-    return new_config, changed
-
-
-def _has_requested_delay(config: dict, name: str, delay_ms: float) -> bool:
-    delay_filter = config.get("filters", {}).get(name)
-    if not delay_filter or delay_filter.get("type") != "Delay":
-        return False
-    params = delay_filter.get("parameters", {})
-    try:
-        delay_matches = abs(float(params.get("delay")) - delay_ms) < 0.001
-    except (TypeError, ValueError):
-        delay_matches = False
-    if not delay_matches or params.get("unit") != "ms":
-        return False
-    expected_channels = _delay_channels(config)
-    matches = []
-    for step in config.get("pipeline", []):
-        names = step.get("names")
-        if isinstance(names, list) and name in names:
-            matches.append(step)
-    return len(matches) == 1 and matches[0].get("channels") == expected_channels
-
-
-def _add_delay(config: dict, name: str, delay_ms: float) -> dict:
-    new_config, _ = _remove_delay(config, name)
-    channels = _delay_channels(new_config)
-    filters = new_config.setdefault("filters", {})
-    filters[name] = {
-        "type": "Delay",
-        "parameters": {"delay": delay_ms, "unit": "ms", "subsample": False},
-    }
-    new_config.setdefault("pipeline", []).insert(
-        0,
-        {
-            "type": "Filter",
-            "channels": channels,
-            "names": [name],
-            "description": "WLED light sync delay (owned by source switcher)",
-            "bypassed": False,
-        },
-    )
-    return new_config
-
-
-def ensure_delay_filter(cdsp: CamillaClient) -> None:
-    """Make the live config's WLED sync-delay filter match the WLED env.
-
-    Idempotent: only calls set_active when the filter is missing/wrong (add) or
-    present-but-disabled (remove), so steady state performs no writes.
-    """
-    enabled, delay_ms, name = read_wled_delay_settings()
-    config = cdsp.config.active()
-    if not config:
-        return
-    if enabled:
-        if _has_requested_delay(config, name, delay_ms):
-            return
-        cdsp.config.set_active(_add_delay(config, name, delay_ms))
-        print(f"WLED light-sync delay applied: {delay_ms:.1f}ms", flush=True)
-    else:
-        new_config, changed = _remove_delay(config, name)
-        if changed:
-            cdsp.config.set_active(new_config)
-            print("WLED light-sync delay removed (disabled)", flush=True)
-
-
 def _write_audio_eq_status(payload: dict) -> None:
     """Publish apply convergence without rewriting an unchanged status file."""
     try:
@@ -1164,11 +990,6 @@ def apply_config(
                 or current_selection["revision"] != target["selection_revision"]
             ):
                 raise RuntimeError("speaker selection changed before config reload")
-        # Release the analyzer's dsnoop hold before a config that captures
-        # the same hardware; harmless no-op for loopback/gadget captures.
-        target_config = target.get("expected_config") if target else None
-        if _spectrum_contends(target_config):
-            _set_spectrum_service(False)
         cdsp.config.set_file_path(file_path)
         cdsp.general.reload()
         time.sleep(settle_time)
@@ -1193,8 +1014,7 @@ def apply_config(
             ):
                 raise RuntimeError("speaker selection changed during config transition")
 
-        # Re-assert owned overlays before sound returns.
-        ensure_delay_filter(cdsp)
+        # Re-assert the owned EQ overlay before sound returns.
         if target:
             ensure_audio_eq(
                 cdsp,
@@ -1237,8 +1057,6 @@ def apply_config(
         cdsp.volume.set_main_mute(previous_mute)
         clear_pending_transition(target)
         clear_audio_inhibit(AUDIO_READY_PATH)
-        if not _spectrum_contends(target_config):
-            _set_spectrum_service(True)
         if (
             target
             and not target.get("legacy", False)
@@ -1283,9 +1101,6 @@ def apply_config(
             cdsp.volume.set_main_mute(True)
         except Exception:
             pass
-        # Re-align the analyzer with whatever config is actually loaded now.
-        if rollback_ok:
-            _set_spectrum_service(not _spectrum_contends(previous_expected))
         if target:
             _write_speaker_status(
                 {
@@ -1368,7 +1183,6 @@ def main() -> int:
     last_manual_error = None
     error_log_deadline = 0.0
     last_error_message = None
-    next_delay_check = 0.0
     next_audio_eq_check = 0.0
     startup_restore_mute: bool | None = None
     startup_configs_validated = False
@@ -1518,16 +1332,7 @@ def main() -> int:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Own the WLED light-sync delay filter: re-assert periodically so it
-            # self-heals and picks up UI changes to CAMILLA_DELAY_MS/ENABLED.
             now = time.monotonic()
-            if now >= next_delay_check:
-                next_delay_check = now + DELAY_REAPPLY_SECONDS
-                try:
-                    ensure_delay_filter(cdsp)
-                except Exception as exc:
-                    print(f"WLED delay ensure failed: {exc}", flush=True)
-
             if now >= next_audio_eq_check and current_speaker == selected_speaker:
                 next_audio_eq_check = now + AUDIO_EQ_REAPPLY_SECONDS
                 try:

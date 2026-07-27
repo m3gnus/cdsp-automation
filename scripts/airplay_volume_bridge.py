@@ -261,7 +261,7 @@ def notify(airplay_db: str) -> None:
 
 
 def notify_airplay_session(active: bool) -> None:
-    """Ask the daemon to hand scheduled playback to or from AirPlay."""
+    """Ask the daemon to hand network playback to or from AirPlay."""
     target = "airplay-active" if active else ""
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
@@ -318,22 +318,35 @@ def _lms_request(player: str, terms: list[object]) -> dict:
     return payload.get("result", {}) if isinstance(payload, dict) else {}
 
 
-def interrupt_scheduled_playback(owner: str = "airplay") -> None:
-    """Inhibit scheduled playback and release ALSA to a network receiver."""
+def begin_network_playback(owner: str = "airplay") -> None:
+    """Claim network playback and hand the shared ALSA program to a receiver.
+
+    Stopping the configured LMS/Squeezelite players is strictly best-effort:
+    an unreachable or absent LMS server must never keep AirPlay or Spotify
+    from starting, so those failures are logged and ignored.
+    """
     if owner not in {"airplay", "spotify"}:
         raise ValueError(f"unsupported playback owner: {owner}")
     _write_playback_state(f"{owner}-starting")
     try:
-        players = _lms_request("", ["players", "0", "100"]).get(
-            "players_loop", []
-        )
-        for player in players or []:
-            if str(player.get("name", "")).strip() in LMS_PLAYER_NAMES:
-                player_id = str(player.get("playerid", "")).strip()
-                if player_id:
-                    _lms_request(player_id, ["stop"])
-        # Squeezelite closes uglan_main after its one-second idle timeout.
-        time.sleep(max(0.0, AIRPLAY_RELEASE_DELAY))
+        stopped = 0
+        if LMS_PLAYER_NAMES:
+            try:
+                players = _lms_request("", ["players", "0", "100"]).get(
+                    "players_loop", []
+                )
+                for player in players or []:
+                    if str(player.get("name", "")).strip() in LMS_PLAYER_NAMES:
+                        player_id = str(player.get("playerid", "")).strip()
+                        if player_id:
+                            _lms_request(player_id, ["stop"])
+                            stopped += 1
+            except Exception as exc:
+                print(f"LMS streamer stop skipped: {exc}", flush=True)
+        if stopped:
+            # Squeezelite closes its ALSA device after a one-second idle
+            # timeout; give it that long before the receiver opens the device.
+            time.sleep(max(0.0, AIRPLAY_RELEASE_DELAY))
         _write_playback_state(f"{owner}-active")
     except Exception:
         AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
@@ -341,7 +354,7 @@ def interrupt_scheduled_playback(owner: str = "airplay") -> None:
 
 
 def finish_network_playback() -> None:
-    """Let the scheduler resume the currently active wall-clock event."""
+    """Clear the network-playback marker when a receiver session ends."""
     AIRPLAY_ACTIVE_PATH.unlink(missing_ok=True)
 
 
@@ -459,7 +472,7 @@ class PlaybackArbiter:
         self.owner = source
         other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
         try:
-            interrupt_scheduled_playback(source)
+            begin_network_playback(source)
             set_receiver_service(other_service, False)
         except Exception:
             self.owner = None

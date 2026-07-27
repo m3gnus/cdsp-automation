@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 from pathlib import Path
 import tempfile
 import unittest
@@ -57,7 +59,7 @@ class VolumeSyncTests(unittest.TestCase):
         self.assertIn('else "idle"', bridge)
         self.assertIn("waiting for an active Spotify Connect session", bridge)
 
-    def test_airplay_handoff_stops_schedule_players_and_clears_inhibit(self) -> None:
+    def test_airplay_handoff_stops_streamer_players_and_clears_marker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             active = Path(directory) / "active"
             calls: list[tuple[str, list[object]]] = []
@@ -75,15 +77,51 @@ class VolumeSyncTests(unittest.TestCase):
 
             with (
                 mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
+                mock.patch.object(
+                    volume_sync, "LMS_PLAYER_NAMES", ("uglan", "uglan-stereo")
+                ),
                 mock.patch.object(volume_sync, "_lms_request", side_effect=request),
                 mock.patch.object(volume_sync.time, "sleep"),
             ):
-                volume_sync.interrupt_scheduled_playback()
+                volume_sync.begin_network_playback()
                 self.assertEqual(active.read_text().strip(), "airplay-active")
                 volume_sync.finish_network_playback()
             self.assertFalse(active.exists())
             self.assertIn(("main", ["stop"]), calls)
             self.assertIn(("stereo", ["stop"]), calls)
+
+    def test_unreachable_lms_never_blocks_network_playback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory) / "active"
+            with (
+                mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
+                mock.patch.object(volume_sync, "LMS_PLAYER_NAMES", ("uglan",)),
+                mock.patch.object(
+                    volume_sync,
+                    "_lms_request",
+                    side_effect=OSError("connection refused"),
+                ),
+                mock.patch.object(volume_sync.time, "sleep") as sleep,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                volume_sync.begin_network_playback()
+                self.assertEqual(active.read_text().strip(), "airplay-active")
+            sleep.assert_not_called()
+            self.assertIn("LMS streamer stop skipped", output.getvalue())
+
+    def test_no_configured_players_skips_lms_entirely(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory) / "active"
+            with (
+                mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
+                mock.patch.object(volume_sync, "LMS_PLAYER_NAMES", ()),
+                mock.patch.object(volume_sync, "_lms_request") as lms,
+                mock.patch.object(volume_sync.time, "sleep") as sleep,
+            ):
+                volume_sync.begin_network_playback("spotify")
+                self.assertEqual(active.read_text().strip(), "spotify-active")
+            lms.assert_not_called()
+            sleep.assert_not_called()
 
     def test_first_active_receiver_keeps_playback_ownership(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
