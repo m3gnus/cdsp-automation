@@ -16,13 +16,40 @@ MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
 CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 CHECK_INTERVAL = float(os.environ.get("MOTU_CHECK_INTERVAL", "1"))
+SOURCE_IDS = ("toslink", "streamer", "gadget", "analog")
 
 # MOTU UltraLite mk5 clock-source payloads captured from the web UI.
 CLOCK_PAYLOADS = {
     "internal": "000b0000000103",
     "optical": "000b0000000102",
 }
+# The MOTU re-locks its clock on every clock-source write, even a redundant
+# one, which mutes the outputs briefly and clicks audibly. The device keeps
+# its clock source across power cycles, so remembering the last value we set
+# lets restarts of this service (or CamillaDSP reconnects) stay silent.
+STATE_PATH = Path(
+    os.environ.get("MOTU_CLOCK_STATE_PATH", "/var/lib/cdsp-automation/motu-clock-source")
+)
 _next_motu_error_log = 0.0
+
+
+def read_persisted_clock() -> str | None:
+    try:
+        value = STATE_PATH.read_text().strip()
+    except OSError:
+        return None
+    return value if value in CLOCK_PAYLOADS else None
+
+
+def persist_clock(source: str) -> None:
+    try:
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        scratch = STATE_PATH.with_name(STATE_PATH.name + ".tmp")
+        scratch.write_text(source + "\n")
+        scratch.replace(STATE_PATH)
+    except OSError as exc:
+        # Persistence only suppresses redundant writes; keep running without it.
+        print(f"MOTU: cannot persist clock state: {exc}", flush=True)
 
 
 def set_motu_clock(source: str) -> bool:
@@ -68,13 +95,23 @@ def current_sample_rate(active_config: object) -> int | None:
 def source_for_config_path(path: object) -> str | None:
     if not isinstance(path, str) or not path:
         return None
-    source = Path(path).stem.split("--", 1)[0]
-    return source if source in {"toslink", "streamer", "gadget", "analog"} else None
+    stem = Path(path).stem
+
+    # Legacy configs are named <source>.yml and generated configs are named
+    # <source>--<speaker>.yml. Operator-owned speaker configs use the inverse
+    # <speaker>-<source>.yml form, for example partymeh-streamer.yml.
+    generated_source = stem.split("--", 1)[0]
+    if generated_source in SOURCE_IDS:
+        return generated_source
+    for source in SOURCE_IDS:
+        if stem.endswith(f"-{source}"):
+            return source
+    return None
 
 
 def main() -> int:
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
-    last_clock = None
+    last_clock = read_persisted_clock()
     next_error_log = 0.0
 
     print("MOTU Clock Sync (source identity mode) started", flush=True)
@@ -100,9 +137,12 @@ def main() -> int:
                         flush=True,
                     )
                     last_clock = desired_clock
+                    persist_clock(desired_clock)
 
         except Exception as exc:
-            last_clock = None
+            # A lost CamillaDSP connection does not change the MOTU clock, so
+            # keep last_clock: forgetting it caused an audible re-lock on
+            # every CamillaDSP restart.
             now = time.monotonic()
             if now >= next_error_log:
                 print(f"CamillaDSP error: {exc}", flush=True)

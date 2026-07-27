@@ -555,6 +555,20 @@ def _set_spectrum_service(active: bool) -> None:
     """Best-effort analyzer start/stop; it must never block a source apply."""
     if not SPECTRUM_CONTENDS_WITH:
         return
+    if active:
+        try:
+            enabled = subprocess.run(
+                ["systemctl", "is-enabled", "--quiet", SPECTRUM_SERVICE],
+                timeout=5,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            print(f"spectrum service enable check failed: {exc}", flush=True)
+            return
+        if enabled.returncode != 0:
+            return
     action = "start" if active else "stop"
     try:
         subprocess.run(

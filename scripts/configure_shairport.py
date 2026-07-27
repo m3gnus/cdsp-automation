@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Idempotently configure Shairport Sync's AirPlay volume callback."""
+"""Idempotently configure Shairport Sync's AirPlay bridge and diagnostics."""
 
 from __future__ import annotations
 
@@ -30,6 +30,11 @@ DSP_END = "// UGLAN-LOUDNESS-END"
 ALSA_KEYS = ("output_device",)
 ALSA_BEGIN = "// UGLAN-OUTPUT-BEGIN"
 ALSA_END = "// UGLAN-OUTPUT-END"
+DIAGNOSTICS_KEYS = ("statistics", "log_verbosity")
+DIAGNOSTICS_BEGIN = "// UGLAN-DIAGNOSTICS-BEGIN"
+DIAGNOSTICS_END = "// UGLAN-DIAGNOSTICS-END"
+DIAGNOSTICS_BLOCK_BEGIN = "// UGLAN-DIAGNOSTICS-BLOCK-BEGIN"
+DIAGNOSTICS_BLOCK_END = "// UGLAN-DIAGNOSTICS-BLOCK-END"
 
 
 def _update_block(
@@ -140,6 +145,44 @@ def update_general_block(text: str, callback: str | None) -> str:
         re.DOTALL,
     )
     updated = created_session.sub("\n", updated)
+    created_diagnostics = re.compile(
+        rf"\n?{re.escape(DIAGNOSTICS_BLOCK_BEGIN)}\n.*?{re.escape(DIAGNOSTICS_BLOCK_END)}\n?",
+        re.DOTALL,
+    )
+    updated = created_diagnostics.sub("\n", updated)
+
+    diagnostics_settings = None
+    if callback is not None:
+        diagnostics_settings = [
+            '    statistics = "no";\n',
+            "    log_verbosity = 1;\n",
+        ]
+    try:
+        updated = _update_block(
+            updated,
+            "diagnostics",
+            DIAGNOSTICS_KEYS,
+            DIAGNOSTICS_BEGIN,
+            DIAGNOSTICS_END,
+            diagnostics_settings,
+        )
+    except ValueError as exc:
+        if str(exc) != "active diagnostics block not found":
+            raise
+        if diagnostics_settings is not None:
+            separator = "" if not updated or updated.endswith("\n") else "\n"
+            updated = (
+                updated
+                + separator
+                + f"{DIAGNOSTICS_BLOCK_BEGIN}\n"
+                + "diagnostics =\n{\n"
+                + f"    {DIAGNOSTICS_BEGIN}\n"
+                + "".join(diagnostics_settings)
+                + f"    {DIAGNOSTICS_END}\n"
+                + "};\n"
+                + f"{DIAGNOSTICS_BLOCK_END}\n"
+            )
+
     session_settings = None
     if callback is not None:
         suffix = " --notify"

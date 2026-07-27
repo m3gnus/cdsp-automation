@@ -424,22 +424,33 @@ class PlaybackArbiter:
             self.owner = "airplay"
             _write_playback_state("airplay-active")
             set_receiver_service(SPOTIFY_SERVICE, False)
+            print("playback arbiter: recovered active AirPlay session", flush=True)
         elif not service_is_active(AIRPLAY_SERVICE) and service_is_active(
             SPOTIFY_SERVICE
         ):
             self.owner = "spotify"
             _write_playback_state("spotify-active")
+            print("playback arbiter: recovered active Spotify session", flush=True)
         else:
             self.owner = None
             finish_network_playback()
+            print("playback arbiter: recovered idle state", flush=True)
         return self.owner
 
     def start(self, source: str) -> bool:
         if source not in {"airplay", "spotify"}:
             raise ValueError(f"unsupported playback source: {source}")
         if self.owner == source:
+            print(
+                f"playback arbiter: duplicate {source} start; owner unchanged",
+                flush=True,
+            )
             return True
         if self.owner is not None:
+            print(
+                f"playback arbiter: rejected {source} start; {self.owner} owns playback",
+                flush=True,
+            )
             set_receiver_service(
                 AIRPLAY_SERVICE if source == "airplay" else SPOTIFY_SERVICE,
                 False,
@@ -458,15 +469,27 @@ class PlaybackArbiter:
             except Exception:
                 pass
             raise
+        print(
+            f"playback arbiter: {source} session started; disabled {other_service}",
+            flush=True,
+        )
         return True
 
     def stop(self, source: str) -> bool:
         if self.owner != source:
+            print(
+                f"playback arbiter: ignored {source} stop; owner={self.owner or 'none'}",
+                flush=True,
+            )
             return False
         other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
         self.owner = None
         finish_network_playback()
         set_receiver_service(other_service, True)
+        print(
+            f"playback arbiter: {source} session ended; enabled {other_service}",
+            flush=True,
+        )
         return True
 
 
