@@ -239,6 +239,22 @@ the owned overlay; legacy stages are stripped when a config becomes active.
 
 ---
 
+## 5. Web Control UI (optional)
+
+`scripts/web_ui.py` is a single-file stdlib `http.server` dashboard installed
+by menu option 11 as `cdsp-control-ui.service`. It reuses the sibling modules
+in `scripts/` (`audio_eq.py`, `speaker_profiles.py`, `speaker_config.py`,
+`speaker_xo.py`) and the shared `cdsp-automation.env`, and it respects the
+single-writer contract: every EQ or speaker edit goes through the persistent
+state files and is composed into the live config by the source switcher.
+
+The unit deliberately runs as root because the UI restarts services, mounts
+USB storage, and sets the system clock. It has no authentication; bind it to
+a trusted LAN only. Users who do not want a root web service simply skip
+this component — nothing else depends on it.
+
+---
+
 ## Why Systemd Services?
 
 All four utilities run as systemd services with these benefits:

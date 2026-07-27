@@ -83,11 +83,11 @@ AIRPLAY_SERVICE = "shairport-sync.service"
 SPOTIFY_SERVICE = "raspotify.service"
 LMS_HOST = os.environ.get("LMS_HOST", "127.0.0.1")
 LMS_PORT = int(os.environ.get("LMS_PORT", "9000"))
+# Comma-separated LMS/Squeezelite player names to stop when a network
+# receiver starts. Empty (the default) disables the LMS hand-off entirely.
 LMS_PLAYER_NAMES = tuple(
     name.strip()
-    for name in os.environ.get(
-        "AIRPLAY_INTERRUPTED_LMS_PLAYERS", "uglan,uglan-stereo"
-    ).split(",")
+    for name in os.environ.get("AIRPLAY_INTERRUPTED_LMS_PLAYERS", "").split(",")
     if name.strip()
 )
 

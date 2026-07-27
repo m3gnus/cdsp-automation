@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "default": "mains",
+  "speakers": {
+    "mains": {
+      "label": "Mains",
+      "description": "Three-way stereo system on outputs 1-6",
+      "operator_configs": {
+        "streamer": "mains-streamer.yml",
+        "toslink": "mains-toslink.yml"
+      }
+    },
+    "measurement": {
+      "label": "Measurement",
+      "description": "Direct measurement routing without speaker EQ or crossover"
+    }
+  }
+}

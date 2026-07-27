@@ -68,6 +68,7 @@ AUDIO_CONTROL_LOCK_PATH=/var/lib/cdsp-automation/audio-control.lock
 AUDIO_READY_PATH=/run/cdsp-source-switcher/audio-ready.json
 AUDIO_EQ_REAPPLY_SECONDS=1.0
 SPEAKER_SELECTION_PATH=/var/lib/cdsp-automation/speaker-selection.json
+SPEAKER_CATALOG_PATH=/etc/cdsp-automation/speaker-catalog.json
 SPEAKER_AUDIO_DIR=/var/lib/cdsp-automation/speaker-audio
 SPEAKER_PROFILE_DIR=/etc/cdsp-automation/speaker-profiles
 SOURCE_BASE_DIR=/etc/cdsp-automation/source-bases
@@ -165,7 +166,7 @@ download_scripts() {
   ensure_env_file
   migrate_legacy_settings
   local script tmp
-  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py; do
+  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -444,6 +445,46 @@ install_spotify_volume_sync() {
   "$SCRIPTS_DIR/build_librespot_volume_sync.sh" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch"
 }
 
+install_control_ui() {
+  echo "Installing the web control UI (optional)..."
+  echo ""
+  echo "The UI manages sources, volume, EQ, speaker profiles, services,"
+  echo "storage and the system clock, so its service runs as root."
+  echo "Expose its port on a trusted LAN only; it has no authentication."
+  echo ""
+  local unit_file
+  unit_file="$(mktemp)"
+  cat > "$unit_file" <<EOL
+[Unit]
+Description=CamillaDSP Control UI
+Wants=network-online.target camilladsp.service
+After=network-online.target camilladsp.service
+
+[Service]
+Type=simple
+WorkingDirectory=$BASE_DIR
+EnvironmentFile=-$ENV_FILE
+Environment=PYTHONUNBUFFERED=1
+Environment=INSTALLATION_UI_HOST=0.0.0.0
+Environment=INSTALLATION_UI_PORT=8088
+ExecStart=$VENV_DIR/bin/python3 -u $SCRIPTS_DIR/web_ui.py
+Restart=always
+RestartSec=2
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cdsp-control-ui
+
+[Install]
+WantedBy=multi-user.target
+EOL
+  sudo install -m 0644 "$unit_file" "${SYSTEMD_UNIT_DIR}/cdsp-control-ui.service"
+  rm -f "$unit_file"
+  sudo systemctl daemon-reload
+  sudo systemctl reenable cdsp-control-ui.service
+  sudo systemctl restart cdsp-control-ui.service
+  echo "Control UI installed on port 8088."
+}
+
 install_iso226_engine() {
   echo "Building the pinned CamillaDSP 4.1.3 ISO 226 engine..."
   "$SCRIPTS_DIR/build_camilladsp_iso226.sh" "$BASE_DIR/camilladsp-iso226/camilladsp-v4.1.3-iso226.patch"
@@ -490,6 +531,9 @@ refresh_installed_units() {
   if [[ -f /etc/systemd/system/raspotify.service.d/uglan-volume-sync.conf ]]; then
     install_spotify_volume_sync
   fi
+  if systemctl list-unit-files --no-legend cdsp-control-ui.service 2>/dev/null | grep -q '^cdsp-control-ui.service'; then
+    install_control_ui
+  fi
 }
 
 show_status() {
@@ -522,6 +566,9 @@ uninstall_all() {
     sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" --remove /etc/shairport-sync.conf
     sudo systemctl restart shairport-sync.service || true
   fi
+  sudo systemctl stop cdsp-control-ui.service 2>/dev/null || true
+  sudo systemctl disable cdsp-control-ui.service 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/cdsp-control-ui.service
   sudo rm -f /usr/local/libexec/airplay_volume_bridge.py \
     /usr/local/libexec/speaker_profiles.py /usr/local/libexec/audio_eq.py
   sudo systemctl daemon-reload
@@ -610,7 +657,8 @@ CamillaDSP Utilities - Choose an Option
 8)  Show Service Status
 9)  Install AirPlay + Spotify Volume Sync
 10) Install ISO 226 Loudness Engine
-11) Uninstall All Utilities
+11) Install Web Control UI (optional)
+12) Uninstall All Utilities
 0)  Exit
 =============================================
 MENU
@@ -632,7 +680,8 @@ main() {
       8) show_status ;;
       9) prepare_install; install_airplay_volume_bridge; install_spotify_volume_sync ;;
       10) prepare_install; install_iso226_engine ;;
-      11) uninstall_all ;;
+      11) prepare_install; install_control_ui ;;
+      12) uninstall_all ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac

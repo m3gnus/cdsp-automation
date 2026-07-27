@@ -19,6 +19,7 @@ from audio_eq import apply_audio_overlay, audio_state_lock
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
+    LEGACY_SPEAKER_ID,
     normalize_speaker_id,
     operator_configs_for_speaker,
 )
@@ -156,8 +157,10 @@ def normalize_profile(raw: Any, *, expected_id: str | None = None) -> dict[str, 
         raise ValueError(
             f"speaker profile id {profile_id!r} does not match {expected_id!r}"
         )
-    if profile_id == DEFAULT_SPEAKER_ID:
-        raise ValueError("Kantarellen uses the legacy compatibility profile")
+    if LEGACY_SPEAKER_ID is not None and profile_id == LEGACY_SPEAKER_ID:
+        raise ValueError(
+            "the legacy compatibility profile has no parametric definition"
+        )
 
     sources_in = profile.get("supported_sources", [])
     if not isinstance(sources_in, list) or not sources_in:
@@ -347,7 +350,7 @@ def profile_catalog(
         operator_config_dir = source_base_dir.parent
     result: dict[str, dict[str, Any]] = {}
     for profile_id, metadata in BUILTIN_SPEAKERS.items():
-        if profile_id == DEFAULT_SPEAKER_ID:
+        if LEGACY_SPEAKER_ID is not None and profile_id == LEGACY_SPEAKER_ID:
             result[profile_id] = {
                 **metadata,
                 "id": profile_id,
@@ -689,8 +692,10 @@ def save_profile(
 ) -> dict[str, Any]:
     """Validate and atomically persist a parametric profile with CAS protection."""
     selected = normalize_speaker_id(profile_id)
-    if selected == DEFAULT_SPEAKER_ID:
-        raise ValueError("Kantarellen uses the legacy compatibility profile")
+    if LEGACY_SPEAKER_ID is not None and selected == LEGACY_SPEAKER_ID:
+        raise ValueError(
+            "the legacy compatibility profile has no parametric definition"
+        )
     payload = dict(_mapping(data, "speaker profile"))
     if "crossover" not in payload:
         raise ValueError("only parametric crossover profiles can be saved")

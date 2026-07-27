@@ -59,6 +59,15 @@ speaker's crossover. Kantarellen retains the legacy
 migration. The browser and HID remote resolve the selected profile for every
 edit, so Bass/Treble, user EQ, and loudness remain independent per speaker.
 
+The selectable speakers ship as the maintainer's defaults. A site replaces
+the whole catalog without editing code by writing the JSON file at
+`SPEAKER_CATALOG_PATH` (default `/etc/cdsp-automation/speaker-catalog.json`;
+see `speaker-catalog.example.json`): `default` names the boot selection, the
+optional `legacy` key marks the one profile that still uses the legacy
+`audio-eq.json` state path, and per-speaker `operator_configs` map sources to
+complete operator-owned CamillaDSP files. An unreadable or invalid catalog
+logs a warning and keeps the built-ins.
+
 Speaker selection and source arbitration are orthogonal. Kantarellen uses the
 existing full configs. Non-legacy profiles are strict YAML fragments in
 `SPEAKER_PROFILE_DIR`; they are composed with capture-only YAML bases from
@@ -96,13 +105,13 @@ The all-utilities install also:
   routes Spotify Connect volume into CamillaDSP, and publishes CamillaDSP/Web
   UI/HID changes back to the Spotify source slider. The installer verifies the
   patched receiver and rolls back automatically if its service or command
-  socket is unhealthy;
-- exposes low/mid/high analysis from crossover output meters declared by the
-  active speaker profile. This avoids a second ALSA capture path that would
-  otherwise see only streamer sources or contend with the main DSP instance.
-  Kantarellen publishes high 0–1, mid 2–3 and low 4–5; other profiles publish
-  their actual `capabilities.meter_bands` or omit it. Missing groups are
-  reported as unavailable rather than displayed as valid silence.
+  socket is unhealthy.
+
+When a network receiver session starts, the bridge can also stop local
+LMS/Squeezelite streamer playback: set `AIRPLAY_INTERRUPTED_LMS_PLAYERS` to a
+comma-separated list of player names. It is strictly best-effort — an
+unreachable LMS never blocks AirPlay or Spotify — and unset (the default) the
+hand-off is disabled.
 
 ISO calibration: choose a comfortable reference master setting, measure SPL at
 the listening position, enter the measured value as the reference phon and then
@@ -419,6 +428,36 @@ DEBUG: Streamer HW=True, Gadget HW=False, TOSLINK meter=False/0/5, Analog meter=
 
 ---
 
+## 🖥️ Web Control UI (optional)
+
+### What It Does
+
+A single-file, no-framework web dashboard (default port 8088) for the whole
+audio stack: physical source switching, CamillaDSP master volume/mute, the
+persistent parametric EQ with a computed response curve and loudness
+controls, speaker-profile selection (muted, validated, rollback-protected
+transitions), service health and restarts, live input levels, journal logs,
+USB storage mounting, and system clock control.
+
+The UI edits persistent state only; the source switcher remains the sole
+writer of the live CamillaDSP configuration.
+
+### Security Model
+
+Because it manages services, storage mounts, and the system clock, the
+`cdsp-control-ui.service` unit runs as **root** by design. The UI has **no
+authentication**: expose port 8088 on a trusted LAN only, never on the
+internet. Install it only if you want that trade-off; every other utility
+works without it.
+
+### Configuration
+
+The unit reads `~/camilladsp/cdsp-automation.env` like the other utilities,
+plus `INSTALLATION_UI_HOST` / `INSTALLATION_UI_PORT` (defaults `0.0.0.0` /
+`8088`) set in the unit file.
+
+---
+
 ## Installation Details
 
 The installer menu provides these options:
@@ -431,7 +470,10 @@ The installer menu provides these options:
 6. **Install Remote Control** - Bluetooth/USB remote control only
 7. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
 8. **Show Service Status** - Check if services are running
-9. **Uninstall All Utilities** - Remove everything
+9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the CamillaDSP fader
+10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build
+11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
+12. **Uninstall All Utilities** - Remove everything
 
 ### What Gets Installed
 
@@ -446,6 +488,8 @@ The installer menu provides these options:
 - `cdsp-motu-sync.service`
 - `cdsp-source-switcher.service`
 - `cdsp-remote.service`
+- `airplay-volume-bridge.service`
+- `cdsp-control-ui.service` (optional)
 
 **Dependencies:**
 - `websocket-client` (Python package)
