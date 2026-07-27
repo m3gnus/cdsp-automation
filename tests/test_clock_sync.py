@@ -26,6 +26,9 @@ except ImportError:
 from scripts import clock_sync
 
 
+REPOSITORY = Path(__file__).resolve().parents[1]
+
+
 class ClockSyncTests(unittest.TestCase):
     def test_current_sample_rate_validates_shape_and_value(self) -> None:
         self.assertEqual(
@@ -134,6 +137,34 @@ class ClockSyncTests(unittest.TestCase):
             clock_sync.main()
 
         self.assertEqual(set_clock.call_args_list, [mock.call("optical"), mock.call("optical")])
+
+
+def test_clock_send_failure_is_not_latched_and_equal_rates_use_source_identity() -> None:
+    class FailingSocket:
+        def connect(self, *_args: object, **_kwargs: object) -> None:
+            raise OSError("MOTU offline")
+
+        def close(self) -> None:
+            pass
+
+    with (
+        mock.patch.object(clock_sync.websocket, "WebSocket", FailingSocket),
+        mock.patch.object(clock_sync, "_next_motu_error_log", 0.0),
+        mock.patch.object(clock_sync.time, "monotonic", side_effect=[0.0, 1.0]),
+        mock.patch("builtins.print") as log,
+    ):
+        assert clock_sync.set_motu_clock("optical") is False
+        assert clock_sync.set_motu_clock("optical") is False
+    assert log.call_count == 1
+    assert clock_sync.source_for_config_path("/generated/streamer--kantarellen.yml") == "streamer"
+    assert clock_sync.source_for_config_path("/generated/toslink--kantarellen.yml") == "toslink"
+    assert clock_sync.source_for_config_path("/configs/partymeh-streamer.yml") == "streamer"
+    assert clock_sync.source_for_config_path("/configs/partymeh-toslink.yml") == "toslink"
+    source = (REPOSITORY / "scripts" / "clock_sync.py").read_text()
+    success_branch = source.split("if set_motu_clock(desired_clock):", 1)[1]
+    assert success_branch.index("last_clock = desired_clock") < success_branch.index(
+        "except Exception"
+    )
 
 
 if __name__ == "__main__":

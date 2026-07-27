@@ -74,6 +74,28 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             self.assertIn("reenable cdsp-source-switcher.service", calls)
             self.assertIn("restart cdsp-source-switcher.service", calls)
 
+    def test_update_refreshes_installed_airplay_callback_bundle(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        refresh = installer.split("refresh_installed_units()", 1)[1].split(
+            "show_status()", 1
+        )[0]
+        self.assertIn("/usr/local/libexec/airplay_volume_bridge.py", refresh)
+        self.assertIn(
+            '"$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py"', refresh
+        )
+
+    def test_control_ui_unit_runs_web_ui_from_the_managed_venv(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        heredoc = installer.split("install_control_ui()", 1)[1].split(
+            "install_iso226_engine()", 1
+        )[0]
+        self.assertIn(
+            "ExecStart=$VENV_DIR/bin/python3 -u $SCRIPTS_DIR/web_ui.py", heredoc
+        )
+        self.assertIn("SyslogIdentifier=cdsp-control-ui", heredoc)
+        self.assertIn("WantedBy=multi-user.target", heredoc)
+        self.assertIn("cdsp-control-ui.service", heredoc)
+
     def test_sudoers_has_no_wildcard_root_command_authorization(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         self.assertNotIn("--on-active=*", installer)
