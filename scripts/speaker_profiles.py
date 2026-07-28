@@ -48,6 +48,7 @@ OPERATOR_CONFIG_SPEAKERS: dict[str, dict[str, str]] = {
         "analog": "partymeh-analog.yml",
     },
 }
+OPERATOR_CONFIG_SOURCES = {"streamer", "gadget", "toslink", "analog"}
 BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
     "kantarellen": {
         "label": "Kantarellen",
@@ -103,6 +104,8 @@ def normalize_speaker_catalog(raw: Any) -> dict[str, Any]:
     operator_configs: dict[str, dict[str, str]] = {}
     for raw_id, meta in speakers_raw.items():
         speaker_id = normalize_speaker_id(raw_id)
+        if speaker_id in speakers:
+            raise ValueError(f"duplicate normalized speaker id: {speaker_id}")
         if not isinstance(meta, dict):
             raise ValueError(f"speaker {speaker_id!r} definition must be an object")
         speakers[speaker_id] = {
@@ -110,12 +113,47 @@ def normalize_speaker_catalog(raw: Any) -> dict[str, Any]:
             "description": str(meta.get("description") or ""),
         }
         configs = meta.get("operator_configs")
-        if isinstance(configs, dict) and configs:
-            operator_configs[speaker_id] = {
-                str(source): str(filename)
-                for source, filename in configs.items()
-                if filename
-            }
+        if configs is None:
+            continue
+        if not isinstance(configs, dict):
+            raise ValueError(
+                f"speaker {speaker_id!r} operator_configs must be an object"
+            )
+        normalized_configs: dict[str, str] = {}
+        for raw_source, raw_filename in configs.items():
+            if not isinstance(raw_source, str):
+                raise ValueError(
+                    f"speaker {speaker_id!r} operator config source must be a string"
+                )
+            source = raw_source.strip().lower()
+            if source not in OPERATOR_CONFIG_SOURCES:
+                raise ValueError(
+                    f"speaker {speaker_id!r} has unsupported operator config "
+                    f"source: {source}"
+                )
+            if source in normalized_configs:
+                raise ValueError(
+                    f"speaker {speaker_id!r} has duplicate operator config "
+                    f"source: {source}"
+                )
+            if not isinstance(raw_filename, str):
+                raise ValueError(
+                    f"speaker {speaker_id!r} operator config filename must be a string"
+                )
+            filename = raw_filename.strip()
+            filename_path = Path(filename)
+            if (
+                not filename
+                or filename_path.name != filename
+                or filename_path.suffix.lower() not in {".yml", ".yaml"}
+            ):
+                raise ValueError(
+                    f"speaker {speaker_id!r} operator config must be a .yml or "
+                    ".yaml filename in the CamillaDSP config directory"
+                )
+            normalized_configs[source] = filename
+        if normalized_configs:
+            operator_configs[speaker_id] = normalized_configs
     default = normalize_speaker_id(raw.get("default", next(iter(speakers))))
     if default not in speakers:
         raise ValueError(f"default speaker {default!r} is not in the catalog")

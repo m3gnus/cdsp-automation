@@ -70,8 +70,8 @@ complete operator-owned CamillaDSP files mapped per source with
 `operator_configs`. An unreadable or invalid catalog logs a warning and
 keeps the built-ins.
 
-Speaker selection and source arbitration are orthogonal. Kantarellen uses the
-existing full configs. Non-legacy profiles are strict YAML fragments in
+Speaker selection and source arbitration are orthogonal. The catalog's default
+speaker uses the existing full configs. Non-legacy profiles are strict YAML fragments in
 `SPEAKER_PROFILE_DIR`; they are composed with capture-only YAML bases from
 `SOURCE_BASE_DIR`, written to digest-addressed immutable files, checked with
 `camilladsp -c`, and reloaded transactionally. A profile is unavailable until

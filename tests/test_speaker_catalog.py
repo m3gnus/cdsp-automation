@@ -62,6 +62,49 @@ class SpeakerCatalogNormalizationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 speaker_profiles.normalize_speaker_catalog(raw)
 
+    def test_operator_configs_reject_invalid_sources_and_paths(self) -> None:
+        invalid_configs = (
+            [],
+            {"bluetooth": "vintage-bluetooth.yml"},
+            {"streamer": "../vintage-streamer.yml"},
+            {"streamer": "/tmp/vintage-streamer.yml"},
+            {"streamer": "vintage-streamer.txt"},
+            {"streamer": 42},
+        )
+        for operator_configs in invalid_configs:
+            with self.subTest(operator_configs=operator_configs):
+                with self.assertRaises(ValueError):
+                    speaker_profiles.normalize_speaker_catalog(
+                        {
+                            "speakers": {
+                                "mains": {},
+                                "vintage": {
+                                    "operator_configs": operator_configs
+                                },
+                            }
+                        }
+                    )
+
+    def test_normalized_speaker_and_source_collisions_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            speaker_profiles.normalize_speaker_catalog(
+                {"speakers": {"Mains": {}, "mains": {}}}
+            )
+        with self.assertRaises(ValueError):
+            speaker_profiles.normalize_speaker_catalog(
+                {
+                    "speakers": {
+                        "mains": {},
+                        "vintage": {
+                            "operator_configs": {
+                                "Streamer": "first.yml",
+                                "streamer": "second.yml",
+                            }
+                        },
+                    }
+                }
+            )
+
 
 class SpeakerCatalogLoadTests(unittest.TestCase):
     def tearDown(self) -> None:

@@ -1269,6 +1269,8 @@ def run_result(
             timeout=timeout,
             check=False,
         )
+    except subprocess.TimeoutExpired as exc:
+        return subprocess.CompletedProcess(command, 124, str(exc))
     except OSError as exc:
         return subprocess.CompletedProcess(command, 127, str(exc))
 
@@ -1543,7 +1545,7 @@ def installed_profile_catalog() -> dict[str, dict[str, Any]]:
 
 def source_availability() -> dict[str, dict[str, Any]]:
     selected = current_speaker_selection()["selected"]
-    if selected == "kantarellen":
+    if selected == DEFAULT_SPEAKER_ID:
         return {
             key: {
                 "label": label,
@@ -1555,14 +1557,23 @@ def source_availability() -> dict[str, dict[str, Any]]:
     profile = installed_profile_catalog().get(selected, {})
     supported = set(profile.get("supported_sources") or [])
     profile_ready = bool(profile.get("available"))
+    operator_configs = operator_configs_for_speaker(selected)
+    paths = {
+        source: (
+            CDSP_CONFIG_DIR / operator_configs[source]
+            if source in operator_configs
+            else SOURCE_BASE_DIR / f"{source}.yml"
+        )
+        for source in SOURCE_CHOICES
+    }
     return {
         key: {
             "label": label,
-            "path": str(SOURCE_BASE_DIR / f"{key}.yml"),
+            "path": str(paths[key]),
             "exists": bool(
                 profile_ready
                 and key in supported
-                and (SOURCE_BASE_DIR / f"{key}.yml").is_file()
+                and paths[key].is_file()
             ),
         }
         for key, label in SOURCE_CHOICES.items()
@@ -1576,7 +1587,11 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
     if isinstance(config_file, str):
         stem = Path(config_file).stem
         source = stem.split("--", 1)[0]
-        current = source if source in SOURCE_CHOICES else stem
+        if source in SOURCE_CHOICES:
+            current = source
+        else:
+            identity = managed_config_identity(config_file)
+            current = identity[0] if identity is not None else stem
 
     return {
         "mode": override or "auto",
@@ -1727,13 +1742,13 @@ def _selected_audio_path(selection: dict[str, Any]) -> Path:
 
 def preflight_speaker_profile(speaker_id: str) -> None:
     """Compile and offline-check every declared source before selection."""
-    if speaker_id == "kantarellen":
+    if speaker_id == DEFAULT_SPEAKER_ID:
         paths = [CDSP_CONFIG_DIR / f"{source}.yml" for source in ("streamer", "gadget", "toslink")]
         analog = CDSP_CONFIG_DIR / "analog.yml"
         if analog.is_file():
             paths.append(analog)
         configs = [(path.stem, path) for path in paths]
-    elif speaker_id in OPERATOR_CONFIG_SPEAKERS:
+    elif operator_configs_for_speaker(speaker_id):
         profile = load_profile(SPEAKER_PROFILE_DIR, speaker_id)
         operator_configs = operator_configs_for_speaker(speaker_id)
         missing_sources = [
@@ -1799,9 +1814,10 @@ def require_active_source_supported(
     if identity is None:
         raise ValueError("cannot change speakers while the active DSP config is unmanaged")
     source, _active_speaker = identity
-    if speaker_id == "kantarellen":
+    if speaker_id == DEFAULT_SPEAKER_ID:
         if not (CDSP_CONFIG_DIR / f"{source}.yml").is_file():
-            raise ValueError(f"Kantarellen has no installed {source} configuration")
+            label = BUILTIN_SPEAKERS.get(speaker_id, {}).get("label") or speaker_id
+            raise ValueError(f"{label} has no installed {source} configuration")
         return source
     supported = set(catalog.get(speaker_id, {}).get("supported_sources") or [])
     if source not in supported:
@@ -1819,7 +1835,7 @@ def managed_config_identity(current: Any) -> tuple[str, str] | None:
     for source in SOURCE_CHOICES:
         target = CDSP_CONFIG_DIR / f"{source}.yml"
         if current_absolute == os.path.abspath(target):
-            return source, "kantarellen"
+            return source, DEFAULT_SPEAKER_ID
     for speaker_id in OPERATOR_CONFIG_SPEAKERS:
         for source, filename in operator_configs_for_speaker(speaker_id).items():
             if current_absolute == os.path.abspath(CDSP_CONFIG_DIR / filename):

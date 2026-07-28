@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -347,6 +348,96 @@ def test_speaker_transition_rejects_unsupported_active_source_and_preflights_ana
     ):
         web_ui.preflight_speaker_profile("kantarellen")
     assert checked == ["streamer", "gadget", "toslink", "analog"]
+
+
+def test_site_default_speaker_uses_legacy_control_paths(tmp_path: Path) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    for source in ("streamer", "gadget", "toslink"):
+        (config_dir / f"{source}.yml").write_text("devices: {}\n")
+
+    checked: list[str] = []
+
+    def fake_run_result(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        checked.append(Path(command[-1]).stem)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    with (
+        patch.object(web_ui, "DEFAULT_SPEAKER_ID", "mains"),
+        patch.object(web_ui, "CDSP_CONFIG_DIR", config_dir),
+        patch.object(
+            web_ui,
+            "current_speaker_selection",
+            return_value={"selected": "mains"},
+        ),
+        patch.object(web_ui, "run_result", side_effect=fake_run_result),
+        patch.object(
+            web_ui,
+            "camilla_status",
+            return_value={"config_file": str(config_dir / "streamer.yml")},
+        ),
+    ):
+        availability = web_ui.source_availability()
+        assert availability["streamer"]["exists"] is True
+        assert availability["analog"]["exists"] is False
+        assert web_ui.managed_config_identity(
+            str(config_dir / "streamer.yml")
+        ) == ("streamer", "mains")
+        web_ui.preflight_speaker_profile("mains")
+        assert web_ui.require_active_source_supported("mains", {}) == "streamer"
+
+    assert checked == ["streamer", "gadget", "toslink"]
+
+
+def test_operator_profile_availability_uses_operator_configs(
+    tmp_path: Path,
+) -> None:
+    config_dir = tmp_path / "configs"
+    source_base_dir = tmp_path / "source-bases"
+    config_dir.mkdir()
+    source_base_dir.mkdir()
+    operator_path = config_dir / "vintage-streamer.yml"
+    operator_path.write_text("devices: {}\n")
+    catalog = {
+        "vintage": {
+            "available": True,
+            "supported_sources": ["streamer"],
+        }
+    }
+
+    with (
+        patch.dict(
+            speaker_profiles.OPERATOR_CONFIG_SPEAKERS,
+            {"vintage": {"streamer": operator_path.name}},
+            clear=True,
+        ),
+        patch.object(web_ui, "CDSP_CONFIG_DIR", config_dir),
+        patch.object(web_ui, "SOURCE_BASE_DIR", source_base_dir),
+        patch.object(
+            web_ui,
+            "current_speaker_selection",
+            return_value={"selected": "vintage"},
+        ),
+        patch.object(web_ui, "installed_profile_catalog", return_value=catalog),
+    ):
+        availability = web_ui.source_availability()
+        assert availability["streamer"] == {
+            "label": web_ui.SOURCE_CHOICES["streamer"],
+            "path": str(operator_path),
+            "exists": True,
+        }
+        assert web_ui.source_status(
+            {"config_file": str(operator_path)}
+        )["current"] == "streamer"
+
+
+def test_run_result_converts_subprocess_timeout_to_failure() -> None:
+    timeout = subprocess.TimeoutExpired(["slow-command"], 2)
+    with patch.object(web_ui.subprocess, "run", side_effect=timeout):
+        result = web_ui.run_result(["slow-command"], timeout=2)
+
+    assert result.returncode == 124
+    assert "timed out" in result.stdout
 
 
 def test_speaker_switch_requires_server_confirmation_and_dashboard_dialog() -> None:
