@@ -9,7 +9,7 @@ Before installing, ensure you have:
 **General Requirements:**
 - Raspberry Pi (any model) running Raspberry Pi OS
 - CamillaDSP installed and running
-- Python 3.7 or newer
+- Python 3.10 or newer
 
 **For Trigger Control:**
 - 5V relay module ([like this](https://www.aliexpress.com/item/1005007109343076.html))
@@ -22,7 +22,7 @@ Before installing, ensure you have:
 
 **For Source Switcher:**
 - Three CamillaDSP config files with **specific naming**:
-  - `~/camilladsp/configs/toslink.yml` - Must be configured for 48kHz
+  - `~/camilladsp/configs/toslink.yml` - For the optical input
   - `~/camilladsp/configs/streamer.yml` - For AirPlay/network streaming
   - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
 - Optional `~/camilladsp/configs/analog.yml` for manual or meter-based analog input
@@ -54,10 +54,10 @@ chmod +x install.sh
 The source switcher is the only writer of the active CamillaDSP configuration.
 It composes the selected speaker's persistent EQ/loudness overlay from
 `/var/lib/cdsp-automation/speaker-audio` into every source before that
-speaker's crossover. Kantarellen retains the legacy
-`/var/lib/cdsp-automation/audio-eq.json` path until an explicit quiesced
-migration. The browser and HID remote resolve the selected profile for every
-edit, so Bass/Treble, user EQ, and loudness remain independent per speaker.
+speaker's crossover. The default speaker keeps using the legacy
+`/var/lib/cdsp-automation/audio-eq.json` state path. The browser and HID
+remote resolve the selected profile for every edit, so Bass/Treble, user EQ,
+and loudness remain independent per speaker.
 
 The selectable speakers ship as the maintainer's defaults. A site replaces
 the whole catalog without editing code by writing the JSON file at

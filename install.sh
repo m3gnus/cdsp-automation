@@ -164,7 +164,6 @@ install_dependencies() {
 download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
-  migrate_legacy_settings
   local script tmp
   for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
@@ -252,38 +251,6 @@ ensure_audio_state_storage() {
   fi
   if [[ ! -d "$source_base_dir" ]]; then
     sudo install -d -m 0755 "$source_base_dir"
-  fi
-  for lock in \
-    "${audio_eq_path}.lock" \
-    "$audio_control_lock_path" \
-    "${speaker_selection_path}.lock" \
-    "${speaker_audio_dir}/kantarellen.json.lock" \
-    "${speaker_audio_dir}/partymeh.json.lock" \
-    "${speaker_audio_dir}/measurement.json.lock" \
-    "${speaker_audio_dir}/partymeh_bird.json.lock"; do
-    if [[ ! -e "$lock" ]]; then
-      sudo -u "$USER" touch "$lock"
-    fi
-    sudo chown "$USER:$USER" "$lock"
-    sudo chmod 0660 "$lock"
-  done
-}
-
-migrate_legacy_settings() {
-  local legacy_motu legacy_remote
-
-  if [[ -f "$SCRIPTS_DIR/clock_sync.py" ]]; then
-    legacy_motu=$(sed -n 's/^MOTU_WS_URL = "\(.*\)"/\1/p' "$SCRIPTS_DIR/clock_sync.py" | head -n 1)
-    if [[ -n "$legacy_motu" && "$(get_env_value MOTU_WS_URL)" == "ws://169.254.51.193:1280" ]]; then
-      set_env_value "MOTU_WS_URL" "$legacy_motu"
-    fi
-  fi
-
-  if [[ -f "$SCRIPTS_DIR/cdsp_remote.py" ]]; then
-    legacy_remote=$(sed -n 's/^REMOTE_NAME = "\(.*\)"/\1/p' "$SCRIPTS_DIR/cdsp_remote.py" | head -n 1)
-    if [[ -n "$legacy_remote" && "$(get_env_value REMOTE_NAME)" == "HID Remote01 Keyboard" ]]; then
-      set_env_value "REMOTE_NAME" "$legacy_remote"
-    fi
   fi
 }
 
@@ -419,8 +386,6 @@ install_airplay_volume_bridge() {
   sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
   sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
   create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon
-  sudo systemctl daemon-reload
-  sudo systemctl enable --now airplay-volume-bridge.service
   if [[ ! -f "$shairport_config" ]]; then
     echo "Shairport Sync config not found at $shairport_config; script installed, config unchanged."
     return
@@ -492,13 +457,6 @@ install_iso226_engine() {
     sudo systemctl restart cdsp-source-switcher.service
   fi
   echo "ISO 226 engine installed and active."
-}
-
-start_all() {
-  local service
-  for service in "${CDSP_SERVICES[@]}"; do
-    sudo systemctl start "${service}.service" || true
-  done
 }
 
 restart_all() {
