@@ -254,6 +254,13 @@ USB storage, and sets the system clock. It has no authentication; bind it to
 a trusted LAN only. Users who do not want a root web service simply skip
 this component — nothing else depends on it.
 
+Because it shares the `flock` files with daemons that run as the install user,
+its unit sets `Group=` to the install group and `UMask=0007`, and the locks
+themselves are created `0660` — so whichever process reaches a lock first, the
+other can still open it. The installer additionally pre-creates the three
+static locks (`audio-eq.json.lock`, `audio-control.lock`,
+`speaker-selection.json.lock`) owned by the install user.
+
 ---
 
 ## Why Systemd Services?

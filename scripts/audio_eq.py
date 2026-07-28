@@ -301,12 +301,28 @@ def atomic_write_json(path: Path, payload: dict[str, Any], mode: int = 0o644) ->
             temporary.unlink(missing_ok=True)
 
 
+# Lock files are shared between the root control UI and the daemons running as
+# the install user, so every participant must be able to open them O_RDWR.  The
+# install group is common to both (the UI unit sets Group=), which leaves the
+# mode: O_CREAT's mode argument is masked by the creator's umask, and systemd's
+# default 022 would strip group write from a lazily created lock and lock the
+# other uid out for good.
+LOCK_FILE_MODE = 0o660
+
+
 @contextmanager
-def exclusive_file_lock(lock_path: Path, mode: int):
+def exclusive_file_lock(lock_path: Path, mode: int = LOCK_FILE_MODE):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     descriptor = os.open(lock_path, flags, mode)
     with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
+        try:
+            # Applied to the descriptor, never to the path: replacing a live
+            # lock file's inode would let two holders believe they own it.
+            os.fchmod(handle.fileno(), mode)
+        except OSError:
+            # Someone else created it; only its owner may adjust the mode.
+            pass
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -316,7 +332,7 @@ def exclusive_file_lock(lock_path: Path, mode: int):
 
 def audio_state_lock(path: Path):
     """Serialize read-modify-write operations from the UI and HID remote."""
-    return exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
+    return exclusive_file_lock(path.with_name(f"{path.name}.lock"))
 
 
 def update_tone_band(

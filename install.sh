@@ -20,6 +20,13 @@ if [[ ! "$INSTALL_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   echo "Could not determine a safe install username"
   exit 1
 fi
+# The root control UI runs with this group so the lock files it creates stay
+# openable by the daemons, which run as $INSTALL_USER.
+INSTALL_GROUP="$(/usr/bin/id -gn)"
+if [[ ! "$INSTALL_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+  echo "Could not determine a safe install group"
+  exit 1
+fi
 SYSTEMD_UNIT_DIR="${CDSP_AUTOMATION_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 LEGACY_UNIT_DIR="${CDSP_AUTOMATION_LEGACY_UNIT_DIR:-/lib/systemd/system}"
 SYSTEMCTL_BIN="/usr/bin/systemctl"
@@ -230,7 +237,7 @@ ensure_user_writable_dir() {
 }
 
 ensure_audio_state_storage() {
-  local audio_eq_path audio_control_lock_path motu_clock_state_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir
+  local lock audio_eq_path audio_control_lock_path motu_clock_state_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir
   audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
   audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
   motu_clock_state_path="$(get_env_value MOTU_CLOCK_STATE_PATH)"
@@ -262,6 +269,20 @@ ensure_audio_state_storage() {
   if [[ ! -d "$source_base_dir" ]]; then
     sudo install -d -m 0755 "$source_base_dir"
   fi
+  # The three locks every component shares are claimed by whichever process
+  # opens them first, which on a fresh install can be the root UI or the
+  # root Shairport callback.  Own them here, before anything runs.  Per-speaker
+  # locks appear later and are covered by the UI unit's Group= and UMask=.
+  for lock in \
+    "${audio_eq_path}.lock" \
+    "$audio_control_lock_path" \
+    "${speaker_selection_path}.lock"; do
+    if [[ ! -e "$lock" ]]; then
+      sudo -u "$INSTALL_USER" touch "$lock"
+    fi
+    sudo chown "$INSTALL_USER:$INSTALL_GROUP" "$lock"
+    sudo chmod 0660 "$lock"
+  done
 }
 
 create_unit() {
@@ -437,6 +458,11 @@ After=network-online.target camilladsp.service
 
 [Service]
 Type=simple
+# No User=: the UI needs root for systemctl, date -s and umount.  Group= only
+# changes the group of the files it creates, so a lock or state file it makes
+# first stays writable by the daemons running as $INSTALL_USER.
+Group=$INSTALL_GROUP
+UMask=0007
 WorkingDirectory=$BASE_DIR
 EnvironmentFile=-$ENV_FILE
 Environment=PYTHONUNBUFFERED=1

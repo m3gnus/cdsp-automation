@@ -243,12 +243,12 @@ def read_speaker_selection(
 
 
 def speaker_selection_lock(path: Path):
-    return exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
+    return exclusive_file_lock(path.with_name(f"{path.name}.lock"))
 
 
 def audio_control_lock(path: Path):
     """Serialize config transitions with every master volume/mute writer."""
-    return exclusive_file_lock(Path(path), 0o660)
+    return exclusive_file_lock(Path(path))
 
 
 def audio_inhibit_active(path: Path) -> bool:

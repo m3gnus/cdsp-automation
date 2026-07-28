@@ -138,6 +138,93 @@ default_env
         self.assertIn("WantedBy=multi-user.target", heredoc)
         self.assertIn("cdsp-control-ui.service", heredoc)
 
+    def test_control_ui_unit_shares_the_install_group_but_stays_root(self) -> None:
+        """Group= alone keeps uid 0 and makes root-created locks group-usable."""
+        installer = INSTALLER.read_text(encoding="utf-8")
+        heredoc = installer.split("install_control_ui()", 1)[1].split(
+            "install_iso226_engine()", 1
+        )[0]
+        self.assertIn("Group=$INSTALL_GROUP", heredoc)
+        self.assertIn("UMask=0007", heredoc)
+        self.assertNotIn("\nUser=", heredoc)
+        self.assertIn('INSTALL_GROUP="$(/usr/bin/id -gn)"', installer)
+        self.assertIn(
+            'if [[ ! "$INSTALL_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then', installer
+        )
+
+    def test_state_storage_claims_the_three_shared_locks(self) -> None:
+        """Lazy creation never chowns, so a fresh install claims these up front."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "site"
+            state = root / "state"
+            etc = root / "etc"
+            base.mkdir()
+            log_path = root / "sudo.log"
+            (base / "cdsp-automation.env").write_text(
+                "\n".join(
+                    [
+                        f"AUDIO_EQ_PATH={state}/audio-eq.json",
+                        f"AUDIO_CONTROL_LOCK_PATH={state}/audio-control.lock",
+                        f"MOTU_CLOCK_STATE_PATH={state}/motu-clock-source",
+                        f"SPEAKER_SELECTION_PATH={state}/speaker-selection.json",
+                        f"SPEAKER_TRANSITION_PATH={state}/speaker-transition.json",
+                        f"SPEAKER_AUDIO_DIR={state}/speaker-audio",
+                        f"SPEAKER_PROFILE_DIR={etc}/speaker-profiles",
+                        f"SOURCE_BASE_DIR={etc}/source-bases",
+                        f"SPEAKER_GENERATED_DIR={state}/generated-configs",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            # sudo is unavailable here: run the command directly, drop the
+            # ownership flags only root can honour, and record the chown so its
+            # arguments are still asserted.
+            command = f"""
+set -euo pipefail
+export HOME={root!s}
+export CDSP_AUTOMATION_BASE_DIR={base!s}
+source {INSTALLER!s}
+sudo() {{
+  local args=()
+  case "$1" in
+    chown) shift; printf 'chown %s\\n' "$*" >> {log_path!s} ;;
+    -u) shift 2; command "$@" ;;
+    install)
+      shift
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          -o|-g) shift 2 ;;
+          *) args+=("$1"); shift ;;
+        esac
+      done
+      command install "${{args[@]}}"
+      ;;
+    *) command "$@" ;;
+  esac
+}}
+ensure_audio_state_storage
+"""
+            subprocess.run(["bash", "-c", command], check=True, env=os.environ.copy())
+
+            identity = subprocess.run(
+                ["/usr/bin/id", "-un"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            group = subprocess.run(
+                ["/usr/bin/id", "-gn"], capture_output=True, text=True, check=True
+            ).stdout.strip()
+            chowned = log_path.read_text(encoding="utf-8").splitlines()
+            for lock in (
+                state / "audio-eq.json.lock",
+                state / "audio-control.lock",
+                state / "speaker-selection.json.lock",
+            ):
+                self.assertTrue(lock.is_file(), lock)
+                self.assertEqual(lock.stat().st_mode & 0o777, 0o660)
+                self.assertIn(f"chown {identity}:{group} {lock}", chowned)
+
     def test_sudoers_has_no_wildcard_root_command_authorization(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         self.assertNotIn("--on-active=*", installer)

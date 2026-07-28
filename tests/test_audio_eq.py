@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+import os
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+import audio_eq
+import speaker_profiles
+
+
+REPOSITORY = Path(__file__).resolve().parents[1]
+SCRIPTS_DIR = REPOSITORY / "scripts"
+
+# Opens an existing lock the way every daemon does — O_RDWR, no O_CREAT — so a
+# lock left unopenable by its creator fails here instead of hanging.
+LOCK_PROBE = """
+import fcntl
+import os
+import sys
+
+descriptor = os.open(sys.argv[1], os.O_RDWR)
+try:
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print("busy")
+else:
+    print("free")
+"""
+
+LOCK_CREATOR = """
+import sys
 from pathlib import Path
 
 import audio_eq
 
+with audio_eq.exclusive_file_lock(Path(sys.argv[1])):
+    pass
+"""
 
-REPOSITORY = Path(__file__).resolve().parents[1]
+
+def _run_probe(source: str, lock_path: Path) -> str:
+    environment = dict(os.environ, PYTHONPATH=str(SCRIPTS_DIR))
+    result = subprocess.run(
+        [sys.executable, "-c", source, str(lock_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=environment,
+    )
+    return result.stdout.strip()
 
 
 def test_audio_eq_overlay_is_idempotent_and_precedes_crossover() -> None:
@@ -321,3 +365,53 @@ def test_audio_state_reports_the_installed_unity_linear_airplay_path() -> None:
         "airplay_unity_bridge": True,
         "airplay_mapping": "linear",
     }
+
+
+def test_shared_locks_stay_usable_whichever_process_creates_them(
+    tmp_path: Path,
+) -> None:
+    """The root UI and the $INSTALL_USER daemons share these lock files.
+
+    Whoever opens a lock first creates it, so the creator must leave it
+    group-openable or the other uid gets EACCES on every volume and EQ
+    operation, permanently.  Root is not available here, so the guarantee is
+    asserted in two halves: the mode a creator leaves behind under a hostile
+    umask (systemd's default 022 strips group write), and real cross-process
+    serialization in both creation orders.
+    """
+    state_path = tmp_path / "speaker-audio" / "partymeh.json"
+    selection_path = tmp_path / "speaker-selection.json"
+    control_path = tmp_path / "audio-control.lock"
+
+    previous_umask = os.umask(0o077)
+    try:
+        with audio_eq.audio_state_lock(state_path):
+            pass
+        with speaker_profiles.speaker_selection_lock(selection_path):
+            pass
+        with speaker_profiles.audio_control_lock(control_path):
+            pass
+    finally:
+        os.umask(previous_umask)
+
+    for lock in (
+        state_path.with_name(f"{state_path.name}.lock"),
+        selection_path.with_name(f"{selection_path.name}.lock"),
+        control_path,
+    ):
+        mode = stat.S_IMODE(lock.stat().st_mode)
+        assert mode == audio_eq.LOCK_FILE_MODE
+        assert mode & stat.S_IRWXG == stat.S_IRGRP | stat.S_IWGRP
+
+    # This process created it; another process must still be able to take it.
+    with speaker_profiles.audio_control_lock(control_path):
+        assert _run_probe(LOCK_PROBE, control_path) == "busy"
+    assert _run_probe(LOCK_PROBE, control_path) == "free"
+
+    # And the reverse order: another process created it first.
+    foreign_lock = tmp_path / "speaker-audio" / "created-elsewhere.json.lock"
+    _run_probe(LOCK_CREATOR, foreign_lock)
+    assert stat.S_IMODE(foreign_lock.stat().st_mode) == audio_eq.LOCK_FILE_MODE
+    with audio_eq.exclusive_file_lock(foreign_lock):
+        assert _run_probe(LOCK_PROBE, foreign_lock) == "busy"
+    assert _run_probe(LOCK_PROBE, foreign_lock) == "free"
