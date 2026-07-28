@@ -88,3 +88,55 @@ running) the code — none is speculative. Tick an item once decided.
       the development host. Decision needed: whether to take that dependency on
       a live audio system for the sizeable reduction in per-poll load, or leave
       the sequential calls as-is.
+
+## Audit findings (unfixed)
+
+Found by a later audit of `8f54548..HEAD` against the commit messages. Left
+unfixed because each is either an owner decision or already tracked above.
+
+- [ ] **`cf1c60d`'s lock claim is wrong, and it is what created item 3 above.**
+      The message says "lock files are created lazily by `audio_state_lock` so
+      pre-creating four hardcoded ones is pointless". The deleted loop covered
+      **seven** paths, and only four were the stale speaker-name locks
+      (`kantarellen`, `partymeh`, `measurement`, `partymeh_bird`) that the
+      site-replaceable catalog made obsolete. The other three —
+      `${audio_eq_path}.lock`, `$audio_control_lock_path` and
+      `${speaker_selection_path}.lock` — also ran `sudo chown "$USER:$USER"`
+      and `sudo chmod 0660`, which lazy creation does **not** reproduce:
+      `exclusive_file_lock` (`scripts/audio_eq.py:305`) only passes a mode to
+      `os.open`, so it is subject to umask and never sets ownership. Deleting
+      the four was right; deleting the `chown` was not, and the `0o660` mode at
+      `scripts/speaker_profiles.py:251` is now a fossil that buys nothing. The
+      resulting root-vs-INSTALL_USER lock failure is item 3 above, so this entry
+      only records the provenance — fixing it means deciding item 3.
+
+- [ ] **Menu option 11 changed meaning: it was "Uninstall All Utilities" and is
+      now "Install Web Control UI".** `install.sh:628-629` and the dispatch at
+      `:651-652` renumbered uninstall to 12 when the optional UI was added. A
+      returning operator typing `11` from habit now installs an unauthenticated
+      root web server on `0.0.0.0:8088` (`install.sh:443-444`). Unlike
+      `install_motu_sync` and `install_remote`, `install_control_ui` prints its
+      warning banner (`:425-428`) but has no `read -r -p` confirmation.
+      Decision needed: add a `y/N` gate, or keep uninstall at 11 and move the
+      UI to 12 — both change the published menu contract.
+
+- [ ] **Uninstall ignores `$SYSTEMD_UNIT_DIR`.** Units are installed to
+      `${SYSTEMD_UNIT_DIR}` (`install.sh:307`, `:455`, overridable via
+      `CDSP_AUTOMATION_SYSTEMD_UNIT_DIR` at `:23`) but removed from a hardcoded
+      path (`install.sh:524`, `:539`), so a non-default install orphans every
+      unit — including the control-UI unit this range added. `LEGACY_UNIT_DIR`
+      (`:24`) is likewise unused at the removal site. Decision needed: whether
+      uninstall should sweep only the configured dirs or both those and the
+      historical defaults, since an operator may have installed under one and
+      uninstalled under the other.
+
+- [ ] **The two Shairport rollback branches still abort the installer without
+      explaining why.** `install.sh:405` and `:410` call
+      `configure_shairport.py --remove` bare under `set -euo pipefail`, so a
+      failure there kills the run *before* the `echo "…restored its previous
+      volume settings." >&2` on the next line. `175ef17` fixed the root cause
+      (`--remove` no longer demands an `alsa` block) and guarded the uninstall
+      call site with `|| true` (`:534`), but `--remove` can still fail — e.g. a
+      config with no active `general` block. Decision needed: printing the
+      reason before attempting the restore changes the message's meaning (the
+      restore may not have happened), so the wording is the owner's call.

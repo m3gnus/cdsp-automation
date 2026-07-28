@@ -249,11 +249,13 @@ def apply_volume(airplay_db: float) -> dict:
             pass
 
 
-def send_local_datagram(message: str, path: Path = SOCKET_PATH) -> None:
+def send_local_datagram(message: str) -> None:
+    # SOCKET_PATH is read here, not bound as a default, so the three callers
+    # keep resolving it at call time exactly as they did before this helper.
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(message.encode("ascii"), str(path))
+        client.sendto(message.encode("ascii"), str(SOCKET_PATH))
     finally:
         client.close()
 

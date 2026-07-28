@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
-import inspect
 import io
 import os
 import subprocess
@@ -247,12 +246,94 @@ def test_spotify_event_callback_forwards_volume_and_playback_lifecycle(monkeypat
     ]
 
 
-def test_spotify_tracker_deadlines_use_monotonic_time() -> None:
-    source = inspect.getsource(volume_sync.run_daemon)
-    assert "tracker_now = time.monotonic()" in source
-    assert "spotify_sync.acknowledge(\n" in source
-    assert "now=tracker_now" in source
-    assert "spotify_sync.healthy(tracker_now)" in source
+def test_spotify_tracker_deadlines_use_monotonic_time(tmp_path: Path) -> None:
+    """Every tracker deadline must be fed the monotonic clock, not time.time().
+
+    The UI can step this Pi's wall clock from a phone, so a retry, heartbeat or
+    ack deadline measured against time.time() would strand a pending Spotify
+    command. Drives one full daemon iteration and records what the tracker was
+    actually given, so a call site regressing to time.time() fails here.
+    """
+    wall, mono = 1_900_000_000.0, 1234.5
+    given: list[float] = []
+
+    class RecordingTracker(volume_sync.SpotifyCommandTracker):
+        def queue(self, volume, camilla_state, *, now):
+            given.append(now)
+            return super().queue(volume, camilla_state, now=now)
+
+        def should_send(self, now):
+            given.append(now)
+            return super().should_send(now)
+
+        def mark_sent(self, now):
+            given.append(now)
+            return super().mark_sent(now)
+
+        def acknowledge(self, command_id, volume, *, now):
+            given.append(now)
+            return super().acknowledge(command_id, volume, now=now)
+
+        def needs_heartbeat(self, now):
+            given.append(now)
+            return super().needs_heartbeat(now)
+
+        def healthy(self, now):
+            given.append(now)
+            return super().healthy(now)
+
+    class Server:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def bind(self, _path: str) -> None:
+            pass
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def setblocking(self, _flag: bool) -> None:
+            pass
+
+        def recv(self, _size: int) -> bytes:
+            self.reads += 1
+            if self.reads == 1:
+                return b"spotify_ack:1:40000"
+            raise BlockingIOError
+
+        def close(self) -> None:
+            pass
+
+    def stop_after_one_pass(_status: dict) -> None:
+        raise KeyboardInterrupt
+
+    with (
+        patch.object(volume_sync.time, "time", lambda: wall),
+        patch.object(volume_sync.time, "monotonic", lambda: mono),
+        patch.object(volume_sync, "SpotifyCommandTracker", RecordingTracker),
+        patch.object(volume_sync, "SOCKET_PATH", tmp_path / "input.sock"),
+        patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", tmp_path / "active"),
+        patch.object(
+            volume_sync, "SPOTIFY_COMMAND_SOCKET_PATH", tmp_path / "command.sock"
+        ),
+        patch.object(volume_sync.socket, "socket", lambda *_args: Server()),
+        patch.object(volume_sync, "secure_socket", lambda _path: None),
+        patch.object(volume_sync, "service_is_active", lambda _service: False),
+        patch.object(volume_sync, "CamillaClient", lambda *_a: SimpleNamespace(
+            connect=lambda: None, disconnect=lambda: None
+        )),
+        patch.object(
+            volume_sync, "read_mirrorable_camilla_volume", lambda _c: (-20.0, False)
+        ),
+        patch.object(volume_sync, "send_spotify_volume", lambda *_a: None),
+        patch.object(volume_sync, "write_status", stop_after_one_pass),
+    ):
+        with contextlib.suppress(KeyboardInterrupt):
+            volume_sync.run_daemon()
+
+    # acknowledge, queue, should_send and mark_sent at minimum.
+    assert len(given) >= 4
+    assert given == [mono] * len(given)
 
 
 def test_spotify_mirror_pauses_before_reading_a_transition_mute(

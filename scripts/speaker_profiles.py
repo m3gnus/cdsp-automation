@@ -324,8 +324,9 @@ def resolve_profile_audio_path(
 ) -> Path:
     """Return the authoritative path without performing a racy lazy copy.
 
-    Kantarellen deliberately keeps using the legacy file until deployment has
-    restarted every legacy writer and performs an explicit quiesced migration.
+    The default speaker keeps reading ``legacy_path`` for as long as it has no
+    per-speaker file of its own; there is no migration step, because a lock
+    cannot stop an old writer that is already waiting on it from writing again.
     """
     selected = normalize_speaker_id(speaker_id)
     target = profile_audio_path(root, selected)
@@ -346,7 +347,7 @@ def read_profile_audio_state(
     *,
     legacy_path: Path | None = None,
 ) -> dict[str, Any]:
-    """Read one speaker's EQ state, retaining the legacy Kantarellen path."""
+    """Read one speaker's EQ state, retaining the default speaker's legacy path."""
     target = resolve_profile_audio_path(root, speaker_id, legacy_path=legacy_path)
     if target.exists():
         return read_audio_state(target)

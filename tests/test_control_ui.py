@@ -110,7 +110,21 @@ def test_live_meter_recovers_from_invalid_levels_and_ignores_nonfinite_values() 
         assert web_ui.camilla_levels() == {"ok": True, "signal_db": -42.5}
 
 
-def test_media_folder_scan_tolerates_drive_disappearing(tmp_path: Path) -> None:
+def test_media_folder_scan_lists_sessions_and_tolerates_drive_disappearing(
+    tmp_path: Path,
+) -> None:
+    """The UI renders only the folder count, so the scan must not stat files."""
+    for name in ("Session B", "session a", ".Spotlight-V100"):
+        (tmp_path / name).mkdir()
+    (tmp_path / "track.wav").write_bytes(b"")
+    (tmp_path / "._track.wav").write_bytes(b"")
+
+    with patch.object(web_ui, "MEDIA_ROOT", tmp_path):
+        assert web_ui.list_media_folders() == [
+            {"name": "session a"},
+            {"name": "Session B"},
+        ]
+
     with (
         patch.object(web_ui, "MEDIA_ROOT", tmp_path),
         patch.object(Path, "iterdir", side_effect=OSError("unmounted")),
@@ -588,9 +602,64 @@ def test_source_status_does_not_trust_unmanaged_generated_filename(
     assert status["current"] == "streamer--spoof"
 
 
-def test_parse_env_tolerates_disappearing_or_unreadable_file(tmp_path: Path) -> None:
+def test_source_override_is_written_validated_and_cleared_by_auto(
+    tmp_path: Path,
+) -> None:
+    """The switcher reads this file directly, so only vetted sources reach it."""
+    override = tmp_path / "run" / "manual_source"
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "streamer.yml").write_text("---\n")
+
+    with (
+        patch.object(web_ui, "SOURCE_OVERRIDE_PATH", override),
+        patch.object(web_ui, "CDSP_CONFIG_DIR", configs),
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
+    ):
+        web_ui.write_source_override("streamer")
+        assert override.read_text().strip() == "streamer"
+        assert web_ui.read_source_override() == "streamer"
+
+        # gadget.yml was never created, so pinning it would strand the switcher.
+        for rejected, expected in (
+            ("gadget", FileNotFoundError),
+            ("../../etc/passwd", ValueError),
+        ):
+            try:
+                web_ui.write_source_override(rejected)
+            except expected:
+                pass
+            else:
+                raise AssertionError(f"override accepted {rejected!r}")
+        assert override.read_text().strip() == "streamer"
+
+        web_ui.write_source_override("auto")
+        assert not override.exists()
+        assert web_ui.read_source_override() is None
+
+
+def test_parse_env_reads_settings_and_tolerates_an_unreadable_file(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "settings.env"
-    with patch.object(Path, "read_text", side_effect=OSError("unavailable")):
+    path.write_text(
+        "# managed by install.sh\n"
+        "REMOTE_NAME=HID Remote01 Keyboard\n"
+        "\n"
+        "  MOTU_WS_URL = ws://169.254.51.193:1280  \n"
+        "not-a-setting\n"
+        "SOURCE_TOSLINK_METER_PAIRS=12,13\n"
+    )
+    assert web_ui.parse_env(path) == {
+        "REMOTE_NAME": "HID Remote01 Keyboard",
+        "MOTU_WS_URL": "ws://169.254.51.193:1280",
+        "SOURCE_TOSLINK_METER_PAIRS": "12,13",
+    }
+
+    # remote_status must keep reporting while the env file is missing or the
+    # root UI cannot read it; a missing file is the OSError that needs no patch.
+    assert web_ui.parse_env(tmp_path / "absent.env") == {}
+    with patch.object(Path, "read_text", side_effect=PermissionError("denied")):
         assert web_ui.parse_env(path) == {}
 
 
