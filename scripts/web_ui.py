@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -1391,6 +1392,13 @@ def camilla_levels() -> dict[str, Any]:
                 client.connect()
                 _levels_client = client
             levels = _levels_client.levels.playback_rms()
+            finite = []
+            for level in levels:
+                if level is None:
+                    continue
+                numeric = float(level)
+                if math.isfinite(numeric) and numeric > -999.0:
+                    finite.append(numeric)
         except Exception:
             try:
                 if _levels_client is not None:
@@ -1400,7 +1408,6 @@ def camilla_levels() -> dict[str, Any]:
             _levels_client = None
             return {"ok": False, "signal_db": None}
 
-    finite = [lvl for lvl in levels if lvl is not None and lvl > -999.0]
     return {"ok": True, "signal_db": max(finite) if finite else None}
 
 
@@ -1605,11 +1612,17 @@ def list_media_folders() -> list[dict[str, Any]]:
     skipped so the GUI shows only real session folders.
     """
     folders: list[dict[str, Any]] = []
-    if MEDIA_ROOT.is_dir():
-        for p in sorted(MEDIA_ROOT.iterdir(), key=lambda x: x.name.lower()):
-            if not p.is_dir() or p.name.startswith("."):
-                continue
-            folders.append({"name": p.name})
+    try:
+        if not MEDIA_ROOT.is_dir():
+            return folders
+        entries = sorted(MEDIA_ROOT.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        # The removable drive can disappear between the mount check and scan.
+        return folders
+    for path in entries:
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        folders.append({"name": path.name})
     return folders
 
 

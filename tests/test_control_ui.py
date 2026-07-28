@@ -35,6 +35,34 @@ def test_manual_amp_off_keeps_trigger_service_running() -> None:
     assert "next audio session" in web_ui.HTML
 
 
+def test_live_meter_recovers_from_invalid_levels_and_ignores_nonfinite_values() -> None:
+    class Client:
+        def __init__(self, levels: object) -> None:
+            self.levels = SimpleNamespace(playback_rms=lambda: levels)
+            self.disconnected = False
+
+        def disconnect(self) -> None:
+            self.disconnected = True
+
+    invalid = Client(None)
+    with patch.object(web_ui, "_levels_client", invalid):
+        assert web_ui.camilla_levels() == {"ok": False, "signal_db": None}
+        assert invalid.disconnected is True
+        assert web_ui._levels_client is None
+
+    valid = Client([None, float("nan"), -1000.0, "-42.5"])
+    with patch.object(web_ui, "_levels_client", valid):
+        assert web_ui.camilla_levels() == {"ok": True, "signal_db": -42.5}
+
+
+def test_media_folder_scan_tolerates_drive_disappearing(tmp_path: Path) -> None:
+    with (
+        patch.object(web_ui, "MEDIA_ROOT", tmp_path),
+        patch.object(Path, "iterdir", side_effect=OSError("unmounted")),
+    ):
+        assert web_ui.list_media_folders() == []
+
+
 def test_web_audio_state_follows_selected_speaker_profile(tmp_path: Path) -> None:
     selection_path = tmp_path / "selection.json"
     audio_dir = tmp_path / "audio"

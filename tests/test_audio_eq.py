@@ -122,7 +122,7 @@ def test_tone_band_identity_limits_and_deployment_permissions() -> None:
         raise AssertionError("reserved Bass identity could be changed")
 
     installer = (REPOSITORY / "install.sh").read_text()
-    assert 'install -d -m 0750 -o "$USER" -g "$USER"' in installer
+    assert 'install -d -m 0750 -o "$INSTALL_USER" -g "$INSTALL_USER"' in installer
     update_body = installer.split("update_utilities()", 1)[1].split(
         "pair_bluetooth_remote()", 1
     )[0]

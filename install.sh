@@ -44,6 +44,7 @@ TRIGGER_DELAY_SECONDS=320
 TRIGGER_CHECK_INTERVAL=0.2
 TRIGGER_AUDIO_THRESHOLD_DB=-80
 MOTU_WS_URL=ws://169.254.51.193:1280
+MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 SOURCE_CHECK_INTERVAL=1.0
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
@@ -215,18 +216,19 @@ prepare_install() {
 ensure_user_writable_dir() {
   local dir="$1"
   if [[ ! -d "$dir" ]]; then
-    sudo install -d -m 0750 -o "$USER" -g "$USER" "$dir"
-  elif ! sudo -u "$USER" test -w "$dir"; then
-    echo "Configured state directory is not writable by $USER: $dir" >&2
+    sudo install -d -m 0750 -o "$INSTALL_USER" -g "$INSTALL_USER" "$dir"
+  elif ! sudo -u "$INSTALL_USER" test -w "$dir"; then
+    echo "Configured state directory is not writable by $INSTALL_USER: $dir" >&2
     echo "Use a dedicated application directory; existing directory ownership is never changed." >&2
     return 1
   fi
 }
 
 ensure_audio_state_storage() {
-  local audio_eq_path audio_control_lock_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir lock
+  local audio_eq_path audio_control_lock_path motu_clock_state_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir
   audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
   audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
+  motu_clock_state_path="$(get_env_value MOTU_CLOCK_STATE_PATH)"
   speaker_selection_path="$(get_env_value SPEAKER_SELECTION_PATH)"
   speaker_transition_path="$(get_env_value SPEAKER_TRANSITION_PATH)"
   speaker_audio_dir="$(get_env_value SPEAKER_AUDIO_DIR)"
@@ -235,6 +237,7 @@ ensure_audio_state_storage() {
   generated_dir="$(get_env_value SPEAKER_GENERATED_DIR)"
   : "${audio_eq_path:=/var/lib/cdsp-automation/audio-eq.json}"
   : "${audio_control_lock_path:=/var/lib/cdsp-automation/audio-control.lock}"
+  : "${motu_clock_state_path:=/var/lib/cdsp-automation/motu-clock-source}"
   : "${speaker_selection_path:=/var/lib/cdsp-automation/speaker-selection.json}"
   : "${speaker_transition_path:=/var/lib/cdsp-automation/speaker-transition.json}"
   : "${speaker_audio_dir:=/var/lib/cdsp-automation/speaker-audio}"
@@ -242,6 +245,8 @@ ensure_audio_state_storage() {
   : "${source_base_dir:=/etc/cdsp-automation/source-bases}"
   : "${generated_dir:=/var/lib/cdsp-automation/generated-configs}"
   ensure_user_writable_dir "$(dirname "$audio_eq_path")"
+  ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"
+  ensure_user_writable_dir "$(dirname "$motu_clock_state_path")"
   ensure_user_writable_dir "$(dirname "$speaker_selection_path")"
   ensure_user_writable_dir "$(dirname "$speaker_transition_path")"
   ensure_user_writable_dir "$speaker_audio_dir"

@@ -84,6 +84,25 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             '"$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py"', refresh
         )
 
+    def test_state_storage_prepares_configured_lock_and_clock_parents(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        storage = installer.split("ensure_audio_state_storage()", 1)[1].split(
+            "create_unit()", 1
+        )[0]
+
+        self.assertIn(
+            "MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source",
+            installer,
+        )
+        self.assertIn(
+            'ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"',
+            storage,
+        )
+        self.assertIn(
+            'ensure_user_writable_dir "$(dirname "$motu_clock_state_path")"',
+            storage,
+        )
+
     def test_control_ui_unit_runs_web_ui_from_the_managed_venv(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         heredoc = installer.split("install_control_ui()", 1)[1].split(

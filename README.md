@@ -322,10 +322,13 @@ To change the IP later, edit `~/camilladsp/cdsp-automation.env`:
 
 ```text
 MOTU_WS_URL=ws://YOUR_MOTU_IP:1280
+MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 ```
 
 Clock ownership is independent of sample rate. Sources may all run at 48 kHz;
-the config identity still selects the correct clock.
+the config identity still selects the correct clock. The last successful clock
+choice is persisted at `MOTU_CLOCK_STATE_PATH` so service restarts do not send
+a redundant command that makes the interface re-lock and briefly mute.
 
 
 ---
