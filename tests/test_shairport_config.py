@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 from pathlib import Path
 
 import configure_shairport
@@ -190,3 +192,53 @@ def test_shairport_configurator_adds_and_removes_missing_diagnostics_block() -> 
     assert "log_verbosity = 1" in managed
     assert configure_shairport.update_general_block(managed, callback) == managed
     assert configure_shairport.update_general_block(managed, None) == initial
+
+
+def test_callback_only_configure_migrates_a_legacy_output_block(tmp_path) -> None:
+    """The installer's update path passes no device; legacy markers must
+    still be rewritten in place with the managed device preserved."""
+    legacy_begin = "// " + "UG" + "LAN-OUTPUT-BEGIN"
+    legacy_end = "// " + "UG" + "LAN-OUTPUT-END"
+    encoded = base64.b64encode(b'    output_device = "hw:0";\n').decode("ascii")
+    config = tmp_path / "shairport-sync.conf"
+    config.write_text(
+        'general =\n{\n    name = "Living Room";\n};\n'
+        "alsa =\n{\n"
+        f"    {legacy_begin}\n"
+        f"    // original-base64: {encoded}\n"
+        '    output_device = "site_main";\n'
+        f"    {legacy_end}\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    configure_shairport.configure(config, "/usr/bin/callback --notify")
+    text = config.read_text(encoding="utf-8")
+    assert legacy_begin not in text and legacy_end not in text
+    assert configure_shairport.ALSA_BEGIN in text
+    assert 'output_device = "site_main"' in text
+    assert f"// original-base64: {encoded}" in text
+    configure_shairport.configure(config, None)
+    restored = config.read_text(encoding="utf-8")
+    assert configure_shairport.ALSA_BEGIN not in restored
+    assert 'output_device = "hw:0"' in restored
+
+
+def test_remove_strips_a_legacy_output_block_without_a_device_argument(tmp_path) -> None:
+    legacy_begin = "// " + "UG" + "LAN-OUTPUT-BEGIN"
+    legacy_end = "// " + "UG" + "LAN-OUTPUT-END"
+    encoded = base64.b64encode(b'    output_device = "plughw:1";\n').decode("ascii")
+    config = tmp_path / "shairport-sync.conf"
+    config.write_text(
+        "general =\n{\n};\n"
+        "alsa =\n{\n"
+        f"    {legacy_begin}\n"
+        f"    // original-base64: {encoded}\n"
+        '    output_device = "site_main";\n'
+        f"    {legacy_end}\n"
+        "};\n",
+        encoding="utf-8",
+    )
+    configure_shairport.configure(config, None)
+    text = config.read_text(encoding="utf-8")
+    assert legacy_begin not in text and "OUTPUT-BEGIN" not in text
+    assert 'output_device = "plughw:1"' in text

@@ -248,11 +248,26 @@ def update_general_block(text: str, callback: str | None) -> str:
         )
 
 
+def _managed_alsa_device(text: str) -> str | None:
+    """Device inside an existing managed output block, either marker form."""
+    match = _block_pattern(ALSA_BEGIN, ALSA_END).search(text)
+    if match is None:
+        return None
+    device = re.search(r'output_device\s*=\s*"([^"\n]*)"', match.group(0))
+    return device.group(1) if device else None
+
+
 def configure(
     path: Path, callback: str | None, output_device: str | None = None
 ) -> Path:
     original = path.read_text(encoding="utf-8")
     updated = update_general_block(original, callback)
+    if output_device is None:
+        # Without an explicit device, still refresh an existing managed
+        # output block: install rewrites it under the current markers and
+        # --remove restores the preserved original settings. A config that
+        # was never output-managed stays untouched.
+        output_device = _managed_alsa_device(updated)
     if output_device is not None:
         managed = None if callback is None else [f'    output_device = "{output_device}";\n']
         updated = _update_block(
