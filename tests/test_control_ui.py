@@ -1,8 +1,7 @@
-"""Control UI behavior: audio state, speaker switching, source override, HTML."""
+"""Control UI behavior: audio state, speaker switching, HTML."""
 
 from __future__ import annotations
 
-import copy
 import inspect
 import json
 import sys
@@ -17,7 +16,6 @@ import audio_eq
 import speaker_config
 import speaker_profiles
 import web_ui
-from profile_fixtures import seed_profile
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -296,32 +294,6 @@ def test_speaker_profile_deployment_and_gui_contract_are_present() -> None:
     assert "speakerState?.selection?.selected" in web_ui.HTML
 
 
-def test_ui_source_override_marks_ui_ownership_and_auto_clears(tmp_path: Path) -> None:
-    """The scheduler (archived repo) refuses to release overrides owned by "ui"."""
-    value = tmp_path / "manual_source"
-    owner = tmp_path / "manual_source.owner"
-    lock = tmp_path / "manual_source.lock"
-    configs = tmp_path / "configs"
-    configs.mkdir()
-    (configs / "streamer.yml").write_text("---\n")
-
-    with (
-        patch.object(web_ui, "SOURCE_OVERRIDE_PATH", value),
-        patch.object(web_ui, "SOURCE_OVERRIDE_OWNER_PATH", owner),
-        patch.object(web_ui, "SOURCE_OVERRIDE_LOCK_PATH", lock),
-        patch.object(web_ui, "CDSP_CONFIG_DIR", configs),
-        patch.object(
-            web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"
-        ),
-    ):
-        web_ui.write_source_override("streamer")
-        assert value.read_text().strip() == "streamer"
-        assert owner.read_text().strip() == "ui"
-        web_ui.write_source_override("auto")
-    assert not value.exists()
-    assert not owner.exists()
-
-
 def test_speaker_transition_rejects_unsupported_active_source_and_preflights_analog(
     tmp_path: Path,
 ) -> None:
@@ -389,124 +361,3 @@ def test_speaker_switch_requires_server_confirmation_and_dashboard_dialog() -> N
     assert "Type <b>SWITCH</b>" in web_ui.HTML
     assert 'confirm:"SWITCH"' in web_ui.HTML
     assert "audioState && !(await saveAudio())" in web_ui.HTML
-
-
-def test_active_profile_edit_requires_switch_and_rolls_back_on_failure(
-    tmp_path: Path,
-) -> None:
-    profile_dir = tmp_path / "profiles"
-    selection_path = tmp_path / "selection.json"
-    ready_path = tmp_path / "ready.json"
-    speaker_profiles.clear_audio_inhibit(ready_path)
-    speaker_profiles.update_speaker_selection(selection_path, "partymeh")
-    original = speaker_config.canonical_profile_document(seed_profile("partymeh"))
-    original["enabled"] = True
-    speaker_config.save_profile(profile_dir, "partymeh", original, expected_revision=0)
-    before = (profile_dir / "partymeh.yml").read_bytes()
-
-    edited = copy.deepcopy(original)
-    edited["crossover"]["ways"][0]["lowpass"]["freq"] = 350.0
-    request = {
-        "id": "partymeh",
-        "revision": 1,
-        "selection_revision": 1,
-        "profile": {
-            "label": original["label"],
-            "description": original["description"],
-            "enabled": True,
-            "supported_sources": original["supported_sources"],
-            "max_volume_db": original["max_volume_db"],
-            "bypass_user_eq": original["bypass_user_eq"],
-            "crossover": edited["crossover"],
-        },
-    }
-
-    class Volume:
-        muted = False
-
-        def main_mute(self) -> bool:
-            return self.muted
-
-        def set_main_mute(self, value: bool) -> None:
-            self.muted = value
-
-    volume = Volume()
-
-    class Client:
-        def __init__(self, *_args: object) -> None:
-            self.volume = volume
-
-        def connect(self) -> None:
-            pass
-
-        def disconnect(self) -> None:
-            pass
-
-    patches = dict(
-        SPEAKER_PROFILE_DIR=profile_dir,
-        SPEAKER_SELECTION_PATH=selection_path,
-        SPEAKER_AUDIO_DIR=tmp_path / "audio",
-        AUDIO_EQ_PATH=tmp_path / "legacy.json",
-        AUDIO_CONTROL_LOCK_PATH=tmp_path / "audio.lock",
-        AUDIO_READY_PATH=ready_path,
-        SPEAKER_TRANSITION_PATH=tmp_path / "transition.json",
-    )
-
-    # Without SWITCH nothing may change, not even the on-disk profile.
-    with patch.multiple(web_ui, **patches):
-        try:
-            web_ui.save_speaker_profile(request)
-        except ValueError as exc:
-            assert "SWITCH" in str(exc)
-        else:
-            raise AssertionError("active profile edit skipped confirmation")
-    assert (profile_dir / "partymeh.yml").read_bytes() == before
-
-    # Preflight failure restores the previous definition byte for byte.
-    with (
-        patch.multiple(web_ui, **patches),
-        patch.object(
-            web_ui,
-            "preflight_speaker_profile",
-            side_effect=ValueError("CamillaDSP rejected toslink/partymeh"),
-        ),
-    ):
-        try:
-            web_ui.save_speaker_profile({**request, "confirm": "SWITCH"})
-        except ValueError as exc:
-            assert "rejected" in str(exc)
-        else:
-            raise AssertionError("failed preflight committed an edit")
-    assert (profile_dir / "partymeh.yml").read_bytes() == before
-    assert ready_path.exists(), "failed edit must not leave audio inhibited"
-    assert (
-        speaker_profiles.read_speaker_selection(selection_path)["revision"] == 1
-    ), "failed edit must not bump the selection revision"
-
-    # The confirmed happy path applies muted and bumps both revisions.
-    fake_catalog = {
-        "partymeh": {
-            "id": "partymeh",
-            "available": True,
-            "supported_sources": ["streamer", "gadget", "toslink", "analog"],
-        }
-    }
-    with (
-        patch.multiple(web_ui, **patches),
-        patch.object(web_ui, "preflight_speaker_profile"),
-        patch.object(web_ui, "profile_catalog", return_value=fake_catalog),
-        patch.object(
-            web_ui, "require_active_source_supported", return_value="toslink"
-        ),
-        patch.dict(sys.modules, {"camilladsp": SimpleNamespace(CamillaClient=Client)}),
-        patch.object(web_ui, "speaker_payload", return_value={"ok": True}),
-    ):
-        result = web_ui.save_speaker_profile({**request, "confirm": "SWITCH"})
-    assert result["applied"] is True
-    assert result["profile_revision"] == 2
-    assert volume.muted is True
-    assert not ready_path.exists()
-    selection = speaker_profiles.read_speaker_selection(selection_path)
-    assert selection == {"version": 1, "revision": 2, "selected": "partymeh"}
-    saved = speaker_config.load_profile(profile_dir, "partymeh")
-    assert saved["crossover"]["ways"][0]["lowpass"]["freq"] == 350.0

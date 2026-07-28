@@ -17,7 +17,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
 
-import fcntl
 import yaml
 
 from audio_eq import (
@@ -28,20 +27,17 @@ from audio_eq import (
     read_audio_state,
 )
 from speaker_config import (
-    PROFILE_VERSION,
     compile_profile_config,
     config_digest,
     load_profile,
     load_yaml_mapping,
     profile_catalog,
-    save_profile,
 )
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
     OPERATOR_CONFIG_SPEAKERS,
     audio_control_lock,
-    normalize_speaker_id,
     operator_configs_for_speaker,
     read_profile_audio_state,
     read_speaker_selection,
@@ -50,7 +46,6 @@ from speaker_profiles import (
     set_audio_inhibit,
     update_speaker_selection,
 )
-from speaker_xo import crossover_response, normalize_crossover
 
 
 HOST = os.environ.get("INSTALLATION_UI_HOST", "0.0.0.0")
@@ -68,12 +63,6 @@ SPEAKER_GENERATED_DIR = Path(
 )
 SOURCE_OVERRIDE_PATH = Path(
     os.environ.get("SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source")
-)
-SOURCE_OVERRIDE_OWNER_PATH = Path(
-    os.environ.get("SOURCE_OVERRIDE_OWNER_PATH", f"{SOURCE_OVERRIDE_PATH}.owner")
-)
-SOURCE_OVERRIDE_LOCK_PATH = Path(
-    os.environ.get("SOURCE_OVERRIDE_LOCK_PATH", f"{SOURCE_OVERRIDE_PATH}.lock")
 )
 UI_SERVICE = "cdsp-control-ui.service"
 AUDIO_EQ_PATH = Path(
@@ -125,18 +114,6 @@ SPEAKER_TRANSITION_PATH = Path(
 )
 BACKUP_KEEP = 15
 MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", "/mnt/whispers"))
-AUDIO_EXTS = {
-    ".wav",
-    ".flac",
-    ".mp3",
-    ".aif",
-    ".aiff",
-    ".m4a",
-    ".ogg",
-    ".opus",
-    ".wv",
-    ".aac",
-}
 MIN_VALID_EPOCH = 1_704_067_200  # 2024-01-01
 MAX_VALID_EPOCH = 4_102_444_800  # 2100-01-01
 DEFAULT_REMOTE_NAME = "HID Remote01 Keyboard"
@@ -320,8 +297,6 @@ HTML = r"""<!doctype html>
     .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(95,208,138,0.15); }
     .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(244,196,81,0.15); }
     .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,107,107,0.16); }
-    .dot.live { animation: pulse 1.6s ease-in-out infinite; }
-    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
 
     /* ---------- nav ---------- */
     nav {
@@ -373,7 +348,7 @@ HTML = r"""<!doctype html>
     .val.big { font-size: 30px; font-weight: 700; font-family: var(--mono); letter-spacing: -0.5px; }
     .unit { font-size: 12px; color: var(--muted); font-weight: 500; }
     .sub2 { font: 11px/1.3 var(--mono); color: var(--faint); margin-top: 6px; overflow-wrap: anywhere; }
-    .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .cool { color: var(--cool); }
+    .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .faint { color: var(--faint); }
 
     .badge {
       display: inline-flex; align-items: center; gap: 6px; font: 11px/1 var(--mono);
@@ -405,7 +380,6 @@ HTML = r"""<!doctype html>
     .btn.ghost { background: transparent; }
     .btn.sm { padding: 7px 10px; font-size: 11px; }
     .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    a.btn { text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
 
     /* source grid */
     .sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
@@ -487,7 +461,6 @@ HTML = r"""<!doctype html>
     .pending { font: 11px/1 var(--mono); color: var(--warm); letter-spacing: 0.5px; }
 
     /* services */
-    table { width: 100%; border-collapse: collapse; }
     .svc-group { margin-bottom: 18px; }
     .svc-row { display: grid; grid-template-columns: minmax(0,1.4fr) auto auto; gap: 12px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line); }
     .svc-row:first-child { border-top: 0; }
@@ -1343,6 +1316,10 @@ def systemctl_show(service: str) -> dict[str, str]:
     return props
 
 
+def service_is_active(unit: str) -> bool:
+    return run(["systemctl", "is-active", unit], timeout=3) == "active"
+
+
 def service_status() -> dict[str, dict[str, Any]]:
     payload: dict[str, dict[str, Any]] = {}
     for name, meta in SERVICE_CATALOG.items():
@@ -1371,6 +1348,22 @@ def service_status() -> dict[str, dict[str, Any]]:
 
 def clamp_volume(value: float) -> float:
     return max(VOLUME_MIN_DB, min(VOLUME_MAX_DB, value))
+
+
+@contextmanager
+def camilla_client() -> Iterator[Any]:
+    """Yield a connected CamillaClient and always disconnect afterwards."""
+    from camilladsp import CamillaClient
+
+    client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
+    client.connect()
+    try:
+        yield client
+    finally:
+        try:
+            client.disconnect()
+        except Exception:
+            pass
 
 
 # ---- persistent read-only CamillaDSP client for the live signal meter ----
@@ -1408,38 +1401,23 @@ def camilla_levels() -> dict[str, Any]:
 
 
 def camilla_status() -> dict[str, Any]:
-    client: Any = None
     try:
-        from camilladsp import CamillaClient
-
-        client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
-        client.connect()
-        config = client.config.active() or {}
-        payload = {
-            "state": str(client.general.state()).replace("ProcessingState.", ""),
-            "config_title": config.get("title"),
-            "config_file": client.config.file_path(),
-            "sample_rate": config.get("devices", {}).get("samplerate"),
-            "volume_db": client.volume.main_volume(),
-            "muted": client.volume.main_mute(),
-        }
-        return payload
+        with camilla_client() as client:
+            config = client.config.active() or {}
+            return {
+                "state": str(client.general.state()).replace("ProcessingState.", ""),
+                "config_title": config.get("title"),
+                "config_file": client.config.file_path(),
+                "sample_rate": config.get("devices", {}).get("samplerate"),
+                "volume_db": client.volume.main_volume(),
+                "muted": client.volume.main_mute(),
+            }
     except Exception as exc:
         return {"error": str(exc)}
-    finally:
-        if client is not None:
-            try:
-                client.disconnect()
-            except Exception:
-                pass
 
 
 def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
-    from camilladsp import CamillaClient
-
-    client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
-    client.connect()
-    try:
+    with camilla_client() as client:
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
             if "delta_db" in payload:
                 current = float(client.volume.main_volume())
@@ -1458,8 +1436,6 @@ def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
                 if not muted:
                     require_audio_unmute_allowed(AUDIO_READY_PATH)
                 client.volume.set_main_mute(muted)
-    finally:
-        client.disconnect()
 
     return camilla_status()
 
@@ -1507,24 +1483,6 @@ def read_source_override() -> str | None:
     return source if source and source != "auto" else None
 
 
-@contextmanager
-def source_override_lock() -> Iterator[None]:
-    SOURCE_OVERRIDE_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-    flags = (
-        os.O_RDWR
-        | os.O_CREAT
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    descriptor = os.open(SOURCE_OVERRIDE_LOCK_PATH, flags, 0o644)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def _write_runtime_value(path: Path, value: str) -> None:
     temporary: Path | None = None
     try:
@@ -1559,9 +1517,7 @@ def _read_runtime_value(path: Path) -> str:
 
 def write_source_override(source: str) -> None:
     if source == "auto":
-        with source_override_lock():
-            SOURCE_OVERRIDE_PATH.unlink(missing_ok=True)
-            SOURCE_OVERRIDE_OWNER_PATH.unlink(missing_ok=True)
+        SOURCE_OVERRIDE_PATH.unlink(missing_ok=True)
         return
 
     if source not in SOURCE_CHOICES:
@@ -1571,17 +1527,22 @@ def write_source_override(source: str) -> None:
     if not entry.get("exists"):
         raise FileNotFoundError(str(entry.get("path") or source))
 
-    with source_override_lock():
-        SOURCE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _write_runtime_value(SOURCE_OVERRIDE_OWNER_PATH, "ui\n")
-        _write_runtime_value(SOURCE_OVERRIDE_PATH, source + "\n")
+    SOURCE_OVERRIDE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _write_runtime_value(SOURCE_OVERRIDE_PATH, source + "\n")
+
+
+def current_speaker_selection() -> dict[str, Any]:
+    return read_speaker_selection(
+        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
+    )
+
+
+def installed_profile_catalog() -> dict[str, dict[str, Any]]:
+    return profile_catalog(SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, CDSP_CONFIG_DIR)
 
 
 def source_availability() -> dict[str, dict[str, Any]]:
-    selection = read_speaker_selection(
-        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
-    )
-    selected = selection["selected"]
+    selected = current_speaker_selection()["selected"]
     if selected == "kantarellen":
         return {
             key: {
@@ -1591,9 +1552,7 @@ def source_availability() -> dict[str, dict[str, Any]]:
             }
             for key, label in SOURCE_CHOICES.items()
         }
-    profile = profile_catalog(
-        SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, CDSP_CONFIG_DIR
-    ).get(selected, {})
+    profile = installed_profile_catalog().get(selected, {})
     supported = set(profile.get("supported_sources") or [])
     profile_ready = bool(profile.get("available"))
     return {
@@ -1627,34 +1586,19 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_media_folders() -> dict[str, Any]:
-    """Session folders on the USB drive, each with a playable-audio count.
+def list_media_folders() -> list[dict[str, Any]]:
+    """Session folders on the USB drive.
 
     Hidden entries and macOS metadata (._*, .Spotlight-V100, .Trashes, …) are
     skipped so the GUI shows only real session folders.
     """
-    mounted = False
-    try:
-        mounted = MEDIA_ROOT.is_mount()
-    except OSError:
-        mounted = False
     folders: list[dict[str, Any]] = []
     if MEDIA_ROOT.is_dir():
         for p in sorted(MEDIA_ROOT.iterdir(), key=lambda x: x.name.lower()):
             if not p.is_dir() or p.name.startswith("."):
                 continue
-            try:
-                count = sum(
-                    1
-                    for f in p.iterdir()
-                    if f.is_file()
-                    and f.suffix.lower() in AUDIO_EXTS
-                    and not f.name.startswith(".")
-                )
-            except OSError:
-                count = 0
-            folders.append({"name": p.name, "count": count})
-    return {"root": str(MEDIA_ROOT), "mounted": mounted, "folders": folders}
+            folders.append({"name": p.name})
+    return folders
 
 
 def storage_status() -> dict[str, Any]:
@@ -1685,7 +1629,7 @@ def storage_status() -> dict[str, Any]:
             info["size_bytes"] = st.f_blocks * st.f_frsize
         except OSError:
             pass
-        info["folders"] = list_media_folders().get("folders", [])
+        info["folders"] = list_media_folders()
     return info
 
 
@@ -1765,15 +1709,10 @@ def _read_json_object(path: Path) -> dict[str, Any]:
 
 
 def speaker_payload() -> dict[str, Any]:
-    selection = read_speaker_selection(
-        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
-    )
-    status = _read_json_object(SPEAKER_STATUS_PATH)
-    catalog = profile_catalog(SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, CDSP_CONFIG_DIR)
     return {
-        "selection": selection,
-        "catalog": catalog,
-        "status": status,
+        "selection": current_speaker_selection(),
+        "catalog": installed_profile_catalog(),
+        "status": _read_json_object(SPEAKER_STATUS_PATH),
         "ready": AUDIO_READY_PATH.is_file(),
     }
 
@@ -1830,14 +1769,7 @@ def preflight_speaker_profile(speaker_id: str) -> None:
                 ) as handle:
                     yaml.safe_dump(compiled, handle, sort_keys=False)
                     temporary = Path(handle.name)
-                result = subprocess.run(
-                    [CAMILLA_BINARY, "-c", str(temporary)],
-                    text=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    timeout=10,
-                    check=False,
-                )
+                result = run_result([CAMILLA_BINARY, "-c", str(temporary)], timeout=10)
             finally:
                 if temporary is not None:
                     temporary.unlink(missing_ok=True)
@@ -1851,14 +1783,7 @@ def preflight_speaker_profile(speaker_id: str) -> None:
     for source, path in configs:
         if not path.is_file():
             raise FileNotFoundError(path)
-        result = subprocess.run(
-            [CAMILLA_BINARY, "-c", str(path)],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-            check=False,
-        )
+        result = run_result([CAMILLA_BINARY, "-c", str(path)], timeout=10)
         if result.returncode != 0:
             raise ValueError(f"CamillaDSP rejected {source}/{speaker_id}")
 
@@ -1930,7 +1855,7 @@ def select_speaker(raw: Any) -> dict[str, Any]:
         raise ValueError("speaker selection requires explicit SWITCH confirmation")
     speaker_id = raw.get("selected")
     expected_revision = raw.get("revision")
-    catalog = profile_catalog(SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, CDSP_CONFIG_DIR)
+    catalog = installed_profile_catalog()
     available_ids = {
         profile_id
         for profile_id, entry in catalog.items()
@@ -1948,11 +1873,7 @@ def select_speaker(raw: Any) -> dict[str, Any]:
             AUDIO_READY_PATH,
             {"reason": "speaker selected", "target": speaker_id},
         )
-        from camilladsp import CamillaClient
-
-        client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
-        try:
-            client.connect()
+        with camilla_client() as client:
             restore_mute = bool(client.volume.main_mute())
             atomic_write_json(
                 SPEAKER_TRANSITION_PATH,
@@ -1964,11 +1885,6 @@ def select_speaker(raw: Any) -> dict[str, Any]:
                 },
             )
             client.volume.set_main_mute(True)
-        finally:
-            try:
-                client.disconnect()
-            except Exception:
-                pass
 
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         require_active_source_supported(speaker_id, catalog)
@@ -1984,137 +1900,6 @@ def select_speaker(raw: Any) -> dict[str, Any]:
         SPEAKER_AUDIO_DIR, speaker_id, legacy_path=AUDIO_EQ_PATH
     )
     return speaker_payload()
-
-
-def preview_speaker_crossover(raw: Any) -> dict[str, Any]:
-    """Validate an unsaved crossover spec and return its response curves."""
-    if not isinstance(raw, dict):
-        raise ValueError("crossover preview must be an object")
-    crossover = normalize_crossover(
-        raw.get("crossover"), raw_measurement=bool(raw.get("raw_measurement"))
-    )
-    return {"crossover": crossover, "response": crossover_response(crossover)}
-
-
-def save_speaker_profile(raw: Any) -> dict[str, Any]:
-    """Persist a parametric profile; editing the live one re-applies muted."""
-    if not isinstance(raw, dict):
-        raise ValueError("speaker profile payload must be an object")
-    speaker_id = normalize_speaker_id(raw.get("id"))
-    if speaker_id not in BUILTIN_SPEAKERS:
-        raise ValueError(f"unknown speaker profile: {speaker_id}")
-    if speaker_id == DEFAULT_SPEAKER_ID:
-        raise ValueError("Kantarellen uses the legacy configs and cannot be edited here")
-    profile_in = raw.get("profile")
-    if not isinstance(profile_in, dict):
-        raise ValueError("profile must be an object")
-    raw_measurement = speaker_id == "measurement"
-    document = {
-        "version": PROFILE_VERSION,
-        "id": speaker_id,
-        "label": str(profile_in.get("label") or BUILTIN_SPEAKERS[speaker_id]["label"]),
-        "description": str(
-            profile_in.get("description")
-            or BUILTIN_SPEAKERS[speaker_id]["description"]
-        ),
-        "enabled": profile_in.get("enabled"),
-        "supported_sources": profile_in.get("supported_sources"),
-        "max_volume_db": profile_in.get("max_volume_db"),
-        "bypass_user_eq": True if raw_measurement else profile_in.get(
-            "bypass_user_eq", False
-        ),
-        "raw_measurement": raw_measurement,
-        "crossover": profile_in.get("crossover"),
-    }
-    selection = read_speaker_selection(
-        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
-    )
-    is_active = selection["selected"] == speaker_id
-    if is_active and document["enabled"] is not True:
-        raise ValueError(
-            "the active speaker profile cannot be disabled; switch speakers first"
-        )
-    if is_active and raw.get("confirm") != "SWITCH":
-        raise ValueError(
-            "editing the active speaker profile requires explicit SWITCH confirmation"
-        )
-
-    profile_path = SPEAKER_PROFILE_DIR / f"{speaker_id}.yml"
-    previous_bytes = (
-        profile_path.read_bytes() if profile_path.is_file() else None
-    )
-    saved = save_profile(
-        SPEAKER_PROFILE_DIR,
-        speaker_id,
-        document,
-        expected_revision=raw.get("revision"),
-    )
-    if not is_active:
-        return {"applied": False, "profile_revision": saved["revision"],
-                "speaker": speaker_payload()}
-
-    # The live crossover changed: verify it end to end, then bump the
-    # selection revision so the switcher re-applies it muted and validated.
-    # Any failure restores the previous definition on disk.
-    def restore_previous() -> None:
-        if previous_bytes is None:
-            profile_path.unlink(missing_ok=True)
-        else:
-            temporary = profile_path.with_name(f".{profile_path.name}.rollback")
-            temporary.write_bytes(previous_bytes)
-            temporary.replace(profile_path)
-
-    try:
-        preflight_speaker_profile(speaker_id)
-        catalog = profile_catalog(
-            SPEAKER_PROFILE_DIR, SOURCE_BASE_DIR, CDSP_CONFIG_DIR
-        )
-        if not catalog.get(speaker_id, {}).get("available"):
-            reason = catalog.get(speaker_id, {}).get("reason") or "profile unavailable"
-            raise ValueError(f"edited profile failed validation: {reason}")
-
-        def inhibit_and_mute(updated: dict[str, Any]) -> None:
-            set_audio_inhibit(
-                AUDIO_READY_PATH,
-                {"reason": "active profile edited", "target": speaker_id},
-            )
-            from camilladsp import CamillaClient
-
-            client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
-            try:
-                client.connect()
-                restore_mute = bool(client.volume.main_mute())
-                atomic_write_json(
-                    SPEAKER_TRANSITION_PATH,
-                    {
-                        "version": 1,
-                        "revision": updated["revision"],
-                        "selected": updated["selected"],
-                        "restore_mute": restore_mute,
-                    },
-                )
-                client.volume.set_main_mute(True)
-            finally:
-                try:
-                    client.disconnect()
-                except Exception:
-                    pass
-
-        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-            require_active_source_supported(speaker_id, catalog)
-            update_speaker_selection(
-                SPEAKER_SELECTION_PATH,
-                speaker_id,
-                expected_revision=raw.get("selection_revision"),
-                allowed_ids={speaker_id},
-                before_commit=inhibit_and_mute,
-                force=True,
-            )
-    except Exception:
-        restore_previous()
-        raise
-    return {"applied": True, "profile_revision": saved["revision"],
-            "speaker": speaker_payload()}
 
 
 def audio_eq_payload() -> dict[str, Any]:
@@ -2160,17 +1945,8 @@ def audio_eq_payload() -> dict[str, Any]:
         )
     except OSError:
         configured = False
-    shairport_active = (
-        run(["systemctl", "is-active", "shairport-sync.service"], timeout=3)
-        == "active"
-    )
-    bridge_active = (
-        run(
-            ["systemctl", "is-active", "airplay-volume-bridge.service"],
-            timeout=3,
-        )
-        == "active"
-    )
+    shairport_active = service_is_active("shairport-sync.service")
+    bridge_active = service_is_active("airplay-volume-bridge.service")
     try:
         spotify_dropin = SPOTIFY_VOLUME_DROPIN_PATH.read_text(encoding="utf-8")
         spotify_configured = (
@@ -2221,17 +1997,12 @@ def write_audio_eq_state(raw: Any, *, expected_speaker: str | None = None) -> di
             raise ValueError(
                 "install and verify the custom ISO 226 CamillaDSP engine first"
             )
-    selection = read_speaker_selection(
-        SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
-    )
+    selection = current_speaker_selection()
     if expected_speaker is not None and expected_speaker != selection["selected"]:
         raise ValueError("speaker selection changed elsewhere; reload before saving")
     audio_path = _selected_audio_path(selection)
     with audio_state_lock(audio_path):
-        latest = read_speaker_selection(
-            SPEAKER_SELECTION_PATH, allowed_ids=BUILTIN_SPEAKERS
-        )
-        if latest != selection:
+        if current_speaker_selection() != selection:
             raise ValueError("speaker selection changed elsewhere; reload before saving")
         current = read_audio_state(audio_path)
         incoming_revision = raw.get("revision", current["revision"])
@@ -2348,10 +2119,6 @@ class Handler(BaseHTTPRequestHandler):
                 )
             return
 
-        if parsed.path == "/api/speaker":
-            self.send_json(speaker_payload())
-            return
-
         if parsed.path == "/api/logs":
             query = urllib.parse.parse_qs(parsed.query)
             unit = query.get("unit", ["camilladsp.service"])[0]
@@ -2395,14 +2162,6 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/speaker":
                 self.send_json({"ok": True, "speaker": select_speaker(payload)})
-                return
-
-            if parsed.path == "/api/speaker/profile":
-                self.send_json({"ok": True, **save_speaker_profile(payload)})
-                return
-
-            if parsed.path == "/api/speaker/profile/preview":
-                self.send_json({"ok": True, **preview_speaker_crossover(payload)})
                 return
 
             if parsed.path == "/api/amps/off":
