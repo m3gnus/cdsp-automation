@@ -13,7 +13,8 @@ MARKER="${CDSP_AUTOMATION_LIBRESPOT_MARKER:-/var/lib/cdsp-automation/librespot-v
 # Only this exact marker format is understood.  Anything else - including the
 # markers older deployments left behind - is treated as "unknown", which forces
 # one rebuild and then rewrites the file in this format.
-MARKER_FORMAT="cdsp-volume-sync/1"
+MARKER_FORMAT="cdsp-volume-sync/2"
+BUILD_FEATURES="alsa-backend,native-tls,with-avahi"
 
 # Artifact names an earlier release compiled a single site's name into.  The
 # name is assembled from fragments so the literal never appears in this
@@ -75,6 +76,7 @@ ExecStart=
 ExecStart=$TARGET$device_flag
 Environment=LIBRESPOT_MIXER=softvol
 Environment=LIBRESPOT_VOLUME_CTRL=fixed
+Environment=LIBRESPOT_ZEROCONF_BACKEND=avahi
 Environment="LIBRESPOT_ONEVENT=/usr/bin/python3 $CALLBACK --notify-spotify"
 Environment=CDSP_SPOTIFY_VOLUME_SOCKET=$COMMAND_SOCKET
 Environment=CDSP_SPOTIFY_VOLUME_ACK_SOCKET=$ACK_SOCKET
@@ -95,10 +97,11 @@ sha256_stream() {
 # redeploy the drop-in, never recompile Rust.
 source_digest() {
   local patch_file="$1"
-  printf '%s\n%s\n%s\n' \
+  printf '%s\n%s\n%s\n%s\n' \
     "$MARKER_FORMAT" \
     "$UPSTREAM_COMMIT" \
-    "$(sha256_stream < "$patch_file")" | sha256_stream
+    "$(sha256_stream < "$patch_file")" \
+    "$BUILD_FEATURES" | sha256_stream
 }
 
 marker_matches() {
@@ -216,7 +219,7 @@ main() {
     cargo test --manifest-path "$BUILD_DIR/librespot/Cargo.toml" \
       -p librespot-playback --no-default-features --features alsa-backend,native-tls
     cargo build --release --manifest-path "$BUILD_DIR/librespot/Cargo.toml" \
-      --no-default-features --features alsa-backend,native-tls,with-libmdns
+      --no-default-features --features "$BUILD_FEATURES"
     candidate="$BUILD_DIR/librespot/target/release/librespot"
     "$candidate" --version | grep -q 'librespot 0.8.0'
   else

@@ -48,6 +48,9 @@ class VolumeSyncTests(unittest.TestCase):
         ).read_text()
         self.assertIn("d36f9f1907e8cc9d68a93f8ebc6b627b1bf7267d", build)
         self.assertIn("LIBRESPOT_VOLUME_CTRL=fixed", build)
+        self.assertIn("BUILD_FEATURES=\"alsa-backend,native-tls,with-avahi\"", build)
+        self.assertIn("LIBRESPOT_ZEROCONF_BACKEND=avahi", build)
+        self.assertNotIn("with-libmdns", build)
         self.assertIn("Box::new(NoOpVolume)", patch_text)
         self.assertIn("CDSP_SPOTIFY_VOLUME_SOCKET", patch_text)
         self.assertIn("set_volume_external", patch_text)
@@ -342,7 +345,7 @@ if marker_matches "different"; then echo "any-digest-accepted" >> {log!s}; else 
                 ["rebuild", "rewritten", "digest-checked"],
             )
             self.assertTrue(
-                marker.read_text(encoding="utf-8").startswith("cdsp-volume-sync/1 ")
+                    marker.read_text(encoding="utf-8").startswith("cdsp-volume-sync/2 ")
             )
 
     def test_uninstall_removes_both_receiver_generations(self) -> None:
