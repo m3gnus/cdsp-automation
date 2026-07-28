@@ -62,11 +62,13 @@ edit, so Bass/Treble, user EQ, and loudness remain independent per speaker.
 The selectable speakers ship as the maintainer's defaults. A site replaces
 the whole catalog without editing code by writing the JSON file at
 `SPEAKER_CATALOG_PATH` (default `/etc/cdsp-automation/speaker-catalog.json`;
-see `speaker-catalog.example.json`): `default` names the boot selection, the
-optional `legacy` key marks the one profile that still uses the legacy
-`audio-eq.json` state path, and per-speaker `operator_configs` map sources to
-complete operator-owned CamillaDSP files. An unreadable or invalid catalog
-logs a warning and keeps the built-ins.
+see `speaker-catalog.example.json`). The contract is one sentence: the
+`default` speaker is the one that plays through your existing full CamillaDSP
+configs (and keeps the legacy `audio-eq.json` state path); every other
+speaker is a managed profile — parametric YAML in the profile directory, or
+complete operator-owned CamillaDSP files mapped per source with
+`operator_configs`. An unreadable or invalid catalog logs a warning and
+keeps the built-ins.
 
 Speaker selection and source arbitration are orthogonal. Kantarellen uses the
 existing full configs. Non-legacy profiles are strict YAML fragments in

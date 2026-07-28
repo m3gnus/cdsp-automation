@@ -31,35 +31,30 @@ class SpeakerCatalogNormalizationTests(unittest.TestCase):
             {"speakers": {"mains": {}}}
         )
         self.assertEqual(catalog["default"], "mains")
-        self.assertIsNone(catalog["legacy"])
         self.assertEqual(catalog["speakers"]["mains"]["label"], "mains")
         self.assertEqual(catalog["operator_configs"], {})
 
-    def test_operator_configs_accept_string_shorthand(self) -> None:
+    def test_operator_configs_are_collected_per_speaker(self) -> None:
         catalog = speaker_profiles.normalize_speaker_catalog(
             {
                 "default": "mains",
                 "speakers": {
-                    "mains": {
-                        "label": "Mains",
-                        "operator_configs": "mains-streamer.yml",
-                    }
+                    "mains": {},
+                    "vintage": {
+                        "operator_configs": {"streamer": "vintage-streamer.yml"}
+                    },
                 },
             }
         )
         self.assertEqual(
-            catalog["operator_configs"]["mains"],
-            {"streamer": "mains-streamer.yml"},
+            catalog["operator_configs"],
+            {"vintage": {"streamer": "vintage-streamer.yml"}},
         )
 
-    def test_unknown_default_and_legacy_are_rejected(self) -> None:
+    def test_unknown_default_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             speaker_profiles.normalize_speaker_catalog(
                 {"default": "missing", "speakers": {"mains": {}}}
-            )
-        with self.assertRaises(ValueError):
-            speaker_profiles.normalize_speaker_catalog(
-                {"legacy": "missing", "speakers": {"mains": {}}}
             )
 
     def test_empty_or_malformed_documents_are_rejected(self) -> None:
@@ -79,23 +74,20 @@ class SpeakerCatalogLoadTests(unittest.TestCase):
         self.assertEqual(speaker_profiles.LEGACY_SPEAKER_ID, "kantarellen")
         self.assertIn("partymeh", speaker_profiles.BUILTIN_SPEAKERS)
 
-    def test_catalog_file_replaces_builtins(self) -> None:
+    def test_catalog_default_becomes_the_legacy_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory, "speaker-catalog.json")
             path.write_text(
                 json.dumps(
                     {
-                        "version": 1,
                         "default": "mains",
                         "speakers": {
-                            "mains": {
-                                "label": "Mains",
-                                "description": "Two-way monitors",
+                            "mains": {"label": "Mains"},
+                            "vintage": {
                                 "operator_configs": {
-                                    "streamer": "mains-streamer.yml"
-                                },
+                                    "streamer": "vintage-streamer.yml"
+                                }
                             },
-                            "sub": {"label": "Sub"},
                         },
                     }
                 ),
@@ -103,13 +95,13 @@ class SpeakerCatalogLoadTests(unittest.TestCase):
             )
             _reload_with_catalog(str(path))
             self.assertEqual(speaker_profiles.DEFAULT_SPEAKER_ID, "mains")
-            self.assertIsNone(speaker_profiles.LEGACY_SPEAKER_ID)
+            self.assertEqual(speaker_profiles.LEGACY_SPEAKER_ID, "mains")
             self.assertEqual(
-                set(speaker_profiles.BUILTIN_SPEAKERS), {"mains", "sub"}
+                set(speaker_profiles.BUILTIN_SPEAKERS), {"mains", "vintage"}
             )
             self.assertEqual(
-                speaker_profiles.operator_config_for_source("mains", "streamer"),
-                "mains-streamer.yml",
+                speaker_profiles.operator_config_for_source("vintage", "streamer"),
+                "vintage-streamer.yml",
             )
             selection = speaker_profiles.default_speaker_selection()
             self.assertEqual(selection["selected"], "mains")

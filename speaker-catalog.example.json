@@ -1,18 +1,21 @@
 {
-  "version": 1,
   "default": "mains",
   "speakers": {
     "mains": {
       "label": "Mains",
-      "description": "Three-way stereo system on outputs 1-6",
-      "operator_configs": {
-        "streamer": "mains-streamer.yml",
-        "toslink": "mains-toslink.yml"
-      }
+      "description": "Plays through your existing full CamillaDSP configs"
     },
-    "measurement": {
-      "label": "Measurement",
-      "description": "Direct measurement routing without speaker EQ or crossover"
+    "office": {
+      "label": "Office monitors",
+      "description": "Managed parametric profile (office.yml in the profile directory)"
+    },
+    "vintage": {
+      "label": "Vintage system",
+      "description": "Operator-owned CamillaGUI configs, one per source",
+      "operator_configs": {
+        "streamer": "vintage-streamer.yml",
+        "toslink": "vintage-toslink.yml"
+      }
     }
   }
 }

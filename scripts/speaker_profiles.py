@@ -25,21 +25,22 @@ from audio_eq import (
 SELECTION_VERSION = 1
 # The shipped catalog below describes the maintainer's own speakers so an
 # unconfigured deployment keeps working. A site replaces the whole catalog
-# with the JSON file at SPEAKER_CATALOG_PATH instead of editing this module;
-# see normalize_speaker_catalog for the accepted document shape.
+# with the JSON file at SPEAKER_CATALOG_PATH instead of editing this module.
+# Contract: the DEFAULT speaker is the one that plays through the existing
+# full CamillaDSP configs (and, for it alone, the legacy audio-eq.json state
+# path); every other speaker is a managed profile. LEGACY_SPEAKER_ID is a
+# readable alias for that same identity at the call sites that care about
+# the legacy state path rather than the boot selection.
 SPEAKER_CATALOG_PATH = os.environ.get(
     "SPEAKER_CATALOG_PATH", "/etc/cdsp-automation/speaker-catalog.json"
 )
 DEFAULT_SPEAKER_ID = "kantarellen"
-# The one profile whose EQ state predates per-speaker files and still lives at
-# the legacy audio-eq.json path. None disables every legacy special case; a
-# catalog file only gets a legacy profile by naming one explicitly.
-LEGACY_SPEAKER_ID: str | None = "kantarellen"
+LEGACY_SPEAKER_ID = DEFAULT_SPEAKER_ID
 # These profiles are complete operator-owned CamillaDSP files in the normal
 # CamillaGUI config directory. They are intentionally editable in CamillaGUI;
 # the source switcher validates and loads the file directly instead of
 # generating an immutable config from the compact crossover schema.
-OPERATOR_CONFIG_SPEAKERS: dict[str, str | dict[str, str]] = {
+OPERATOR_CONFIG_SPEAKERS: dict[str, dict[str, str]] = {
     "partymeh": {
         "streamer": "partymeh-streamer.yml",
         "gadget": "partymeh-gadget.yml",
@@ -68,15 +69,8 @@ BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
 
 
 def operator_configs_for_speaker(speaker_id: str) -> dict[str, str]:
-    """Return source -> filename for an operator-owned speaker profile.
-
-    A legacy string entry remains a streamer-only shorthand so older local
-    deployments can be upgraded without changing their profile definition.
-    """
-    spec = OPERATOR_CONFIG_SPEAKERS.get(speaker_id)
-    if isinstance(spec, str):
-        return {"streamer": spec}
-    return dict(spec or {})
+    """Return source -> filename for an operator-owned speaker profile."""
+    return dict(OPERATOR_CONFIG_SPEAKERS.get(speaker_id) or {})
 
 
 def operator_config_for_source(speaker_id: str, source: str) -> str | None:
@@ -99,58 +93,38 @@ def normalize_speaker_id(value: Any) -> str:
 def normalize_speaker_catalog(raw: Any) -> dict[str, Any]:
     """Validate a site speaker-catalog document.
 
-    Shape: {"version": 1, "default": "<id>", "legacy": "<id>" (optional),
-    "speakers": {"<id>": {"label": "...", "description": "...",
-    "operator_configs": {"<source>": "<file>.yml"} (optional)}}}.
+    Shape: {"default": "<id>", "speakers": {"<id>": {"label": "...",
+    "description": "...", "operator_configs": {"<source>": "<file>.yml"}}}}.
+    The default speaker plays through the existing full CamillaDSP configs;
+    every other speaker must be an installed managed profile.
     """
     if not isinstance(raw, dict):
         raise ValueError("speaker catalog must be an object")
-    version = raw.get("version", 1)
-    if isinstance(version, bool) or version != 1:
-        raise ValueError(f"unsupported speaker catalog version: {version}")
     speakers_raw = raw.get("speakers")
     if not isinstance(speakers_raw, dict) or not speakers_raw:
         raise ValueError("speaker catalog must define at least one speaker")
     speakers: dict[str, dict[str, str]] = {}
-    operator_configs: dict[str, str | dict[str, str]] = {}
+    operator_configs: dict[str, dict[str, str]] = {}
     for raw_id, meta in speakers_raw.items():
         speaker_id = normalize_speaker_id(raw_id)
         if not isinstance(meta, dict):
             raise ValueError(f"speaker {speaker_id!r} definition must be an object")
-        label = meta.get("label", speaker_id)
-        description = meta.get("description", "")
-        if not isinstance(label, str) or not isinstance(description, str):
-            raise ValueError(
-                f"speaker {speaker_id!r} label and description must be strings"
-            )
         speakers[speaker_id] = {
-            "label": label or speaker_id,
-            "description": description,
+            "label": str(meta.get("label") or speaker_id),
+            "description": str(meta.get("description") or ""),
         }
         configs = meta.get("operator_configs")
-        if configs is None:
-            continue
-        if isinstance(configs, str):
-            configs = {"streamer": configs}
-        if not isinstance(configs, dict) or not all(
-            isinstance(source, str) and isinstance(filename, str) and filename
-            for source, filename in configs.items()
-        ):
-            raise ValueError(
-                f"speaker {speaker_id!r} operator_configs must map source to filename"
-            )
-        operator_configs[speaker_id] = dict(configs)
+        if isinstance(configs, dict) and configs:
+            operator_configs[speaker_id] = {
+                str(source): str(filename)
+                for source, filename in configs.items()
+                if filename
+            }
     default = normalize_speaker_id(raw.get("default", next(iter(speakers))))
     if default not in speakers:
         raise ValueError(f"default speaker {default!r} is not in the catalog")
-    legacy = raw.get("legacy")
-    if legacy is not None:
-        legacy = normalize_speaker_id(legacy)
-        if legacy not in speakers:
-            raise ValueError(f"legacy speaker {legacy!r} is not in the catalog")
     return {
         "default": default,
-        "legacy": legacy,
         "speakers": speakers,
         "operator_configs": operator_configs,
     }
@@ -166,27 +140,17 @@ def _apply_speaker_catalog() -> None:
     global DEFAULT_SPEAKER_ID, LEGACY_SPEAKER_ID
     try:
         with open(SPEAKER_CATALOG_PATH, "r", encoding="utf-8") as handle:
-            raw = json.load(handle)
+            catalog = normalize_speaker_catalog(json.load(handle))
     except FileNotFoundError:
         return
     except (OSError, ValueError) as exc:
         print(
-            f"speaker catalog {SPEAKER_CATALOG_PATH} unreadable, "
+            f"speaker catalog {SPEAKER_CATALOG_PATH} ignored, "
             f"using built-ins: {exc}",
             flush=True,
         )
         return
-    try:
-        catalog = normalize_speaker_catalog(raw)
-    except ValueError as exc:
-        print(
-            f"speaker catalog {SPEAKER_CATALOG_PATH} invalid, "
-            f"using built-ins: {exc}",
-            flush=True,
-        )
-        return
-    DEFAULT_SPEAKER_ID = catalog["default"]
-    LEGACY_SPEAKER_ID = catalog["legacy"]
+    DEFAULT_SPEAKER_ID = LEGACY_SPEAKER_ID = catalog["default"]
     # Mutate in place: function defaults and from-imports keep referencing
     # these dict objects.
     BUILTIN_SPEAKERS.clear()
@@ -357,8 +321,7 @@ def resolve_profile_audio_path(
     if target.exists():
         return target
     if (
-        LEGACY_SPEAKER_ID is not None
-        and selected == LEGACY_SPEAKER_ID
+        selected == LEGACY_SPEAKER_ID
         and legacy_path is not None
         and legacy_path.exists()
     ):
@@ -402,8 +365,6 @@ def migrate_legacy_profile_audio_state(
     """
     if not legacy_writers_quiesced:
         raise RuntimeError("legacy audio writers must be stopped before migration")
-    if LEGACY_SPEAKER_ID is None:
-        raise RuntimeError("no legacy speaker profile is configured")
     target = profile_audio_path(root, LEGACY_SPEAKER_ID)
     with audio_state_lock(legacy_path):
         with audio_state_lock(target):

@@ -583,3 +583,18 @@ def test_apply_config_publishes_selection_revision(tmp_path: Path) -> None:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_catalog_default_speaker_uses_the_plain_source_configs(tmp_path: Path) -> None:
+    """A site catalog's default speaker plays through the existing configs."""
+    plain = tmp_path / "streamer.yml"
+    plain.write_text("devices: {}\n")
+    with (
+        patch.object(switcher, "DEFAULT_SPEAKER_ID", "mains"),
+        patch.dict(switcher.CONFIGS, {"streamer": str(plain)}, clear=True),
+        patch.object(switcher, "speaker_audio_state", return_value={}),
+    ):
+        target = switcher.resolve_config_target("streamer", "mains")
+    assert target["legacy"] is True
+    assert target["path"] == str(plain)
+    assert target["max_volume_db"] == 0.0

@@ -1911,7 +1911,7 @@ def managed_config_identity(current: Any) -> tuple[str, str] | None:
         len(parts) != 2
         or parts[0] not in SOURCE_CHOICES
         or parts[1] not in BUILTIN_SPEAKERS
-        or parts[1] == "kantarellen"
+        or parts[1] == DEFAULT_SPEAKER_ID
     ):
         return None
     try:
