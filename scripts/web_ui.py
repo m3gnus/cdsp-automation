@@ -1351,8 +1351,15 @@ def service_status() -> dict[str, dict[str, Any]]:
     return payload
 
 
-def clamp_volume(value: float) -> float:
-    return max(VOLUME_MIN_DB, min(VOLUME_MAX_DB, value))
+def _finite_volume(value: Any) -> float:
+    numeric = float(value)
+    if isinstance(value, bool) or not math.isfinite(numeric):
+        raise ValueError("volume must be a finite number")
+    return numeric
+
+
+def clamp_volume(value: Any) -> float:
+    return max(VOLUME_MIN_DB, min(VOLUME_MAX_DB, _finite_volume(value)))
 
 
 @contextmanager
@@ -1430,15 +1437,14 @@ def camilla_status() -> dict[str, Any]:
 def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
     with camilla_client() as client:
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+            target_volume = None
             if "delta_db" in payload:
                 current = float(client.volume.main_volume())
-                client.volume.set_main_volume(
-                    clamp_volume(current + float(payload["delta_db"]))
+                target_volume = clamp_volume(
+                    current + _finite_volume(payload["delta_db"])
                 )
             elif "volume_db" in payload:
-                client.volume.set_main_volume(
-                    clamp_volume(float(payload["volume_db"]))
-                )
+                target_volume = clamp_volume(payload["volume_db"])
 
             if "muted" in payload:
                 muted = payload["muted"]
@@ -1446,6 +1452,10 @@ def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
                     raise ValueError("muted must be true or false")
                 if not muted:
                     require_audio_unmute_allowed(AUDIO_READY_PATH)
+
+            if target_volume is not None:
+                client.volume.set_main_volume(target_volume)
+            if "muted" in payload:
                 client.volume.set_main_mute(muted)
 
     return camilla_status()

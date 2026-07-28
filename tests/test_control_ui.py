@@ -5,8 +5,10 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import math
 import subprocess
 import sys
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,6 +35,59 @@ def test_manual_amp_off_keeps_trigger_service_running() -> None:
     )
     assert 'id="ampOff"' in web_ui.HTML
     assert "next audio session" in web_ui.HTML
+
+
+def test_volume_api_rejects_nonfinite_and_boolean_values() -> None:
+    applied: list[float] = []
+    volume = SimpleNamespace(
+        main_volume=lambda: -20.0,
+        set_main_volume=applied.append,
+    )
+    client = SimpleNamespace(volume=volume)
+    invalid = (
+        {"volume_db": math.nan},
+        {"volume_db": math.inf},
+        {"delta_db": -math.inf},
+        {"volume_db": True},
+    )
+    with (
+        patch.object(web_ui, "camilla_client", return_value=nullcontext(client)),
+        patch.object(web_ui, "audio_control_lock", return_value=nullcontext()),
+    ):
+        for payload in invalid:
+            try:
+                web_ui.set_camilla_volume(payload)
+            except ValueError as exc:
+                assert "finite number" in str(exc)
+            else:
+                raise AssertionError(f"invalid volume was accepted: {payload}")
+    assert applied == []
+
+
+def test_blocked_unmute_does_not_partially_apply_volume() -> None:
+    applied: list[float] = []
+    client = SimpleNamespace(
+        volume=SimpleNamespace(
+            main_volume=lambda: -20.0,
+            set_main_volume=applied.append,
+        )
+    )
+    with (
+        patch.object(web_ui, "camilla_client", return_value=nullcontext(client)),
+        patch.object(web_ui, "audio_control_lock", return_value=nullcontext()),
+        patch.object(
+            web_ui,
+            "require_audio_unmute_allowed",
+            side_effect=RuntimeError("audio inhibited"),
+        ),
+    ):
+        try:
+            web_ui.set_camilla_volume({"volume_db": -10, "muted": False})
+        except RuntimeError as exc:
+            assert "inhibited" in str(exc)
+        else:
+            raise AssertionError("blocked unmute was accepted")
+    assert applied == []
 
 
 def test_live_meter_recovers_from_invalid_levels_and_ignores_nonfinite_values() -> None:

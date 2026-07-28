@@ -71,7 +71,7 @@ def operator_configs_for_speaker(speaker_id: str) -> dict[str, str]:
 
 
 def operator_config_for_source(speaker_id: str, source: str) -> str | None:
-    return operator_configs_for_speaker(speaker_id).get(source)
+    return OPERATOR_CONFIG_SPEAKERS.get(speaker_id, {}).get(source)
 
 
 def normalize_speaker_id(value: Any) -> str:
@@ -235,8 +235,6 @@ def read_speaker_selection(
     path: Path, *, allowed_ids: Iterable[str] = BUILTIN_SPEAKERS
 ) -> dict[str, Any]:
     try:
-        import json
-
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return default_speaker_selection()
@@ -246,11 +244,10 @@ def read_speaker_selection(
 
 
 @contextmanager
-def speaker_selection_lock(path: Path):
-    lock_path = path.with_name(f"{path.name}.lock")
+def _exclusive_file_lock(lock_path: Path, mode: int):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(lock_path, flags, 0o644)
+    descriptor = os.open(lock_path, flags, mode)
     with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
@@ -259,19 +256,13 @@ def speaker_selection_lock(path: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-@contextmanager
+def speaker_selection_lock(path: Path):
+    return _exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
+
+
 def audio_control_lock(path: Path):
     """Serialize config transitions with every master volume/mute writer."""
-    lock_path = Path(path)
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(lock_path, flags, 0o660)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return _exclusive_file_lock(Path(path), 0o660)
 
 
 def audio_inhibit_active(path: Path) -> bool:
@@ -370,10 +361,7 @@ def read_profile_audio_state(
     legacy_path: Path | None = None,
 ) -> dict[str, Any]:
     """Read one speaker's EQ state, retaining the legacy Kantarellen path."""
-    selected = normalize_speaker_id(speaker_id)
-    target = resolve_profile_audio_path(
-        root, selected, legacy_path=legacy_path
-    )
+    target = resolve_profile_audio_path(root, speaker_id, legacy_path=legacy_path)
     if target.exists():
         return read_audio_state(target)
 
