@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import io
 import stat
@@ -129,6 +130,44 @@ class RemoteTests(unittest.TestCase):
     def test_privileged_command_paths_are_fixed_not_path_derived(self) -> None:
         self.assertEqual(cdsp_remote.SUDO_BIN, "/usr/bin/sudo")
         self.assertEqual(cdsp_remote.SYSTEMCTL_BIN, "/usr/bin/systemctl")
+
+    def test_device_reconnect_closes_old_handle_and_updates_cleanup_target(self) -> None:
+        class Device:
+            def __init__(self, error: Exception) -> None:
+                self.error = error
+                self.ungrabbed = False
+                self.closed = False
+
+            async def async_read_loop(self):
+                if False:
+                    yield None
+                raise self.error
+
+            def ungrab(self) -> None:
+                self.ungrabbed = True
+
+            def close(self) -> None:
+                self.closed = True
+
+        old = Device(OSError("disconnected"))
+        replacement = Device(RuntimeError("stop test loop"))
+        cdsp_remote.remote_device = old
+
+        with (
+            mock.patch.object(cdsp_remote.asyncio, "sleep", new=mock.AsyncMock()),
+            mock.patch.object(
+                cdsp_remote, "find_remote_device", return_value=replacement
+            ),
+            mock.patch.object(cdsp_remote, "grab_device") as grab,
+            contextlib.redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(RuntimeError, "stop test loop"),
+        ):
+            asyncio.run(cdsp_remote.handle_remote_events(old))
+
+        self.assertTrue(old.ungrabbed)
+        self.assertTrue(old.closed)
+        self.assertIs(cdsp_remote.remote_device, replacement)
+        grab.assert_called_once_with(replacement)
 
 
 if __name__ == "__main__":

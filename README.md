@@ -713,15 +713,16 @@ journalctl -u cdsp-source-switcher -n 100 | grep "MOTU meters"
 
 ## Can I Use Just One Utility?
 
-**Yes!** The utilities are completely independent:
+**Yes.** Trigger control and MOTU clock sync can run independently. Source
+switching owns the persistent EQ overlay; install it when using the remote's
+tone controls or the web UI's audio controls:
 
 - Install only **Trigger Control** for amp power management
 - Install only **MOTU Clock Sync** for clock source automation
 - Install only **Source Switcher** for config switching
-- Install only **Remote Control** for volume/tone adjustment
-- Install any combination
-
-They don't interfere with each other and can run simultaneously.
+- Install **Remote Control** by itself for volume, mute, and recovery controls,
+  or alongside **Source Switcher** for persistent tone adjustment
+- Install any compatible combination; shared writers use the audio-control lock
 
 ---
 

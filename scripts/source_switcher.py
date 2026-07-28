@@ -874,17 +874,17 @@ def ensure_audio_eq(
             updated, preamp = apply_audio_overlay(config, safe_state)
             if not _configs_equivalent(config, updated):
                 cdsp.config.set_active(updated)
-                _write_audio_eq_status(
-                    {
-                        **status_payload(
-                            state,
-                            applied=False,
-                            effective_preamp=preamp,
-                            error="ISO 226 engine capability is missing; loudness bypassed",
-                        ),
-                        "speaker": speaker_id,
-                    }
-                )
+            _write_audio_eq_status(
+                {
+                    **status_payload(
+                        state,
+                        applied=False,
+                        effective_preamp=preamp,
+                        error="ISO 226 engine capability is missing; loudness bypassed",
+                    ),
+                    "speaker": speaker_id,
+                }
+            )
             return
     updated, preamp = apply_audio_overlay(config, state)
     changed = not _configs_equivalent(config, updated)

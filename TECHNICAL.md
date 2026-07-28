@@ -295,13 +295,17 @@ journalctl -u cdsp-remote -f
 
 ## Can I Use Just One?
 
-Absolutely! The utilities are independent:
+Trigger control and MOTU clock sync are independent. The source switcher owns
+the persistent EQ overlay, so remote tone controls and web audio controls need
+it:
 
 - **Just Trigger** - For basic amp power control
 - **Just MOTU Sync** - If you only need clock management
 - **Just Source Switcher** - For automatic source selection
-- **Just Remote** - For volume/tone control via remote
-- **Any combination** - They don't interfere with each other
+- **Just Remote** - For volume, mute, and recovery controls; add Source Switcher
+  for persistent tone control
+- **Compatible combinations** - Shared volume writers serialize through the
+  audio-control lock
 
 ---
 

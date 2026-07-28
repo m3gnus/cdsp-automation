@@ -399,6 +399,8 @@ def shutdown_system() -> None:
 
 async def handle_remote_events(device) -> None:
     """Process events from the remote control device."""
+    global remote_device
+
     counter_volume = 0
     hold_started_at: dict[str, float] = {}
     hold_handled: set[str] = set()
@@ -509,8 +511,10 @@ async def handle_remote_events(device) -> None:
 
         except OSError as exc:
             print(f"Device error: {exc}. Attempting to reconnect...", flush=True)
+            close_remote_device(device)
             await asyncio.sleep(2)
             device = find_remote_device()
+            remote_device = device
             grab_device(device)
 
 
@@ -525,18 +529,24 @@ def grab_device(device) -> None:
         print(f"Remote input grab skipped: {exc}", flush=True)
 
 
+def close_remote_device(device) -> None:
+    """Best-effort release of an input device during reconnect or shutdown."""
+    if device is None:
+        return
+    try:
+        device.ungrab()
+    except Exception:
+        pass
+    try:
+        device.close()
+    except Exception:
+        pass
+
+
 def cleanup(signum=None, frame=None) -> None:
     """Clean up resources on exit."""
     print("\nShutting down...", flush=True)
-    if remote_device is not None:
-        try:
-            remote_device.ungrab()
-        except Exception:
-            pass
-        try:
-            remote_device.close()
-        except Exception:
-            pass
+    close_remote_device(remote_device)
     if cdsp:
         try:
             cdsp.disconnect()

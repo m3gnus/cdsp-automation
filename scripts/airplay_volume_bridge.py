@@ -496,9 +496,12 @@ class PlaybackArbiter:
             )
             return False
         other_service = SPOTIFY_SERVICE if source == "airplay" else AIRPLAY_SERVICE
-        self.owner = None
-        finish_network_playback()
+        # Keep ownership and its marker until the disabled receiver has been
+        # restored. If systemctl fails, a repeated stop can safely retry and
+        # the callback sees that the handoff did not complete.
         set_receiver_service(other_service, True)
+        finish_network_playback()
+        self.owner = None
         print(
             f"playback arbiter: {source} session ended; enabled {other_service}",
             flush=True,
@@ -697,14 +700,16 @@ def run_daemon() -> int:
                     camilla.connect()
                 for payload in payloads:
                     source, value = parse_bridge_message(payload)
-                    now = time.time()
+                    tracker_now = time.monotonic()
                     if source == "spotify_ack":
                         command_id, ack_volume = value
-                        if spotify_sync.acknowledge(command_id, ack_volume, now=now):
+                        if spotify_sync.acknowledge(
+                            command_id, ack_volume, now=tracker_now
+                        ):
                             status["spotify"].update(
                                 {
                                     "command_socket": True,
-                                    "last_ack_at": now,
+                                    "last_ack_at": time.time(),
                                     "last_cdsp_volume": ack_volume,
                                 }
                             )
@@ -746,21 +751,23 @@ def run_daemon() -> int:
                     )
                     # This also supersedes any older command still queued while
                     # librespot was disconnected. Silent application cannot echo.
-                    spotify_sync.queue(spotify_volume, last_camilla, now=now)
+                    spotify_sync.queue(
+                        spotify_volume, last_camilla, now=tracker_now
+                    )
 
                 current = read_mirrorable_camilla_volume(camilla)
                 if current is None:
                     status["spotify"]["paused_for_transition"] = True
                 else:
                     status["spotify"].pop("paused_for_transition", None)
-                now = time.time()
+                tracker_now = time.monotonic()
                 if current is not None and (
                     last_camilla is None or current != last_camilla
                 ):
                     spotify_volume = map_camilla_to_spotify(
                         current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
                     )
-                    spotify_sync.queue(spotify_volume, current, now=now)
+                    spotify_sync.queue(spotify_volume, current, now=tracker_now)
                     last_camilla = current
                     status.update(
                         {
@@ -770,23 +777,25 @@ def run_daemon() -> int:
                             "muted": current[1],
                         }
                     )
-                elif current is not None and spotify_sync.needs_heartbeat(now):
+                elif current is not None and spotify_sync.needs_heartbeat(
+                    tracker_now
+                ):
                     spotify_sync.queue(
                         map_camilla_to_spotify(
                             current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
                         ),
                         current,
-                        now=now,
+                        now=tracker_now,
                     )
 
-                if spotify_sync.should_send(now):
+                if spotify_sync.should_send(tracker_now):
                     pending = spotify_sync.pending
                     assert pending is not None
                     try:
                         send_spotify_volume(
                             int(pending["id"]), int(pending["volume"])
                         )
-                        spotify_sync.mark_sent(now)
+                        spotify_sync.mark_sent(tracker_now)
                     except OSError as exc:
                         status["spotify"].update(
                             {
@@ -797,7 +806,7 @@ def run_daemon() -> int:
                             }
                         )
                 receiver_socket = SPOTIFY_COMMAND_SOCKET_PATH.is_socket()
-                command_ready = spotify_sync.healthy(now)
+                command_ready = spotify_sync.healthy(tracker_now)
                 status["spotify"].update(
                     {
                         "receiver_socket": receiver_socket,

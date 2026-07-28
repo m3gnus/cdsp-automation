@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import subprocess
@@ -181,6 +182,23 @@ def test_audio_eq_ui_write_rejects_stale_revision(tmp_path: Path) -> None:
         else:
             raise AssertionError("stale audio state overwrite was accepted")
     assert 'data-tab="audio"' in web_ui.HTML
+
+
+def test_audio_eq_ui_write_rejects_non_integer_revision(tmp_path: Path) -> None:
+    state_path = tmp_path / "audio-eq.json"
+    initial = audio_eq.default_audio_state()
+    audio_eq.atomic_write_json(state_path, initial)
+
+    with patch.object(web_ui, "AUDIO_EQ_PATH", state_path):
+        for invalid in (True, 0.5, "0"):
+            candidate = copy.deepcopy(initial)
+            candidate["revision"] = invalid
+            try:
+                web_ui.write_audio_eq_state(candidate)
+            except ValueError as exc:
+                assert "revision must be an integer" in str(exc)
+            else:
+                raise AssertionError(f"non-integer revision was accepted: {invalid!r}")
 
 
 def test_audio_ui_uses_installed_profiles_and_exposes_load_failures() -> None:
@@ -429,6 +447,27 @@ def test_operator_profile_availability_uses_operator_configs(
         assert web_ui.source_status(
             {"config_file": str(operator_path)}
         )["current"] == "streamer"
+
+
+def test_source_status_does_not_trust_unmanaged_generated_filename(
+    tmp_path: Path,
+) -> None:
+    spoof = tmp_path / "streamer--spoof.yml"
+    spoof.write_text("devices: {}\n")
+    with (
+        patch.object(web_ui, "read_source_override", return_value=None),
+        patch.object(web_ui, "source_availability", return_value={}),
+        patch.object(web_ui, "CDSP_CONFIG_DIR", tmp_path / "configs"),
+        patch.object(web_ui, "SPEAKER_GENERATED_DIR", tmp_path / "generated"),
+    ):
+        status = web_ui.source_status({"config_file": str(spoof)})
+    assert status["current"] == "streamer--spoof"
+
+
+def test_parse_env_tolerates_disappearing_or_unreadable_file(tmp_path: Path) -> None:
+    path = tmp_path / "settings.env"
+    with patch.object(Path, "read_text", side_effect=OSError("unavailable")):
+        assert web_ui.parse_env(path) == {}
 
 
 def test_run_result_converts_subprocess_timeout_to_failure() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import inspect
 import io
 import os
 import subprocess
@@ -178,6 +179,26 @@ class VolumeSyncTests(unittest.TestCase):
                 ],
             )
 
+    def test_receiver_stop_keeps_retryable_state_when_peer_enable_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            active = Path(directory) / "active"
+            active.write_text("airplay-active\n")
+            arbiter = volume_sync.PlaybackArbiter()
+            arbiter.owner = "airplay"
+            with (
+                mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
+                mock.patch.object(
+                    volume_sync,
+                    "set_receiver_service",
+                    side_effect=RuntimeError("systemctl failed"),
+                ),
+                self.assertRaisesRegex(RuntimeError, "systemctl failed"),
+            ):
+                arbiter.stop("airplay")
+
+            self.assertEqual(arbiter.owner, "airplay")
+            self.assertEqual(active.read_text().strip(), "airplay-active")
+
 
 def test_airplay_volume_mapping_endpoints_curve_and_mute() -> None:
     assert volume_sync.map_airplay_volume(-144) == (-50.0, True)
@@ -224,6 +245,14 @@ def test_spotify_event_callback_forwards_volume_and_playback_lifecycle(monkeypat
         (b"spotify_session:stop", str(volume_sync.SOCKET_PATH)),
         (b"spotify_session:stop", str(volume_sync.SOCKET_PATH)),
     ]
+
+
+def test_spotify_tracker_deadlines_use_monotonic_time() -> None:
+    source = inspect.getsource(volume_sync.run_daemon)
+    assert "tracker_now = time.monotonic()" in source
+    assert "spotify_sync.acknowledge(\n" in source
+    assert "now=tracker_now" in source
+    assert "spotify_sync.healthy(tracker_now)" in source
 
 
 def test_spotify_mirror_pauses_before_reading_a_transition_mute(

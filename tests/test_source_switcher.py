@@ -277,6 +277,36 @@ def test_measurement_bypass_strips_user_eq_overlay() -> None:
     )
 
 
+def test_missing_iso226_capability_reports_bypass_when_config_is_already_safe() -> None:
+    state = audio_eq.default_audio_state()
+    state["loudness"]["enabled"] = True
+    safe_state = audio_eq.default_audio_state()
+    base = {
+        "devices": {"capture": {"channels": 2}},
+        "filters": {},
+        "pipeline": [],
+    }
+    safe_config, _preamp = audio_eq.apply_audio_overlay(base, safe_state)
+    config = mock.Mock()
+    config.active.return_value = safe_config
+    client = SimpleNamespace(config=config)
+    statuses: list[dict] = []
+
+    with (
+        patch.object(switcher, "iso226_capability_available", return_value=False),
+        patch.object(switcher, "_write_audio_eq_status", side_effect=statuses.append),
+    ):
+        switcher.ensure_audio_eq(
+            client,
+            speaker_id=speaker_profiles.DEFAULT_SPEAKER_ID,
+            state=state,
+        )
+
+    config.set_active.assert_not_called()
+    assert statuses[-1]["applied"] is False
+    assert "capability is missing" in statuses[-1]["error"]
+
+
 def test_speaker_config_switch_is_muted_validated_and_volume_clamped(
     tmp_path: Path,
 ) -> None:

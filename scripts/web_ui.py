@@ -1289,9 +1289,11 @@ def run_checked(command: list[str], timeout: float = 10.0) -> str:
 
 def parse_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    if not path.exists():
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
         return values
-    for line in path.read_text().splitlines():
+    for line in lines:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
@@ -1585,13 +1587,8 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
     config_file = camilla.get("config_file")
     current = None
     if isinstance(config_file, str):
-        stem = Path(config_file).stem
-        source = stem.split("--", 1)[0]
-        if source in SOURCE_CHOICES:
-            current = source
-        else:
-            identity = managed_config_identity(config_file)
-            current = identity[0] if identity is not None else stem
+        identity = managed_config_identity(config_file)
+        current = identity[0] if identity is not None else Path(config_file).stem
 
     return {
         "mode": override or "auto",
@@ -2022,10 +2019,10 @@ def write_audio_eq_state(raw: Any, *, expected_speaker: str | None = None) -> di
             raise ValueError("speaker selection changed elsewhere; reload before saving")
         current = read_audio_state(audio_path)
         incoming_revision = raw.get("revision", current["revision"])
-        try:
-            incoming_revision = int(incoming_revision)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("revision must be an integer") from exc
+        if isinstance(incoming_revision, bool) or not isinstance(
+            incoming_revision, int
+        ):
+            raise ValueError("revision must be an integer")
         if incoming_revision != current["revision"]:
             raise ValueError("audio settings changed elsewhere; reload before saving")
         clean = normalize_audio_state(raw, revision=current["revision"] + 1)
