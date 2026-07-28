@@ -75,7 +75,7 @@ SOURCE_OVERRIDE_OWNER_PATH = Path(
 SOURCE_OVERRIDE_LOCK_PATH = Path(
     os.environ.get("SOURCE_OVERRIDE_LOCK_PATH", f"{SOURCE_OVERRIDE_PATH}.lock")
 )
-UI_SERVICE = "installation-control-ui.service"
+UI_SERVICE = "cdsp-control-ui.service"
 AUDIO_EQ_PATH = Path(
     os.environ.get("AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json")
 )
@@ -2259,7 +2259,7 @@ def service_action(service: str, action: str) -> str:
         raise ValueError("action not allowed")
 
     if service == UI_SERVICE and action == "restart":
-        unit = f"installation-control-ui-self-restart-{int(time.time())}"
+        unit = f"cdsp-control-ui-self-restart-{int(time.time())}"
         return run_checked(
             [
                 "systemd-run",
