@@ -110,6 +110,15 @@ def test_raw_measurement_contract_rejects_every_filter_layer() -> None:
         },
     }
     profile = speaker_config.normalize_profile(raw)
+    # Compatibility contract: a hand-authored capabilities block is accepted
+    # but its retired contents must never reach the catalog or the API.
+    assert profile["capabilities"] == {}
+    try:
+        speaker_config.normalize_profile({**raw, "capabilities": "nope"})
+    except ValueError as exc:
+        assert "capabilities" in str(exc)
+    else:
+        raise AssertionError("non-object capabilities block accepted")
     source = {"devices": {"capture": {"channels": 2}}, "filters": {}, "pipeline": []}
     compiled = speaker_config.compile_profile_config(
         source, profile, audio_eq.default_audio_state(), source_id="streamer"

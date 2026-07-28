@@ -150,7 +150,11 @@ def test_parametric_crossover_rejects_unsafe_geometry() -> None:
             "outputs": [0, 1],
         }]),
         spec(ways=[{"name": "a", "lowpass": {"freq": 300, "slope": "LR36"}, "outputs": [0, 1]}]),
-        spec(ways=[{"name": f"w{i}", "outputs": [2 * i, 2 * i + 1]} for i in range(5)]),
+        # Wide enough that only the way-count limit can reject this one.
+        spec(
+            playback={"device": "hw:test", "channels": 10},
+            ways=[{"name": f"w{i}", "outputs": [2 * i, 2 * i + 1]} for i in range(5)],
+        ),
         spec(ways=[{"name": "a", "outputs": [0, 1], "buzz": 1}]),
     ]
     for broken in failures:

@@ -72,6 +72,24 @@ def test_shairport_configurator_accepts_missing_or_commented_dsp_block() -> None
         assert configure_shairport.update_general_block(first, None) == initial
 
 
+def test_cli_install_then_remove_round_trips_a_config_without_an_alsa_block(
+    tmp_path: Path,
+) -> None:
+    """The installer's own two argument forms, on a stock shairport config."""
+    initial = 'general =\n{\n    name = "Pi";\n};\n'
+    config = tmp_path / "shairport-sync.conf"
+    config.write_text(initial, encoding="utf-8")
+    callback = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify"
+
+    assert configure_shairport.main([str(config), callback]) == 0
+    managed = config.read_text(encoding="utf-8")
+    assert 'ignore_volume_control = "yes"' in managed
+
+    assert configure_shairport.main(["--remove", str(config)]) == 0
+    assert config.read_text(encoding="utf-8") == initial
+    assert "UGLAN" not in config.read_text(encoding="utf-8")
+
+
 def test_shairport_configurator_adds_and_removes_missing_diagnostics_block() -> None:
     initial = 'general =\n{\n    name = "UGLAN";\n};\n'
     callback = "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify"

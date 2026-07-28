@@ -202,6 +202,34 @@ def test_partymeh_uses_source_specific_operator_owned_configs(tmp_path: Path) ->
             assert target["max_volume_db"] == 0.0
 
 
+def test_validate_config_file_reports_the_rejection_reason(tmp_path: Path) -> None:
+    """The camilladsp -c gate before a config goes live, actually executed.
+
+    Every other test patches this out, so without this the interlock could be
+    a no-op and the suite would stay green.
+    """
+    config = tmp_path / "streamer.yml"
+    config.write_text("devices: {}\n")
+    rejecting = tmp_path / "camilladsp-reject"
+    rejecting.write_text("#!/bin/sh\necho 'Error: bad samplerate' >&2\nexit 1\n")
+    rejecting.chmod(0o755)
+    accepting = tmp_path / "camilladsp-accept"
+    accepting.write_text("#!/bin/sh\nexit 0\n")
+    accepting.chmod(0o755)
+
+    with patch.object(switcher, "CAMILLA_BINARY", str(rejecting)):
+        try:
+            switcher.validate_config_file(config)
+        except ValueError as exc:
+            assert "streamer.yml" in str(exc)
+            assert "bad samplerate" in str(exc)
+        else:
+            raise AssertionError("a rejected config passed validation")
+
+    with patch.object(switcher, "CAMILLA_BINARY", str(accepting)):
+        switcher.validate_config_file(config)
+
+
 def test_active_profile_becoming_unavailable_fails_closed(tmp_path: Path) -> None:
     client = SimpleNamespace(volume=FakeSwitcherVolume(mute=False))
     statuses: list[dict] = []
@@ -499,7 +527,7 @@ def test_speaker_config_switch_rolls_back_and_latches_mute_on_failure(
     with (
         patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
         patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
-        patch.dict(switcher.CONFIGS, {"streamer": str(previous)}, clear=True),
+        patch.object(switcher, "CONFIG_DIR", str(tmp_path)),
         patch.object(switcher, "validate_config_file"),
         patch.object(switcher, "_write_speaker_status", side_effect=statuses.append),
         patch.object(switcher.time, "sleep"),
@@ -690,10 +718,6 @@ def test_apply_config_publishes_selection_revision(tmp_path: Path) -> None:
     assert statuses[-1]["selection_revision"] == 7
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def test_catalog_default_speaker_uses_the_plain_source_configs(tmp_path: Path) -> None:
     """A site catalog's default speaker plays through the existing configs."""
     plain = tmp_path / "streamer.yml"
@@ -707,3 +731,7 @@ def test_catalog_default_speaker_uses_the_plain_source_configs(tmp_path: Path) -
     assert target["legacy"] is True
     assert target["path"] == str(plain)
     assert target["max_volume_db"] == 0.0
+
+
+if __name__ == "__main__":
+    unittest.main()

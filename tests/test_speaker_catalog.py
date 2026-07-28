@@ -20,6 +20,13 @@ if "camilladsp" not in sys.modules:
 from scripts import speaker_profiles
 
 
+# conftest pins this at a nonexistent path so imports stay hermetic; restore
+# that instead of unsetting, which would fall back to the real /etc lookup.
+HERMETIC_CATALOG_PATH = os.environ.get(
+    "SPEAKER_CATALOG_PATH", "/nonexistent/speaker-catalog.json"
+)
+
+
 def _reload_with_catalog(path: str) -> None:
     os.environ["SPEAKER_CATALOG_PATH"] = path
     importlib.reload(speaker_profiles)
@@ -108,7 +115,7 @@ class SpeakerCatalogNormalizationTests(unittest.TestCase):
 
 class SpeakerCatalogLoadTests(unittest.TestCase):
     def tearDown(self) -> None:
-        os.environ.pop("SPEAKER_CATALOG_PATH", None)
+        os.environ["SPEAKER_CATALOG_PATH"] = HERMETIC_CATALOG_PATH
         importlib.reload(speaker_profiles)
 
     def test_missing_catalog_keeps_builtins(self) -> None:

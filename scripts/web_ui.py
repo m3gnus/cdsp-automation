@@ -29,7 +29,7 @@ from audio_eq import (
 )
 from speaker_config import (
     compile_profile_config,
-    config_digest,
+    identify_managed_config,
     load_profile,
     load_yaml_mapping,
     profile_catalog,
@@ -37,7 +37,6 @@ from speaker_config import (
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
-    OPERATOR_CONFIG_SPEAKERS,
     audio_control_lock,
     operator_configs_for_speaker,
     read_profile_audio_state,
@@ -657,9 +656,9 @@ HTML = r"""<!doctype html>
     }
 
     /* ---------------- rendering ---------------- */
-    function tile(cap, val, cls = "", sub = "", valExtra = "") {
+    function tile(cap, val, cls = "", sub = "") {
       return `<div class="tile"><div class="cap">${cap}</div>
-        <div class="val ${cls}">${val}${valExtra}</div>${sub ? `<div class="sub2">${sub}</div>` : ""}</div>`;
+        <div class="val ${cls}">${val}</div>${sub ? `<div class="sub2">${sub}</div>` : ""}</div>`;
     }
 
     function renderHealth(data) {
@@ -677,7 +676,7 @@ HTML = r"""<!doctype html>
       const c = data.camilla || {};
       const src = data.source || {};
       const state = c.error ? "error" : (c.state || serviceText(data.services["camilladsp.service"]));
-      const stCls = c.error ? "bad" : (state === "RUNNING" ? "ok" : (state === "PAUSED" ? "warn" : "warn"));
+      const stCls = c.error ? "bad" : (state === "RUNNING" ? "ok" : "warn");
       const vol = c.volume_db != null ? Number(c.volume_db).toFixed(1) : "—";
       const activeSrc = src.current ? (src.current[0].toUpperCase() + src.current.slice(1)) : (c.config_title || "—");
       qs("#heroGrid").innerHTML =
@@ -943,9 +942,13 @@ HTML = r"""<!doctype html>
       const dashboard=qs("#dashboardSpeaker");
       if (dashboard) {
         const active=selected.available&&status.applied===selection.selected&&status.ok&&speakerState.ready;
+        // The 5s status poll re-renders this panel; keep a target the operator
+        // already picked instead of snapping the list back to the live profile.
+        const pendingTarget=qs("#dashboardSpeakerTarget")?.value;
         const options=Object.values(catalog).map(p=>`<option value="${esc(p.id)}" ${p.id===selection.selected?"selected":""} ${p.available?"":"disabled"}>${esc(p.label||p.id)}${p.available?"":" — unavailable"}</option>`).join("");
         dashboard.innerHTML=`<div class="active-name">${esc(selected.label||selection.selected||"—")}</div><div><span class="badge ${active?"ok":"warn"}">${active?"active":"transition / inhibited"}</span></div><select id="dashboardSpeakerTarget" aria-label="Target speaker profile">${options}</select><button class="btn danger" id="dashboardSpeakerChange" disabled>Review profile change…</button><div class="sub2">Changing this is intentionally a confirmed maintenance action.</div>${error}`;
         const target=qs("#dashboardSpeakerTarget"), change=qs("#dashboardSpeakerChange");
+        if (pendingTarget && catalog[pendingTarget]?.available) target.value=pendingTarget;
         const sync=()=>{ change.disabled=!target.value||target.value===selection.selected; };
         target.addEventListener("change",sync); sync();
         change.addEventListener("click",()=>requestSpeakerChange(target.value));
@@ -981,7 +984,8 @@ HTML = r"""<!doctype html>
         speakerState=result.speaker; qs("#speakerConfirm").close(); renderSpeakerProfiles(); audioLoaded=false; await loadAudio();
         [1000,2500,5000].forEach(delay => setTimeout(() => { if (!audioDirty && !audioSaving) loadAudio(); }, delay));
       } catch(e) { toast(e.message); await loadAudio(); }
-      finally { apply.textContent="Mute and switch profile"; }
+      // Re-arm the button on failure; the dialog stays open for another try.
+      finally { apply.textContent="Mute and switch profile"; apply.disabled=qs("#speakerConfirmText").value.trim()!=="SWITCH"; }
     }
 
     function setAudioAvailable(available, message="") {
@@ -1222,9 +1226,9 @@ HTML = r"""<!doctype html>
       if (name === "logs") refreshLogs();
       if (name === "audio" && !audioLoaded) loadAudio();
     }
-    qsa("nav button").forEach(b => b.addEventListener("click", () => {
-      location.hash = b.dataset.tab; activateTab(b.dataset.tab);
-    }));
+    // Only the hash drives tab activation; calling activateTab here too would
+    // duplicate the tab's initial fetch (two /api/logs or /api/audio requests).
+    qsa("nav button").forEach(b => b.addEventListener("click", () => { location.hash = b.dataset.tab; }));
     window.addEventListener("hashchange", () => activateTab(location.hash.slice(1)));
     qs("#refreshLogs").addEventListener("click", refreshLogs);
     qs("#logUnit").addEventListener("change", refreshLogs);
@@ -1251,7 +1255,11 @@ HTML = r"""<!doctype html>
     animateEq();
     if (location.hash.slice(1)) activateTab(location.hash.slice(1));
     load().catch(e => toast(e.message));
-    setInterval(() => load().catch(() => {}), 5000);
+    // A backgrounded phone must not keep the Pi spawning a status sweep every
+    // 5s; refresh immediately instead when the page becomes visible again.
+    const refresh = () => { if (!document.hidden) load().catch(() => {}); };
+    setInterval(refresh, 5000);
+    document.addEventListener("visibilitychange", refresh);
     setInterval(pollLevels, 800);
   </script>
 </body>
@@ -1850,39 +1858,12 @@ def require_active_source_supported(
 
 def managed_config_identity(current: Any) -> tuple[str, str] | None:
     """Match exact legacy, operator-owned, or generated DSP configs."""
-    if not isinstance(current, str) or not current:
-        return None
-    current_absolute = os.path.abspath(current)
-    for source in SOURCE_CHOICES:
-        target = CDSP_CONFIG_DIR / f"{source}.yml"
-        if current_absolute == os.path.abspath(target):
-            return source, DEFAULT_SPEAKER_ID
-    for speaker_id in OPERATOR_CONFIG_SPEAKERS:
-        for source, filename in operator_configs_for_speaker(speaker_id).items():
-            if current_absolute == os.path.abspath(CDSP_CONFIG_DIR / filename):
-                return source, speaker_id
-    path = Path(current).resolve(strict=False)
-    generated_root = SPEAKER_GENERATED_DIR.resolve(strict=False)
-    if path.parent.parent != generated_root:
-        return None
-    digest = path.parent.name
-    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        return None
-    parts = path.stem.split("--", 1)
-    if (
-        len(parts) != 2
-        or parts[0] not in SOURCE_CHOICES
-        or parts[1] not in BUILTIN_SPEAKERS
-        or parts[1] == DEFAULT_SPEAKER_ID
-    ):
-        return None
-    try:
-        config = load_yaml_mapping(path, "managed generated config")
-    except (OSError, ValueError):
-        return None
-    if config_digest(config) != digest:
-        return None
-    return parts[0], parts[1]
+    return identify_managed_config(
+        current,
+        config_dir=CDSP_CONFIG_DIR,
+        generated_dir=SPEAKER_GENERATED_DIR,
+        default_speaker_id=DEFAULT_SPEAKER_ID,
+    )
 
 
 def select_speaker(raw: Any) -> dict[str, Any]:
@@ -1906,10 +1887,7 @@ def select_speaker(raw: Any) -> dict[str, Any]:
     def inhibit_and_mute(updated: dict[str, Any]) -> None:
         # Called by update_speaker_selection only after its revision check has
         # succeeded, while both the audio and selection locks are held.
-        set_audio_inhibit(
-            AUDIO_READY_PATH,
-            {"reason": "speaker selected", "target": speaker_id},
-        )
+        set_audio_inhibit(AUDIO_READY_PATH)
         with camilla_client() as client:
             restore_mute = bool(client.volume.main_mute())
             atomic_write_json(

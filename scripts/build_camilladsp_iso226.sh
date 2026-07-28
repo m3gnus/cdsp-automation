@@ -82,7 +82,8 @@ if ! systemctl is-active --quiet camilladsp.service || [[ ! "$pid" =~ ^[1-9][0-9
   rollback
   exit 1
 fi
-sudo install -d -m 0750 -o "$USER" -g "$USER" /var/lib/cdsp-automation
+install_user="$(id -un)"
+sudo install -d -m 0750 -o "$install_user" -g "$install_user" /var/lib/cdsp-automation
 marker="$BUILD_DIR/iso226-engine.json"
 binary_sha256="$(sha256sum "$CANDIDATE" | awk '{print $1}')"
 printf '{"engine":"Iso226","upstream_commit":"%s","binary_sha256":"%s","installed_at":%s}\n' "$UPSTREAM_COMMIT" "$binary_sha256" "$(date +%s)" > "$marker"

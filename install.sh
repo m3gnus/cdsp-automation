@@ -39,6 +39,9 @@ default_env() {
 # This file is preserved when scripts are updated.
 CDSP_HOST=127.0.0.1
 CDSP_PORT=1234
+# The control UI runs as root, so it cannot derive these from \$HOME.
+CDSP_CONFIG_DIR=$CONFIGS_DIR
+CDSP_AUTOMATION_ENV=$ENV_FILE
 POWER_GPIO=4
 TRIGGER_DELAY_SECONDS=320
 TRIGGER_CHECK_INTERVAL=0.2
@@ -148,7 +151,9 @@ install_dependencies() {
   sudo apt install -y python3-venv python3-rpi-lgpio alsa-utils bluez wget curl git cargo build-essential pkg-config libasound2-dev libssl-dev
 
   export PATH="$HOME/.cargo/bin:$PATH"
-  if ! rustc --version 2>/dev/null | awk '{print $2}' | awk -F. '{exit !($1 > 1 || ($1 == 1 && $2 >= 90))}'; then
+  # Without the command check awk sees no input, never runs its action, and
+  # exits 0 — so a missing rustc would silently look new enough.
+  if ! command -v rustc >/dev/null 2>&1 || ! rustc --version | awk '{print $2}' | awk -F. '{exit !($1 > 1 || ($1 == 1 && $2 >= 90))}'; then
     echo "Installing the pinned Rust 1.90 toolchain required by CamillaDSP 4.1.3..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.90.0
   fi
@@ -377,7 +382,7 @@ install_remote() {
   echo "   - LEFT/RIGHT arrows: Adjust bass (+/-0.5 dB)"
   echo "   - ENTER (short): Show current status"
   echo "   - ENTER (hold ~1s): Reset bass/treble to 0 dB"
-  echo "   - POWER (hold ~1s): Restart all services"
+  echo "   - POWER (hold ~1s): Restart CamillaDSP, GUI, MOTU sync and the switcher"
   echo "   - POWER (hold ~10s): Shutdown system"
   echo ""
   echo "NOTE: log out/in or reboot if this installer just added your user to the input group."
@@ -505,7 +510,7 @@ show_status() {
   echo "Service Status"
   echo "============================================="
   local service
-  for service in "${CDSP_SERVICES[@]}"; do
+  for service in "${CDSP_SERVICES[@]}" cdsp-control-ui; do
     systemctl status "${service}.service" --no-pager || true
   done
 }
@@ -526,7 +531,7 @@ uninstall_all() {
     "$SCRIPTS_DIR/build_librespot_volume_sync.sh" --uninstall || true
   fi
   if [[ -f /etc/shairport-sync.conf && -f "$SCRIPTS_DIR/configure_shairport.py" ]]; then
-    sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" --remove /etc/shairport-sync.conf
+    sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" --remove /etc/shairport-sync.conf || true
     sudo systemctl restart shairport-sync.service || true
   fi
   sudo systemctl stop cdsp-control-ui.service 2>/dev/null || true

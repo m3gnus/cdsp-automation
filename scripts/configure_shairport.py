@@ -261,7 +261,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if remove:
             path = Path(argv[1])
-            configure(path, None, "uglan_main")
+            # Strip exactly what install writes. Naming an output device here
+            # would demand an alsa block that installation never creates, so
+            # removal failed outright on stock configs that have none.
+            configure(path, None, None)
             print(f"Removed managed AirPlay settings from {path}")
             return 0
         backup = configure(Path(argv[0]), argv[1], argv[2] if len(argv) == 3 else None)

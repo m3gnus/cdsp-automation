@@ -19,6 +19,7 @@ from audio_eq import apply_audio_overlay, audio_state_lock
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     LEGACY_SPEAKER_ID,
+    OPERATOR_CONFIG_SPEAKERS,
     normalize_speaker_id,
     operator_configs_for_speaker,
 )
@@ -571,6 +572,53 @@ def _validate_output_contract(config: dict[str, Any], profile: dict[str, Any]) -
 def config_digest(config: dict[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def identify_managed_config(
+    current: Any,
+    *,
+    config_dir: Path,
+    generated_dir: Path,
+    default_speaker_id: str,
+) -> tuple[str, str] | None:
+    """Map a live CamillaDSP config path to its ``(source, speaker)`` identity.
+
+    Recognizes the default speaker's full configs, operator-owned profile
+    configs, and generated configs whose parent directory name still matches
+    the digest of the file's own content.  Everything else is unmanaged, so
+    both the switcher and the control UI must refuse to reason about it.
+    """
+    if not isinstance(current, str) or not current:
+        return None
+    current_absolute = os.path.abspath(current)
+    for source in SOURCE_IDS:
+        if current_absolute == os.path.abspath(config_dir / f"{source}.yml"):
+            return source, default_speaker_id
+    for speaker_id in OPERATOR_CONFIG_SPEAKERS:
+        for source, filename in operator_configs_for_speaker(speaker_id).items():
+            if current_absolute == os.path.abspath(config_dir / filename):
+                return source, speaker_id
+    path = Path(current).resolve(strict=False)
+    if path.parent.parent != Path(generated_dir).resolve(strict=False):
+        return None
+    digest = path.parent.name
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        return None
+    parts = path.stem.split("--", 1)
+    if (
+        len(parts) != 2
+        or parts[0] not in SOURCE_IDS
+        or parts[1] not in BUILTIN_SPEAKERS
+        or parts[1] == default_speaker_id
+    ):
+        return None
+    try:
+        config = load_yaml_mapping(path, "managed generated config")
+    except (OSError, ValueError):
+        return None
+    if config_digest(config) != digest:
+        return None
+    return parts[0], parts[1]
 
 
 def write_generated_config(

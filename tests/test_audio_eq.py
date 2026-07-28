@@ -270,6 +270,39 @@ def test_audio_state_strict_booleans_versions_and_headroom_range() -> None:
     normalized = audio_eq.normalize_audio_state(legacy)
     assert "stereo" not in normalized
 
+    # Config-side counterpart: overlay composition must also strip the filters
+    # and pipeline step that the retired program left in generated configs.
+    stale = {
+        "devices": {"capture": {"channels": 2}},
+        "filters": {
+            "uglan_stereo_eq_01_low": {"type": "Biquad", "parameters": {}},
+            "keep_me": {"type": "Gain", "parameters": {"gain": -3}},
+        },
+        "pipeline": [
+            {
+                "type": "Filter",
+                "channels": [0, 1],
+                "names": ["uglan_stereo_eq_01_low"],
+                "description": "UGLAN stereo system EQ (owned by source switcher)",
+            },
+            {"type": "Filter", "channels": [0, 1], "names": ["keep_me"]},
+        ],
+    }
+    cleaned, _preamp = audio_eq.apply_audio_overlay(
+        stale, audio_eq.default_audio_state()
+    )
+    assert "uglan_stereo_eq_01_low" not in cleaned["filters"]
+    assert "keep_me" in cleaned["filters"]
+    assert not [
+        step
+        for step in cleaned["pipeline"]
+        if "stereo system EQ" in str(step.get("description", ""))
+        or any(
+            str(name).startswith("uglan_stereo_eq_")
+            for name in step.get("names", [])
+        )
+    ]
+
 
 def test_audio_state_reports_the_installed_unity_linear_airplay_path() -> None:
     state = audio_eq.default_audio_state()

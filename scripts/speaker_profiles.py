@@ -256,8 +256,8 @@ def audio_inhibit_active(path: Path) -> bool:
     return not Path(path).is_file()
 
 
-def set_audio_inhibit(path: Path, payload: dict[str, Any]) -> None:
-    del payload
+def set_audio_inhibit(path: Path) -> None:
+    """Drop the ready token; absence alone is what inhibits unmuting."""
     Path(path).unlink(missing_ok=True)
 
 

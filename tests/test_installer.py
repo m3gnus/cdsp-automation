@@ -103,6 +103,29 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             storage,
         )
 
+    def test_default_env_points_the_control_ui_at_the_installed_base_dir(self) -> None:
+        """The UI unit has no User=, so it cannot resolve these from $HOME."""
+        with tempfile.TemporaryDirectory() as directory:
+            command = f"""
+set -euo pipefail
+export HOME={directory!s}
+export CDSP_AUTOMATION_BASE_DIR={directory!s}/site
+source {INSTALLER!s}
+default_env
+"""
+            result = subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy(),
+            )
+            rendered = result.stdout.splitlines()
+            self.assertIn(f"CDSP_CONFIG_DIR={directory}/site/configs", rendered)
+            self.assertIn(
+                f"CDSP_AUTOMATION_ENV={directory}/site/cdsp-automation.env", rendered
+            )
+
     def test_control_ui_unit_runs_web_ui_from_the_managed_venv(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         heredoc = installer.split("install_control_ui()", 1)[1].split(

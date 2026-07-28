@@ -478,7 +478,8 @@ The installer menu provides these options:
 9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the CamillaDSP fader
 10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build
 11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
-12. **Uninstall All Utilities** - Remove everything
+12. **Uninstall All Utilities** - Remove the services, units and sudoers rule.
+    Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
 
 ### What Gets Installed
 

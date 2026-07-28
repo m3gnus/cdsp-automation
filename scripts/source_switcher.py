@@ -29,6 +29,7 @@ from audio_eq import (
 from speaker_config import (
     compile_profile_config,
     config_digest,
+    identify_managed_config,
     load_profile,
     load_yaml_mapping,
     prune_generated_configs,
@@ -38,7 +39,6 @@ from speaker_config import (
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
-    OPERATOR_CONFIG_SPEAKERS,
     audio_control_lock,
     audio_inhibit_active,
     clear_audio_inhibit,
@@ -47,7 +47,6 @@ from speaker_profiles import (
     set_audio_inhibit,
     speaker_selection_lock,
     operator_config_for_source,
-    operator_configs_for_speaker,
 )
 
 
@@ -377,37 +376,12 @@ def same_config(current: str | None, target: str) -> bool:
 
 def managed_config_identity(current: str | None) -> tuple[str, str] | None:
     """Identify exact legacy, operator-owned, or generated configs."""
-    for source, target in CONFIGS.items():
-        if same_config(current, target):
-            return source, DEFAULT_SPEAKER_ID
-    for speaker_id in OPERATOR_CONFIG_SPEAKERS:
-        for source, filename in operator_configs_for_speaker(speaker_id).items():
-            if same_config(current, os.path.join(CONFIG_DIR, filename)):
-                return source, speaker_id
-    if not current:
-        return None
-    path = Path(current).resolve(strict=False)
-    generated_root = SPEAKER_GENERATED_DIR.resolve(strict=False)
-    if path.parent.parent != generated_root:
-        return None
-    digest = path.parent.name
-    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
-        return None
-    parts = path.stem.split("--", 1)
-    if (
-        len(parts) != 2
-        or parts[0] not in CONFIGS
-        or parts[1] not in BUILTIN_SPEAKERS
-        or parts[1] == DEFAULT_SPEAKER_ID
-    ):
-        return None
-    try:
-        config = load_yaml_mapping(path, "managed generated config")
-    except (OSError, ValueError):
-        return None
-    if config_digest(config) != digest:
-        return None
-    return parts[0], parts[1]
+    return identify_managed_config(
+        current,
+        config_dir=Path(CONFIG_DIR),
+        generated_dir=SPEAKER_GENERATED_DIR,
+        default_speaker_id=DEFAULT_SPEAKER_ID,
+    )
 
 
 def source_for_config(current: str | None) -> str | None:
@@ -496,14 +470,7 @@ def require_selected_profile_available(
                 f"selected speaker profile {selected_speaker!r} became unavailable: "
                 f"{selected_entry.get('reason') or 'unknown reason'}"
             )
-            set_audio_inhibit(
-                AUDIO_READY_PATH,
-                {
-                    "reason": "selected profile unavailable",
-                    "target": selected_speaker,
-                    "updated_at": time.time(),
-                },
-            )
+            set_audio_inhibit(AUDIO_READY_PATH)
             cdsp.volume.set_main_mute(True)
             _write_speaker_status(
                 {
@@ -938,15 +905,7 @@ def apply_config(
             audio_guard = audio_control_lock(AUDIO_CONTROL_LOCK_PATH)
             audio_guard.__enter__()
             audio_guard_entered = True
-        set_audio_inhibit(
-            AUDIO_READY_PATH,
-            {
-                "reason": "config transition",
-                "target": target.get("speaker") if target else None,
-                "source": target.get("source") if target else None,
-                "updated_at": time.time(),
-            },
-        )
+        set_audio_inhibit(AUDIO_READY_PATH)
         previous_mute = (
             bool(cdsp.volume.main_mute())
             if restore_mute is None
@@ -1060,10 +1019,7 @@ def apply_config(
         # Failure handling is fail-closed before any rollback I/O. The ready
         # token stays absent even if the mute RPC response is ambiguous.
         try:
-            set_audio_inhibit(
-                AUDIO_READY_PATH,
-                {"reason": "config transition failed", "updated_at": time.time()},
-            )
+            set_audio_inhibit(AUDIO_READY_PATH)
             cdsp.volume.set_main_mute(True)
         except Exception:
             pass
@@ -1151,10 +1107,7 @@ def main() -> int:
         flush=True,
     )
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        set_audio_inhibit(
-            AUDIO_READY_PATH,
-            {"reason": "source switcher startup", "updated_at": time.time()},
-        )
+        set_audio_inhibit(AUDIO_READY_PATH)
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
     motu = (
         MotuMeterReader(MOTU_WS_URL)
@@ -1267,15 +1220,7 @@ def main() -> int:
                         if startup_restore_mute is not None
                         else bool(cdsp.volume.main_mute())
                     )
-                    set_audio_inhibit(
-                        AUDIO_READY_PATH,
-                        {
-                            "reason": "speaker transition",
-                            "target": selected_speaker,
-                            "source": current_source,
-                            "updated_at": time.time(),
-                        },
-                    )
+                    set_audio_inhibit(AUDIO_READY_PATH)
                     cdsp.volume.set_main_mute(True)
                     if not current_source:
                         error = (
