@@ -36,6 +36,7 @@ class ClockSyncTests(unittest.TestCase):
             48000,
         )
         self.assertIsNone(clock_sync.current_sample_rate({"devices": {"samplerate": 0}}))
+        self.assertIsNone(clock_sync.current_sample_rate({"devices": None}))
         self.assertIsNone(clock_sync.current_sample_rate(None))
 
     def test_motu_failure_is_reported_to_caller_for_retry(self) -> None:

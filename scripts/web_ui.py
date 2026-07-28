@@ -45,6 +45,7 @@ from speaker_profiles import (
     require_audio_unmute_allowed,
     resolve_profile_audio_path,
     set_audio_inhibit,
+    speaker_selection_lock,
     update_speaker_selection,
 )
 
@@ -1952,12 +1953,7 @@ def audio_eq_payload() -> dict[str, Any]:
     except ValueError as exc:
         state = default_audio_state()
         state_error = str(exc)
-    try:
-        status = json.loads(AUDIO_EQ_STATUS_PATH.read_text(encoding="utf-8"))
-        if not isinstance(status, dict):
-            status = {}
-    except (OSError, json.JSONDecodeError):
-        status = {}
+    status = _read_json_object(AUDIO_EQ_STATUS_PATH)
     if state_error:
         status = {**status, "applied": False, "error": state_error}
     try:
@@ -2033,29 +2029,28 @@ def write_audio_eq_state(raw: Any, *, expected_speaker: str | None = None) -> di
             raise ValueError(
                 "install and verify the custom ISO 226 CamillaDSP engine first"
             )
-    selection = current_speaker_selection()
-    if expected_speaker is not None and expected_speaker != selection["selected"]:
-        raise ValueError("speaker selection changed elsewhere; reload before saving")
-    audio_path = _selected_audio_path(selection)
-    with audio_state_lock(audio_path):
-        if current_speaker_selection() != selection:
+    with speaker_selection_lock(SPEAKER_SELECTION_PATH):
+        selection = current_speaker_selection()
+        if expected_speaker is not None and expected_speaker != selection["selected"]:
             raise ValueError("speaker selection changed elsewhere; reload before saving")
-        current = read_audio_state(audio_path)
-        incoming_revision = raw.get("revision", current["revision"])
-        if isinstance(incoming_revision, bool) or not isinstance(
-            incoming_revision, int
-        ):
-            raise ValueError("revision must be an integer")
-        if incoming_revision != current["revision"]:
-            raise ValueError("audio settings changed elsewhere; reload before saving")
-        clean = normalize_audio_state(raw, revision=current["revision"] + 1)
-        _backup_file(
-            audio_path,
-            AUDIO_EQ_BACKUP_DIR,
-            f"audio-eq-{selection['selected']}",
-        )
-        atomic_write_json(audio_path, clean)
-        return clean
+        audio_path = _selected_audio_path(selection)
+        with audio_state_lock(audio_path):
+            current = read_audio_state(audio_path)
+            incoming_revision = raw.get("revision", current["revision"])
+            if isinstance(incoming_revision, bool) or not isinstance(
+                incoming_revision, int
+            ):
+                raise ValueError("revision must be an integer")
+            if incoming_revision != current["revision"]:
+                raise ValueError("audio settings changed elsewhere; reload before saving")
+            clean = normalize_audio_state(raw, revision=current["revision"] + 1)
+            _backup_file(
+                audio_path,
+                AUDIO_EQ_BACKUP_DIR,
+                f"audio-eq-{selection['selected']}",
+            )
+            atomic_write_json(audio_path, clean)
+            return clean
 
 
 def service_action(service: str, action: str) -> str:

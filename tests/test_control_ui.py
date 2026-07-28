@@ -8,7 +8,7 @@ import json
 import math
 import subprocess
 import sys
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -136,6 +136,40 @@ def test_web_audio_state_follows_selected_speaker_profile(tmp_path: Path) -> Non
     assert not (audio_dir / "kantarellen.json").exists()
 
 
+def test_web_audio_save_holds_speaker_selection_lock_through_commit(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "audio-eq.json"
+    selection_path = tmp_path / "selection.json"
+    audio_eq.atomic_write_json(state_path, audio_eq.default_audio_state())
+    selection_locked = False
+
+    @contextmanager
+    def selection_lock(path: Path):
+        nonlocal selection_locked
+        assert path == selection_path
+        selection_locked = True
+        try:
+            yield
+        finally:
+            selection_locked = False
+
+    def guarded_write(path: Path, payload: dict, mode: int = 0o644) -> None:
+        assert selection_locked
+        audio_eq.atomic_write_json(path, payload, mode)
+
+    with (
+        patch.object(web_ui, "AUDIO_EQ_PATH", state_path),
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", selection_path),
+        patch.object(web_ui, "speaker_selection_lock", side_effect=selection_lock),
+        patch.object(web_ui, "atomic_write_json", side_effect=guarded_write),
+    ):
+        saved = web_ui.write_audio_eq_state(audio_eq.default_audio_state())
+
+    assert saved["revision"] == 1
+    assert selection_locked is False
+
+
 def test_web_speaker_selection_mutes_and_removes_ready_token(tmp_path: Path) -> None:
     selection_path = tmp_path / "selection.json"
     ready_path = tmp_path / "ready.json"
@@ -255,6 +289,7 @@ def test_audio_eq_ui_write_rejects_stale_revision(tmp_path: Path) -> None:
         patch.object(web_ui, "AUDIO_EQ_PATH", state_path),
         patch.object(web_ui, "AUDIO_EQ_STATUS_PATH", status_path),
         patch.object(web_ui, "AUDIO_EQ_BACKUP_DIR", backup_path),
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
     ):
         saved = web_ui.write_audio_eq_state(initial)
         assert saved["revision"] == 1
@@ -272,7 +307,10 @@ def test_audio_eq_ui_write_rejects_non_integer_revision(tmp_path: Path) -> None:
     initial = audio_eq.default_audio_state()
     audio_eq.atomic_write_json(state_path, initial)
 
-    with patch.object(web_ui, "AUDIO_EQ_PATH", state_path):
+    with (
+        patch.object(web_ui, "AUDIO_EQ_PATH", state_path),
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
+    ):
         for invalid in (True, 0.5, "0"):
             candidate = copy.deepcopy(initial)
             candidate["revision"] = invalid
@@ -352,7 +390,10 @@ def test_simultaneous_audio_posts_cannot_both_overwrite_revision(
         except ValueError:
             return "stale"
 
-    with patch.object(web_ui, "AUDIO_EQ_PATH", state_path):
+    with (
+        patch.object(web_ui, "AUDIO_EQ_PATH", state_path),
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
+    ):
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(save, (1.0, 2.0)))
     assert sorted(results) == ["saved", "stale"]

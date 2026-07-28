@@ -7,10 +7,8 @@ kept in the source switcher so it remains the only live-config writer.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -18,6 +16,7 @@ from audio_eq import (
     atomic_write_json,
     audio_state_lock,
     default_audio_state,
+    exclusive_file_lock,
     read_audio_state,
 )
 
@@ -243,26 +242,13 @@ def read_speaker_selection(
     return normalize_speaker_selection(raw, allowed_ids=allowed_ids)
 
 
-@contextmanager
-def _exclusive_file_lock(lock_path: Path, mode: int):
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(lock_path, flags, mode)
-    with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def speaker_selection_lock(path: Path):
-    return _exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
+    return exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
 
 
 def audio_control_lock(path: Path):
     """Serialize config transitions with every master volume/mute writer."""
-    return _exclusive_file_lock(Path(path), 0o660)
+    return exclusive_file_lock(Path(path), 0o660)
 
 
 def audio_inhibit_active(path: Path) -> bool:

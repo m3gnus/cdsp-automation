@@ -302,18 +302,21 @@ def atomic_write_json(path: Path, payload: dict[str, Any], mode: int = 0o644) ->
 
 
 @contextmanager
-def audio_state_lock(path: Path):
-    """Serialize read-modify-write operations from the UI and HID remote."""
-    lock_path = path.with_name(f"{path.name}.lock")
+def exclusive_file_lock(lock_path: Path, mode: int):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
-    descriptor = os.open(lock_path, flags, 0o644)
+    descriptor = os.open(lock_path, flags, mode)
     with os.fdopen(descriptor, "a+", encoding="utf-8") as handle:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
         try:
             yield
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def audio_state_lock(path: Path):
+    """Serialize read-modify-write operations from the UI and HID remote."""
+    return exclusive_file_lock(path.with_name(f"{path.name}.lock"), 0o644)
 
 
 def update_tone_band(

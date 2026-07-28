@@ -84,7 +84,10 @@ def set_motu_clock(source: str) -> bool:
 def current_sample_rate(active_config: object) -> int | None:
     if not isinstance(active_config, dict):
         return None
-    value = active_config.get("devices", {}).get("samplerate")
+    devices = active_config.get("devices")
+    if not isinstance(devices, dict):
+        return None
+    value = devices.get("samplerate")
     try:
         rate = int(value)
     except (TypeError, ValueError):
