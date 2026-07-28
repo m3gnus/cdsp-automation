@@ -241,6 +241,31 @@ def test_active_profile_becoming_unavailable_fails_closed(tmp_path: Path) -> Non
     assert statuses[-1]["ok"] is False
 
 
+def test_status_publishers_replace_valid_non_object_json(tmp_path: Path) -> None:
+    speaker_status = tmp_path / "speaker-status.json"
+    eq_status = tmp_path / "eq-status.json"
+    speaker_status.write_text("[]")
+    eq_status.write_text("null")
+    speaker_payload = {"ok": True, "updated_at": 10}
+    eq_payload = {"applied": True, "updated_at": 20}
+
+    with (
+        patch.object(switcher, "SPEAKER_STATUS_PATH", speaker_status),
+        patch.object(switcher, "AUDIO_EQ_STATUS_PATH", str(eq_status)),
+    ):
+        switcher._write_speaker_status(speaker_payload)
+        switcher._write_audio_eq_status(eq_payload)
+
+    assert json.loads(speaker_status.read_text()) == speaker_payload
+    assert json.loads(eq_status.read_text()) == eq_payload
+
+    with patch.object(switcher, "atomic_write_json") as write:
+        switcher._write_status_if_changed(
+            speaker_status, {**speaker_payload, "updated_at": 30}
+        )
+    write.assert_not_called()
+
+
 def test_measurement_bypass_strips_user_eq_overlay() -> None:
     state = audio_eq.default_audio_state()
     state["bands"][0]["gain"] = 4

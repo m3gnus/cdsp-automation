@@ -523,15 +523,22 @@ def require_selected_profile_available(
     raise RuntimeError(error)
 
 
-def _write_speaker_status(payload: dict) -> None:
+def _write_status_if_changed(path: Path, payload: dict) -> None:
     try:
-        current = json.loads(SPEAKER_STATUS_PATH.read_text(encoding="utf-8"))
+        current = json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, OSError, ValueError):
         current = {}
-    comparable = {key: value for key, value in payload.items() if key != "updated_at"}
-    old = {key: value for key, value in current.items() if key != "updated_at"}
-    if comparable != old:
-        atomic_write_json(SPEAKER_STATUS_PATH, payload)
+    if not isinstance(current, dict):
+        current = {}
+    current.pop("updated_at", None)
+    comparable = payload.copy()
+    comparable.pop("updated_at", None)
+    if comparable != current:
+        atomic_write_json(path, payload)
+
+
+def _write_speaker_status(payload: dict) -> None:
+    _write_status_if_changed(SPEAKER_STATUS_PATH, payload)
 
 
 def _speaker_status_revision() -> int | None:
@@ -759,17 +766,7 @@ def read_manual_source() -> str | None:
 
 def _write_audio_eq_status(payload: dict) -> None:
     """Publish apply convergence without rewriting an unchanged status file."""
-    try:
-        with open(AUDIO_EQ_STATUS_PATH, "r", encoding="utf-8") as handle:
-            current = json.load(handle)
-    except (FileNotFoundError, OSError, ValueError):
-        current = {}
-    comparable = {key: value for key, value in payload.items() if key != "updated_at"}
-    old_comparable = {
-        key: value for key, value in current.items() if key != "updated_at"
-    }
-    if comparable != old_comparable:
-        atomic_write_json(Path(AUDIO_EQ_STATUS_PATH), payload)
+    _write_status_if_changed(Path(AUDIO_EQ_STATUS_PATH), payload)
 
 
 def _comparable_filter(value: object) -> object:
