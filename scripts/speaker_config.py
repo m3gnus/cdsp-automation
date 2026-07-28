@@ -63,43 +63,6 @@ def _boolean(value: Any, label: str, default: bool) -> bool:
     return value
 
 
-def _normalize_capabilities(
-    value: Any, *, output_channels: int, active_outputs: list[int]
-) -> dict[str, Any]:
-    raw = _mapping(value, "capabilities")
-    unknown = set(raw) - {"secondary_program", "meter_bands"}
-    if unknown:
-        raise ValueError("unsupported capabilities: " + ", ".join(sorted(unknown)))
-    result: dict[str, Any] = {
-        "secondary_program": _boolean(
-            raw.get("secondary_program"), "capabilities.secondary_program", False
-        )
-    }
-    meter_bands = raw.get("meter_bands")
-    if meter_bands is None:
-        result["meter_bands"] = None
-        return result
-    meter_bands = _mapping(meter_bands, "capabilities.meter_bands")
-    if set(meter_bands) != {"low", "mid", "high"}:
-        raise ValueError("capabilities.meter_bands must define low, mid and high")
-    used: set[int] = set()
-    normalized: dict[str, list[int]] = {}
-    for name in ("low", "mid", "high"):
-        channels = _normalize_outputs(
-            meter_bands[name], f"capabilities.meter_bands.{name}", output_channels
-        )
-        if not channels:
-            raise ValueError(f"capabilities.meter_bands.{name} cannot be empty")
-        if not set(channels) <= set(active_outputs):
-            raise ValueError(f"capabilities.meter_bands.{name} contains inactive outputs")
-        if used & set(channels):
-            raise ValueError("capabilities.meter_bands channel groups overlap")
-        used.update(channels)
-        normalized[name] = channels
-    result["meter_bands"] = normalized
-    return result
-
-
 def load_yaml_mapping(path: Path, label: str) -> dict[str, Any]:
     try:
         value = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -119,7 +82,7 @@ def normalize_profile(raw: Any, *, expected_id: str | None = None) -> dict[str, 
     if profile.get("crossover") is not None:
         derived_keys = (
             "camilladsp", "output_channels", "active_outputs",
-            "muted_outputs", "output_roles", "capabilities",
+            "muted_outputs", "output_roles",
         )
         expanded = expand_crossover_profile(
             {k: v for k, v in profile.items() if k not in derived_keys}
@@ -138,9 +101,11 @@ def normalize_profile(raw: Any, *, expected_id: str | None = None) -> dict[str, 
     required_fields = {
         "version", "id", "enabled", "supported_sources", "output_channels",
         "active_outputs", "muted_outputs", "output_roles", "max_volume_db",
-        "bypass_user_eq", "raw_measurement", "capabilities", "camilladsp",
+        "bypass_user_eq", "raw_measurement", "camilladsp",
     }
-    allowed_fields = required_fields | {"label", "description", "crossover", "revision"}
+    allowed_fields = required_fields | {
+        "label", "description", "crossover", "revision", "capabilities",
+    }
     unknown = set(profile) - allowed_fields
     missing = required_fields - set(profile)
     if unknown:
@@ -218,6 +183,12 @@ def normalize_profile(raw: Any, *, expected_id: str | None = None) -> dict[str, 
     if not isinstance(fragment.get("pipeline"), list):
         raise ValueError("camilladsp.pipeline must be a list")
 
+    # The secondary_program and meter_bands capabilities are retired, but
+    # existing hand-authored profiles may still declare them: accept any
+    # capabilities mapping and ignore its contents.
+    if profile.get("capabilities") is not None:
+        _mapping(profile["capabilities"], "capabilities")
+
     raw_measurement = _boolean(
         profile.get("raw_measurement"), "raw_measurement", False
     )
@@ -259,61 +230,41 @@ def normalize_profile(raw: Any, *, expected_id: str | None = None) -> dict[str, 
         ),
         "bypass_user_eq": bypass_user_eq,
         "raw_measurement": raw_measurement,
-        "capabilities": _normalize_capabilities(
-            profile.get("capabilities", {}),
-            output_channels=output_channels,
-            active_outputs=active_outputs,
-        ),
+        "capabilities": {},
         "camilladsp": fragment,
     }
 
 
 def _normalize_program_map(value: Any, capture_channels: int) -> dict[str, list[int]]:
-    """Where a source base carries the program in its capture stream.
+    """Where a source base carries the main program in its capture stream.
 
-    Defaults: main on channels 0/1, stereo on 2/3 when the capture is at
-    least four channels wide. Multichannel interfaces override with e.g.
+    Defaults to channels 0/1. Multichannel interfaces override with e.g.
     ``program: {main: [12, 13]}``.
     """
     if value is None:
         value = {}
     spec = _mapping(value, "source program")
-    unknown = set(spec) - {"main", "stereo"}
+    unknown = set(spec) - {"main"}
     if unknown:
         raise ValueError(
             "unsupported source program keys: " + ", ".join(sorted(unknown))
         )
-    result: dict[str, list[int]] = {}
-    # An explicitly declared map never gains a guessed stereo pair; the
-    # implicit 2/3 default exists only for undeclared loopback-style bases.
-    defaults: dict[str, list[int] | None] = {
-        "main": [0, 1],
-        "stereo": [2, 3] if capture_channels >= 4 and not spec else None,
-    }
-    used: set[int] = set()
-    for name in ("main", "stereo"):
-        channels = spec.get(name, defaults[name])
-        if channels is None:
-            continue
-        if (
-            not isinstance(channels, list)
-            or len(channels) != 2
-            or any(isinstance(c, bool) or not isinstance(c, int) for c in channels)
-        ):
-            raise ValueError(f"source program {name} must be [left, right] integers")
-        left, right = channels
-        if left == right:
-            raise ValueError(f"source program {name} channels must differ")
-        for channel in (left, right):
-            if not 0 <= channel < capture_channels:
-                raise ValueError(
-                    f"source program {name} channel {channel} is outside the capture range"
-                )
-            if channel in used:
-                raise ValueError("source program channels overlap")
-            used.add(channel)
-        result[name] = [left, right]
-    return result
+    channels = spec.get("main", [0, 1])
+    if (
+        not isinstance(channels, list)
+        or len(channels) != 2
+        or any(isinstance(c, bool) or not isinstance(c, int) for c in channels)
+    ):
+        raise ValueError("source program main must be [left, right] integers")
+    left, right = channels
+    if left == right:
+        raise ValueError("source program main channels must differ")
+    for channel in (left, right):
+        if not 0 <= channel < capture_channels:
+            raise ValueError(
+                f"source program main channel {channel} is outside the capture range"
+            )
+    return {"main": [left, right]}
 
 
 def _normalize_outputs(value: Any, label: str, channel_count: int) -> list[int]:
@@ -481,28 +432,25 @@ def compile_profile_config(
         raise ValueError("playback channel count does not match speaker profile")
 
     if profile.get("crossover"):
-        # Parametric fragments declare the minimum program width and reference
-        # logical program channels (main 0/1, stereo 2/3). Widen the entry
-        # mixer to the source's real capture width and remap the logical
-        # channels onto the physical ones the base declares (a multichannel
-        # interface may deliver the program on any capture pair).
+        # Parametric fragments reference the logical two-channel main program
+        # (channels 0/1). Widen the entry mixer to the source's real capture
+        # width and remap the logical channels onto the physical ones the base
+        # declares (a multichannel interface may deliver the program on any
+        # capture pair, e.g. ``program: {main: [12, 13]}``).
         capture = _mapping(devices.get("capture", {}), "source capture device")
         capture_channels = _integer(
             capture.get("channels"), "source capture channels", 1, 64
         )
-        program_min = profile["crossover"]["program_channels"]
-        if capture_channels < program_min:
+        if capture_channels < 2:
             raise ValueError(
-                f"speaker profile {profile['id']} needs a {program_min}-channel "
+                f"speaker profile {profile['id']} needs a two-channel "
                 f"program but source {source} provides {capture_channels}"
             )
         program_map = _normalize_program_map(program_spec, capture_channels)
-        logical_to_physical: dict[int, int] = {}
-        for name, base_index in (("main", 0), ("stereo", 2)):
-            channels = program_map.get(name)
-            if channels is not None:
-                logical_to_physical[base_index] = channels[0]
-                logical_to_physical[base_index + 1] = channels[1]
+        logical_to_physical = {
+            0: program_map["main"][0],
+            1: program_map["main"][1],
+        }
         entry_step = fragment["pipeline"][0]
         entry_mixer = result["mixers"][entry_step["name"]]
         entry_mixer["channels"]["in"] = capture_channels
@@ -511,11 +459,6 @@ def compile_profile_config(
                 logical = row_source.get("channel")
                 if logical in logical_to_physical:
                     row_source["channel"] = logical_to_physical[logical]
-                elif logical is not None and logical >= 2:
-                    raise ValueError(
-                        f"source {source} does not provide a stereo program "
-                        f"for speaker profile {profile['id']}"
-                    )
     current_limit = devices.get("volume_limit")
     if current_limit is None:
         devices["volume_limit"] = profile["max_volume_db"]

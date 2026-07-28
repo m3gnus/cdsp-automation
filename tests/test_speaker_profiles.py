@@ -93,24 +93,6 @@ def test_concurrent_speaker_selection_compare_and_swap(tmp_path: Path) -> None:
     assert speaker_profiles.read_speaker_selection(path)["revision"] == 1
 
 
-def test_profile_migration_requires_explicit_writer_quiescence(tmp_path: Path) -> None:
-    legacy = tmp_path / "audio-eq.json"
-    state = audio_eq.default_audio_state()
-    state["bands"][0]["gain"] = 1.5
-    audio_eq.atomic_write_json(legacy, state)
-    root = tmp_path / "profiles"
-    try:
-        speaker_profiles.migrate_legacy_profile_audio_state(root, legacy)
-    except RuntimeError as exc:
-        assert "writers must be stopped" in str(exc)
-    else:
-        raise AssertionError("migration proceeded without quiesced writers")
-    target = speaker_profiles.migrate_legacy_profile_audio_state(
-        root, legacy, legacy_writers_quiesced=True
-    )
-    assert audio_eq.read_audio_state(target)["bands"][0]["gain"] == 1.5
-
-
 def test_forced_selection_touch_and_status_revision_signal(tmp_path: Path) -> None:
     selection_path = tmp_path / "speaker-selection.json"
     first = speaker_profiles.update_speaker_selection(selection_path, "partymeh")

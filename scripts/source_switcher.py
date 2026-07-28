@@ -21,8 +21,6 @@ from camilladsp import CamillaClient
 from audio_eq import (
     FILTER_PREFIX,
     PIPELINE_DESCRIPTION,
-    STEREO_FILTER_PREFIX,
-    STEREO_PIPELINE_DESCRIPTION,
     apply_audio_overlay,
     atomic_write_json,
     effective_preamp_db,
@@ -653,14 +651,7 @@ def resolve_config_target(
             "max_volume_db": 0.0,
             "bypass_user_eq": False,
             "legacy": True,
-            "capabilities": {
-                "secondary_program": False,
-                "meter_bands": {
-                    "low": [4, 5],
-                    "mid": [2, 3],
-                    "high": [0, 1],
-                },
-            },
+            "capabilities": {},
             "selection_revision": selection_revision,
             "audio_state": audio_state,
             "expected_config": expected_config,
@@ -805,26 +796,24 @@ def _audio_overlay_matches(actual: dict, expected: dict) -> bool:
     expected_owned = {
         name: _comparable_filter(value)
         for name, value in expected_filters.items()
-        if name.startswith(FILTER_PREFIX) or name.startswith(STEREO_FILTER_PREFIX)
+        if name.startswith(FILTER_PREFIX)
     }
     actual_owned = {
         name: _comparable_filter(value)
         for name, value in actual_filters.items()
-        if name.startswith(FILTER_PREFIX) or name.startswith(STEREO_FILTER_PREFIX)
+        if name.startswith(FILTER_PREFIX)
     }
     if actual_owned != expected_owned:
         return False
     actual_steps = [
         step
         for step in actual.get("pipeline", [])
-        if step.get("description")
-        in {PIPELINE_DESCRIPTION, STEREO_PIPELINE_DESCRIPTION}
+        if step.get("description") == PIPELINE_DESCRIPTION
     ]
     expected_steps = [
         step
         for step in expected.get("pipeline", [])
-        if step.get("description")
-        in {PIPELINE_DESCRIPTION, STEREO_PIPELINE_DESCRIPTION}
+        if step.get("description") == PIPELINE_DESCRIPTION
     ]
     return actual_steps == expected_steps
 
@@ -868,10 +857,6 @@ def ensure_audio_eq(
             safe_state["enabled"] = False
             safe_state["loudness"]["enabled"] = False
             safe_state["preamp_db"] = 0.0
-            safe_state["stereo"]["enabled"] = False
-            safe_state["stereo"]["muted"] = False
-            safe_state["stereo"]["trim_db"] = 0.0
-            safe_state["stereo"]["preamp_db"] = 0.0
             updated, _preamp = apply_audio_overlay(config, safe_state)
             if not _configs_equivalent(config, updated):
                 cdsp.config.set_active(updated)

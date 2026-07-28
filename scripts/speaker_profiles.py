@@ -61,10 +61,6 @@ BUILTIN_SPEAKERS: dict[str, dict[str, str]] = {
         "label": "Measurement",
         "description": "Direct measurement routing without speaker EQ or crossover",
     },
-    "partymeh_bird": {
-        "label": "PartyMEH + Bird",
-        "description": "PartyMEH on outputs 1–6 and Bird on outputs 7–8",
-    },
 }
 
 
@@ -349,27 +345,3 @@ def read_profile_audio_state(
         state = default_audio_state()
         atomic_write_json(target, state)
         return state
-
-
-def migrate_legacy_profile_audio_state(
-    root: Path,
-    legacy_path: Path,
-    *,
-    legacy_writers_quiesced: bool = False,
-) -> Path:
-    """Copy legacy Kantarellen state after all old-path writers are stopped.
-
-    A lock alone cannot prevent an old process that is waiting on the lock from
-    writing immediately after migration.  Requiring an explicit quiesced
-    cutover makes that deployment precondition visible and testable.
-    """
-    if not legacy_writers_quiesced:
-        raise RuntimeError("legacy audio writers must be stopped before migration")
-    target = profile_audio_path(root, LEGACY_SPEAKER_ID)
-    with audio_state_lock(legacy_path):
-        with audio_state_lock(target):
-            if target.exists():
-                return target
-            state = read_audio_state(legacy_path)
-            atomic_write_json(target, state)
-    return target

@@ -241,12 +241,11 @@ def test_active_profile_becoming_unavailable_fails_closed(tmp_path: Path) -> Non
     assert statuses[-1]["ok"] is False
 
 
-def test_measurement_bypass_strips_main_and_secondary_overlay() -> None:
+def test_measurement_bypass_strips_user_eq_overlay() -> None:
     state = audio_eq.default_audio_state()
     state["bands"][0]["gain"] = 4
-    state["stereo"]["bands"][0]["gain"] = 3
     base = {
-        "devices": {"capture": {"channels": 4}},
+        "devices": {"capture": {"channels": 2}},
         "filters": {},
         "pipeline": [],
     }
@@ -269,12 +268,11 @@ def test_measurement_bypass_strips_main_and_secondary_overlay() -> None:
     ):
         switcher.ensure_audio_eq(client, speaker_id="measurement", state=state)
     assert not any(
-        name.startswith((audio_eq.FILTER_PREFIX, audio_eq.STEREO_FILTER_PREFIX))
+        name.startswith(audio_eq.FILTER_PREFIX)
         for name in client.config.value["filters"]
     )
     assert not any(
-        step.get("description")
-        in {audio_eq.PIPELINE_DESCRIPTION, audio_eq.STEREO_PIPELINE_DESCRIPTION}
+        step.get("description") == audio_eq.PIPELINE_DESCRIPTION
         for step in client.config.value["pipeline"]
     )
 

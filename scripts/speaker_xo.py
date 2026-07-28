@@ -20,7 +20,8 @@ from speaker_profiles import normalize_speaker_id
 
 CROSSOVER_VERSION = 1
 MAX_WAYS = 4
-WAY_SOURCES = {"main", "stereo"}
+# Every way is fed by the single two-channel main program.
+PROGRAM_CHANNELS = 2
 # slope name -> (camilladsp filter family, order)
 SLOPES: dict[str, tuple[str, int]] = {
     "BW6": ("ButterworthFO", 1),
@@ -101,9 +102,13 @@ def normalize_crossover(raw: Any, *, raw_measurement: bool = False) -> dict[str,
     if isinstance(version, bool) or not isinstance(version, int) or version != CROSSOVER_VERSION:
         raise ValueError(f"unsupported crossover version: {version!r}")
 
-    program_channels = raw.get("program_channels", 2)
-    if program_channels not in (2, 4):
-        raise ValueError("crossover program_channels must be 2 or 4")
+    # Saved profiles written before the secondary "stereo" program was retired
+    # persist ``program_channels``.  Accept the key for compatibility, but the
+    # only supported program is the two-channel main one; the normalized spec
+    # no longer carries the field.
+    program_channels = raw.get("program_channels", PROGRAM_CHANNELS)
+    if program_channels != PROGRAM_CHANNELS:
+        raise ValueError("crossover program_channels must be 2")
 
     playback = raw.get("playback")
     if not isinstance(playback, dict):
@@ -148,12 +153,8 @@ def normalize_crossover(raw: Any, *, raw_measurement: bool = False) -> dict[str,
             raise ValueError(f"duplicate way name: {name}")
         names.add(name)
         source = str(item.get("source") or "main").strip().lower()
-        if source not in WAY_SOURCES:
-            raise ValueError(f"way {name!r} source must be 'main' or 'stereo'")
-        if source == "stereo" and program_channels < 4:
-            raise ValueError(
-                f"way {name!r} uses the stereo program which needs program_channels: 4"
-            )
+        if source != "main":
+            raise ValueError(f"way {name!r} source must be 'main'")
         highpass = _edge(item.get("highpass"), f"way {name!r} highpass")
         lowpass = _edge(item.get("lowpass"), f"way {name!r} lowpass")
         if highpass and lowpass and highpass["freq"] >= lowpass["freq"]:
@@ -194,24 +195,18 @@ def normalize_crossover(raw: Any, *, raw_measurement: bool = False) -> dict[str,
             or way["gain_db"] != 0
             or way["delay_ms"] != 0
             or way["invert"]
-            or way["source"] != "main"
         ):
             raise ValueError(
-                "raw Measurement ways must be full-range, unity, main-program only"
+                "raw Measurement ways must be full-range and unity"
             )
         ways.append(way)
     if raw_measurement and len(ways) != 1:
         raise ValueError("raw Measurement must define exactly one way")
     return {
         "version": CROSSOVER_VERSION,
-        "program_channels": program_channels,
         "playback": playback_out,
         "ways": ways,
     }
-
-
-def _band_position(way: dict[str, Any]) -> float:
-    return float(way["highpass"]["freq"]) if way["highpass"] else 0.0
 
 
 def _edge_filter(edge: dict[str, Any], *, highpass: bool) -> dict[str, Any]:
@@ -257,7 +252,7 @@ def crossover_fragment(
             "filters": {},
             "mixers": {
                 name: {
-                    "channels": {"in": xo["program_channels"], "out": out_channels},
+                    "channels": {"in": PROGRAM_CHANNELS, "out": out_channels},
                     "mapping": mapping,
                 }
             },
@@ -270,7 +265,6 @@ def crossover_fragment(
     filters: dict[str, Any] = {}
     filter_steps: list[dict[str, Any]] = []
     for index, way in enumerate(ways):
-        source_base = 0 if way["source"] == "main" else 2
         names: list[str] = []
         if way["highpass"]:
             name = f"{prefix}{way['name']}_hp"
@@ -294,7 +288,7 @@ def crossover_fragment(
         for side in (0, 1):
             bus = 2 * index + side
             expand_mapping.append(
-                {"dest": bus, "sources": [{"channel": source_base + side}]}
+                {"dest": bus, "sources": [{"channel": side}]}
             )
             if names:
                 filter_steps.append(
@@ -323,7 +317,7 @@ def crossover_fragment(
         "filters": filters,
         "mixers": {
             ways_mixer: {
-                "channels": {"in": xo["program_channels"], "out": bus_count},
+                "channels": {"in": PROGRAM_CHANNELS, "out": bus_count},
                 "mapping": expand_mapping,
             },
             output_mixer: {
@@ -351,27 +345,11 @@ def derive_profile_fields(xo: dict[str, Any]) -> dict[str, Any]:
             active.append(output)
     active_outputs = sorted(active)
     muted_outputs = [o for o in range(out_channels) if o not in set(active)]
-
-    meter_bands = None
-    main_ways = [w for w in xo["ways"] if w["source"] == "main"]
-    if len(main_ways) == 3:
-        ordered = sorted(main_ways, key=_band_position)
-        positions = [_band_position(w) for w in ordered]
-        if len(set(positions)) == 3:
-            meter_bands = {
-                "low": sorted(ordered[0]["outputs"]),
-                "mid": sorted(ordered[1]["outputs"]),
-                "high": sorted(ordered[2]["outputs"]),
-            }
     return {
         "output_channels": out_channels,
         "active_outputs": active_outputs,
         "muted_outputs": muted_outputs,
         "output_roles": roles,
-        "capabilities": {
-            "secondary_program": any(w["source"] == "stereo" for w in xo["ways"]),
-            "meter_bands": meter_bands,
-        },
     }
 
 
@@ -389,8 +367,7 @@ def expand_crossover_profile(raw: dict[str, Any]) -> dict[str, Any]:
             "a speaker profile defines either crossover or camilladsp, not both"
         )
     derived_keys = (
-        "output_channels", "active_outputs", "muted_outputs",
-        "output_roles", "capabilities",
+        "output_channels", "active_outputs", "muted_outputs", "output_roles",
     )
     overlap = [key for key in derived_keys if key in raw]
     if overlap:

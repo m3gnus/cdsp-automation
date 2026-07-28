@@ -42,27 +42,6 @@ def test_audio_eq_overlay_is_idempotent_and_precedes_crossover() -> None:
     assert 'for key in ("inverted", "mute")' in source_switcher
 
 
-def test_four_channel_overlay_keeps_main_and_stereo_eq_on_separate_inputs() -> None:
-    config = {
-        "devices": {"capture": {"channels": 4}},
-        "filters": {},
-        "pipeline": [{"type": "Mixer", "name": "4x10"}],
-    }
-    state = audio_eq.default_audio_state()
-    state["stereo"]["trim_db"] = -9
-    state["stereo"]["bands"][2]["gain"] = 3
-    updated, _ = audio_eq.apply_audio_overlay(config, state)
-    steps = {step.get("description"): step for step in updated["pipeline"]}
-    assert steps[audio_eq.PIPELINE_DESCRIPTION]["channels"] == [0, 1]
-    assert steps[audio_eq.STEREO_PIPELINE_DESCRIPTION]["channels"] == [2, 3]
-    assert updated["filters"]["uglan_stereo_eq_gain"]["parameters"]["gain"] == -12
-
-    stereo_state = audio_eq.normalize_audio_state(state)
-    two_channel = {"devices": {"capture": {"channels": 2}}, "pipeline": [], "filters": {}}
-    without_stereo, _ = audio_eq.apply_audio_overlay(two_channel, stereo_state)
-    assert not any(name.startswith(audio_eq.STEREO_FILTER_PREFIX) for name in without_stereo["filters"])
-
-
 def test_audio_eq_bypass_and_validation_are_safe() -> None:
     state = audio_eq.default_audio_state()
     state["bands"][2]["enabled"] = False
@@ -144,9 +123,6 @@ def test_tone_band_identity_limits_and_deployment_permissions() -> None:
 
     installer = (REPOSITORY / "install.sh").read_text()
     assert 'install -d -m 0750 -o "$USER" -g "$USER"' in installer
-    assert '${audio_eq_path}.lock' in installer
-    assert '${speaker_selection_path}.lock' in installer
-    assert '${speaker_audio_dir}/partymeh_bird.json.lock' in installer
     update_body = installer.split("update_utilities()", 1)[1].split(
         "pair_bluetooth_remote()", 1
     )[0]
@@ -243,7 +219,6 @@ def test_audio_state_strict_booleans_versions_and_headroom_range() -> None:
     for mutate in (
         lambda state: state.update(enabled="false"),
         lambda state: state["bands"][0].update(enabled="false"),
-        lambda state: state["stereo"].update(muted="false"),
         lambda state: state["loudness"].update(enabled="false"),
     ):
         state = audio_eq.default_audio_state()
@@ -281,19 +256,19 @@ def test_audio_state_strict_booleans_versions_and_headroom_range() -> None:
     else:
         raise AssertionError("undeployable automatic headroom was accepted")
 
-    state = audio_eq.default_audio_state()
-    state["stereo"]["trim_db"] = -60
-    for index in range(6):
-        state["stereo"]["bands"].insert(-1, {
-            "id": f"stereo_boost_{index}", "enabled": True, "type": "Peaking",
-            "freq": 500 + index * 500, "gain": 24, "q": 1,
-        })
-    try:
-        audio_eq.normalize_audio_state(state)
-    except ValueError as exc:
-        assert "stereo trim and headroom" in str(exc)
-    else:
-        raise AssertionError("stereo trim plus headroom exceeded Gain range")
+    # State files persisted before the secondary stereo program was retired
+    # still carry a "stereo" object; it must load and be dropped on rewrite.
+    legacy = audio_eq.default_audio_state()
+    legacy["stereo"] = {
+        "enabled": True,
+        "auto_headroom": True,
+        "preamp_db": 0.0,
+        "trim_db": -12.0,
+        "muted": False,
+        "bands": [{"id": "low"}],
+    }
+    normalized = audio_eq.normalize_audio_state(legacy)
+    assert "stereo" not in normalized
 
 
 def test_audio_state_reports_the_installed_unity_linear_airplay_path() -> None:

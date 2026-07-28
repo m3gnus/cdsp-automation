@@ -334,26 +334,8 @@ def test_source_base_program_map_remaps_parametric_profiles() -> None:
     }
     assert channels == {0: 12, 1: 13, 2: 12, 3: 13, 4: 12, 5: 13}
 
-    # A declared map without stereo must reject stereo-program ways.
-    dual = seed_profile("partymeh_bird")
-    try:
-        speaker_config.compile_profile_config(
-            base, dual, state, source_id="streamer"
-        )
-    except ValueError as exc:
-        assert "stereo program" in str(exc)
-    else:
-        raise AssertionError("declared map silently gained a stereo pair")
-
-    # Undeclared four-channel bases keep the implicit main 0/1 stereo 2/3.
-    config = speaker_config.compile_profile_config(
-        capture_base(4), dual, state, source_id="streamer"
-    )
-    expand = config["mixers"]["spk_partymeh_bird_ways"]["mapping"]
-    bird_left = next(row for row in expand if row["dest"] == 6)
-    assert bird_left["sources"] == [{"channel": 2}]
-
-    # Overlapping or out-of-range program channels are rejected.
+    # Duplicate or out-of-range main channels are rejected, and the retired
+    # stereo program key is no longer a valid map entry.
     for bad in ({"main": [12, 12]}, {"main": [19, 25]}, {"main": [2, 3], "stereo": [3, 4]}):
         broken = capture_base(20)
         broken["program"] = bad

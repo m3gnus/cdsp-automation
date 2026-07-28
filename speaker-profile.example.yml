@@ -29,10 +29,10 @@ bypass_user_eq: false
 # Set true only for the Measurement profile. This rejects all source/profile
 # filters and leaves only the explicit output-routing mixer.
 raw_measurement: false
-capabilities:
-  secondary_program: false
-  # Publish these only when playback outputs genuinely represent XO bands.
-  # meter_bands: {low: [4, 5], mid: [2, 3], high: [0, 1]}
+# Optional. The secondary_program and meter_bands capabilities are retired;
+# older profiles that still declare them load fine — the block is accepted
+# and ignored.
+capabilities: {}
 camilladsp:
   devices:
     playback:

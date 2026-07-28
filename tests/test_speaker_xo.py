@@ -4,21 +4,19 @@ from __future__ import annotations
 
 import copy
 import math
+from pathlib import Path
+
+import yaml
 
 import audio_eq
 import speaker_config
 import speaker_xo
-from profile_fixtures import capture_base, seed_profile
+from profile_fixtures import capture_base, partymeh_document, seed_profile
 
 
 def test_parametric_crossover_compiles_flat_and_widens_program() -> None:
     profile = seed_profile("partymeh")
     assert profile["active_outputs"] == [0, 1, 2, 3, 4, 5]
-    assert profile["capabilities"]["meter_bands"] == {
-        "low": [4, 5],
-        "mid": [2, 3],
-        "high": [0, 1],
-    }
     state = audio_eq.default_audio_state()
     for source, channels in (("streamer", 4),):
         config = speaker_config.compile_profile_config(
@@ -41,22 +39,11 @@ def test_parametric_crossover_compiles_flat_and_widens_program() -> None:
     assert math.isclose(by_name["low"][1], -6.02, abs_tol=0.1)
     assert math.isclose(by_name["high"][3], -6.02, abs_tol=0.35)
 
-    # The four-channel dual profile refuses a two-channel program.
-    dual = seed_profile("partymeh_bird")
-    try:
-        speaker_config.compile_profile_config(
-            capture_base(2), dual, state, source_id="streamer"
-        )
-    except ValueError as exc:
-        assert "4-channel" in str(exc)
-    else:
-        raise AssertionError("dual profile accepted a two-channel program")
 
-
-def test_parametric_crossover_places_trims_delay_and_stereo_program() -> None:
+def test_parametric_crossover_places_trims_and_delay() -> None:
     document = {
         "version": 1,
-        "id": "partymeh_bird",
+        "id": "partymeh",
         "enabled": True,
         "supported_sources": ["streamer"],
         "max_volume_db": -20,
@@ -64,7 +51,6 @@ def test_parametric_crossover_places_trims_delay_and_stereo_program() -> None:
         "raw_measurement": False,
         "crossover": {
             "version": 1,
-            "program_channels": 4,
             "playback": {
                 "type": "Alsa",
                 "device": "hw:test",
@@ -85,39 +71,65 @@ def test_parametric_crossover_places_trims_delay_and_stereo_program() -> None:
                     "invert": True,
                     "outputs": [0, 1],
                 },
-                {"name": "bird", "source": "stereo", "outputs": [6, 7]},
             ],
         },
     }
     profile = speaker_config.normalize_profile(document)
     fragment = profile["camilladsp"]
-    assert profile["capabilities"]["secondary_program"] is True
+    assert profile["capabilities"] == {}
 
-    route = fragment["mixers"]["spk_partymeh_bird_output"]["mapping"]
+    route = fragment["mixers"]["spk_partymeh_output"]["mapping"]
     high_left = next(row for row in route if row["dest"] == 0)
     assert high_left["sources"] == [{"channel": 2, "gain": -2.5, "inverted": True}]
     low_left = next(row for row in route if row["dest"] == 4)
     assert low_left["sources"] == [{"channel": 0}]
 
-    expand = fragment["mixers"]["spk_partymeh_bird_ways"]["mapping"]
-    bird_left = next(row for row in expand if row["dest"] == 4)
-    assert bird_left["sources"] == [{"channel": 2}]
+    # Every way is fed by the two-channel main program.
+    expand_mixer = fragment["mixers"]["spk_partymeh_ways"]
+    assert expand_mixer["channels"] == {"in": 2, "out": 4}
+    high_left_bus = next(row for row in expand_mixer["mapping"] if row["dest"] == 2)
+    assert high_left_bus["sources"] == [{"channel": 0}]
 
-    delay = fragment["filters"]["spk_partymeh_bird_high_delay"]
+    delay = fragment["filters"]["spk_partymeh_high_delay"]
     assert delay["parameters"] == {"delay": 0.3, "unit": "ms", "subsample": False}
     filtered_buses = {
         step["channels"][0]
         for step in fragment["pipeline"]
         if step["type"] == "Filter"
     }
-    assert filtered_buses == {0, 1, 2, 3}, "full-range bird buses must stay direct"
+    assert filtered_buses == {0, 1, 2, 3}
+
+
+def test_persisted_program_channels_key_still_normalizes_and_loads(
+    tmp_path: Path,
+) -> None:
+    """Profiles saved before the stereo program retired carry the key."""
+    document = partymeh_document()
+    document["crossover"]["program_channels"] = 2
+    normalized = speaker_xo.normalize_crossover(copy.deepcopy(document["crossover"]))
+    assert "program_channels" not in normalized
+
+    (tmp_path / "partymeh.yml").write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    profile = speaker_config.load_profile(tmp_path, "partymeh")
+    assert profile["active_outputs"] == [0, 1, 2, 3, 4, 5]
+    assert "program_channels" not in profile["crossover"]
+
+    # The retired four-channel dual-program width is no longer valid.
+    document["crossover"]["program_channels"] = 4
+    try:
+        speaker_xo.normalize_crossover(document["crossover"])
+    except ValueError as exc:
+        assert "program_channels" in str(exc)
+    else:
+        raise AssertionError("retired four-channel program width was accepted")
 
 
 def test_parametric_crossover_rejects_unsafe_geometry() -> None:
     def spec(**overrides):
         base = {
             "version": 1,
-            "program_channels": 2,
             "playback": {"device": "hw:test", "channels": 8},
             "ways": [
                 {"name": "low", "lowpass": {"freq": 300}, "outputs": [4, 5]},
@@ -154,14 +166,13 @@ def test_parametric_crossover_rejects_unsafe_geometry() -> None:
         {"gain_db": -3},
         {"delay_ms": 1},
         {"invert": True},
-        {"source": "stereo"},
     ):
         way = {"name": "direct", "outputs": [6, 7], **tweak}
-        raw = spec(ways=[way], program_channels=4)
+        raw = spec(ways=[way])
         try:
             speaker_xo.normalize_crossover(raw, raw_measurement=True)
         except ValueError as exc:
-            assert "full-range, unity" in str(exc)
+            assert "full-range and unity" in str(exc)
         else:
             raise AssertionError(f"raw measurement accepted {tweak}")
 

@@ -2,8 +2,7 @@
 
 Real installations keep their profile YAMLs outside this repository, so the
 tests build minimal documents that exercise the same schema paths: a
-three-way LR24 parametric crossover ("partymeh"), its dual-program variant
-with a full-range stereo way ("partymeh_bird"), and a hand-authored
+three-way LR24 parametric crossover ("partymeh") and a hand-authored
 CamillaDSP fragment profile.
 """
 
@@ -50,7 +49,6 @@ def partymeh_document() -> dict[str, Any]:
         "raw_measurement": False,
         "crossover": {
             "version": 1,
-            "program_channels": 2,
             "playback": {
                 "type": "Alsa",
                 "device": "hw:test",
@@ -71,25 +69,8 @@ def partymeh_document() -> dict[str, Any]:
     }
 
 
-def partymeh_bird_document() -> dict[str, Any]:
-    """Dual-program variant: three-way mains plus a full-range stereo way."""
-    document = partymeh_document()
-    document.update(
-        id="partymeh_bird",
-        label="PartyMEH + Bird",
-        description="Dual-program test profile: mains on 1-6, bird on 7-8",
-        enabled=False,
-        supported_sources=["streamer"],
-        max_volume_db=-20,
-    )
-    document["crossover"]["program_channels"] = 4
-    document["crossover"]["ways"].append(_way("bird", [6, 7], source="stereo"))
-    return document
-
-
 _DOCUMENTS = {
     "partymeh": partymeh_document,
-    "partymeh_bird": partymeh_bird_document,
 }
 
 

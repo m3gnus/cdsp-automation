@@ -7,7 +7,7 @@ Speaker selection is stored as a versioned, compare-and-swap document at
 must explicitly provide: `id`, `enabled`, `supported_sources`,
 `output_channels`, complete `active_outputs`/`muted_outputs`, one role per
 output, a non-positive `max_volume_db`, `bypass_user_eq`, `raw_measurement`,
-capabilities, and a
+and a
 CamillaDSP fragment. Profile-owned filter/mixer/processor names use the
 `spk_<id>_` prefix. The profile owns playback and output routing; the source
 base owns capture, samplerate, clock-related device settings, and (for normal
@@ -16,11 +16,12 @@ or processors. A `raw_measurement: true` Measurement profile additionally
 requires `bypass_user_eq: true`, empty source filters/pipeline, and empty
 profile filters/processors; only its explicit output mixer remains.
 
-`capabilities.meter_bands` is optional and, when present, strictly maps the
-active playback outputs into non-overlapping low/mid/high groups. The applied
-profile publishes this map in its transactional status. Consumers disable
-frequency-dependent displays/effects when the map is absent or status is not
-fully applied.
+Every program is the two-channel main one; a source base places it in its
+capture stream with `program: {main: [left, right]}` (default `[0, 1]`). The
+retired secondary-"stereo"-program and `capabilities` features
+(`secondary_program`, `meter_bands`) are accepted and ignored when older
+profiles or crossover documents still carry them — including the persisted
+`crossover.program_channels: 2` key.
 
 The compiler rejects coercion in safety fields: YAML booleans must be real
 booleans and channel/output indices must be real integers. The terminal mixer
