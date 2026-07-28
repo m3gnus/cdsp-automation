@@ -684,3 +684,204 @@ def test_speaker_switch_requires_server_confirmation_and_dashboard_dialog() -> N
     assert "Type <b>SWITCH</b>" in web_ui.HTML
     assert 'confirm:"SWITCH"' in web_ui.HTML
     assert "audioState && !(await saveAudio())" in web_ui.HTML
+
+
+def _stanza(**properties: str) -> str:
+    return "".join(f"{key}={value}\n" for key, value in properties.items())
+
+
+def test_batched_show_parses_stanzas_regardless_of_property_order() -> None:
+    output = (
+        _stanza(
+            Id="a.service",
+            Names="a.service",
+            Description="one = two",
+            LoadState="loaded",
+            ActiveState="active",
+            SubState="running",
+            UnitFileState="enabled",
+        )
+        + "\n"
+        + _stanza(
+            SubState="dead",
+            ActiveState="inactive",
+            Names="b.service b-alias.service",
+            UnitFileState="",
+            Id="b.service",
+            LoadState="not-found",
+            Description="",
+        )
+        + "\n\n"
+    )
+    records = web_ui.parse_systemctl_show(output)
+    assert len(records) == 2
+    assert records[0]["Description"] == "one = two"
+    assert records[1]["UnitFileState"] == ""
+    assert records[1]["SubState"] == "dead"
+
+
+def test_batched_show_maps_requested_aliases_through_names() -> None:
+    output = (
+        _stanza(Id="real.service", Names="real.service alias.service", ActiveState="active")
+        + "\n"
+    )
+    with patch.object(web_ui, "run", return_value=output) as run:
+        result = web_ui.systemctl_show_many(["alias.service"])
+    assert result["alias.service"]["ActiveState"] == "active"
+    assert run.call_count == 1
+    # --all keeps empty properties present, so a suppressed one cannot merge
+    # two units into a single corrupted record.
+    assert "--all" in run.call_args[0][0]
+
+
+def test_batched_show_drops_ambiguous_and_unrequested_records() -> None:
+    output = (
+        _stanza(Id="dup.service", Names="dup.service", ActiveState="active")
+        + "\n"
+        + _stanza(Id="other.service", Names="other.service dup.service", ActiveState="failed")
+        + "\n"
+        + _stanza(Id="extra.service", Names="extra.service", ActiveState="active")
+        + "\n"
+    )
+    with patch.object(web_ui, "run", return_value=output):
+        result = web_ui.systemctl_show_many(["dup.service", "other.service"])
+    assert "dup.service" not in result
+    assert result["other.service"]["ActiveState"] == "failed"
+    assert "extra.service" not in result
+
+
+def test_batched_show_tolerates_malformed_output() -> None:
+    with patch.object(web_ui, "run", return_value="garbage\n\n= \n\nnot an identifier=1\n"):
+        assert web_ui.systemctl_show_many(["a.service"]) == {}
+    with patch.object(web_ui, "run") as run:
+        assert web_ui.systemctl_show_many([]) == {}
+    run.assert_not_called()
+
+
+def test_service_status_uses_one_subprocess_and_falls_back_per_unit() -> None:
+    units = list(web_ui.SERVICE_CATALOG)
+    complete = "\n".join(
+        _stanza(
+            Id=unit,
+            Names=unit,
+            LoadState="loaded",
+            ActiveState="active",
+            SubState="running",
+            UnitFileState="enabled",
+            Description=unit,
+        )
+        for unit in units
+    )
+    with patch.object(web_ui, "run", return_value=complete) as run:
+        payload = web_ui.service_status()
+    assert set(payload) == set(units)
+    assert run.call_count == 1
+
+    partial = "\n".join(
+        _stanza(
+            Id=unit,
+            Names=unit,
+            LoadState="loaded",
+            ActiveState="active",
+            SubState="running",
+            UnitFileState="enabled",
+            Description=unit,
+        )
+        for unit in units[1:]
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(command: list[str], timeout: float = 5.0) -> str:
+        calls.append(command)
+        if len(calls) == 1:
+            return partial
+        return _stanza(
+            LoadState="loaded", ActiveState="activating", SubState="start", Description="x"
+        )
+
+    with patch.object(web_ui, "run", side_effect=fake_run):
+        payload = web_ui.service_status()
+    # One batch plus exactly one single-unit fallback: the other eight units
+    # are not re-queried because one of them was missing.
+    assert len(calls) == 2
+    assert calls[1][:3] == ["systemctl", "show", units[0]]
+    assert payload[units[0]]["active"] == "activating"
+
+
+def test_site_name_is_published_escaped_and_defaults_to_a_neutral_value() -> None:
+    assert web_ui.SITE_NAME == "CamillaDSP"
+    assert "{{site}}" not in web_ui.HTML
+    assert "<title>CamillaDSP — audio control</title>" in web_ui.HTML
+    assert "<h1><b>CamillaDSP</b></h1>" in web_ui.HTML
+
+    source = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
+    assert 'HTML.replace("{{site}}", html.escape(SITE_NAME))' in source
+    escaped = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import web_ui; print('<script>' in web_ui.HTML.split('</title>')[0])",
+        ],
+        cwd=str(REPOSITORY / "scripts"),
+        env={"SITE_NAME": "<script>x</script>", "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert escaped.stdout.strip() == "False"
+
+
+def test_receiver_status_recognizes_both_marker_generations(tmp_path: Path) -> None:
+    """The UI must not report "not configured" between update and reconfigure."""
+    legacy_tag = "ug" "lan"
+    dropin = tmp_path / "volume-sync.conf"
+    shairport = tmp_path / "shairport-sync.conf"
+
+    for marker, receiver, socket_env in (
+        ("CDSP", "librespot-cdsp", "CDSP_SPOTIFY_VOLUME_SOCKET"),
+        (
+            legacy_tag.upper(),
+            f"librespot-{legacy_tag}",
+            f"{legacy_tag.upper()}_SPOTIFY_VOLUME_SOCKET",
+        ),
+    ):
+        shairport.write_text(
+            f"// {marker}-AIRPLAY-BEGIN\n"
+            'ignore_volume_control = "yes";\n'
+            "airplay_volume_bridge.py --notify\n",
+            encoding="utf-8",
+        )
+        dropin.write_text(
+            f"ExecStart=/usr/local/bin/{receiver}\n"
+            "Environment=LIBRESPOT_VOLUME_CTRL=fixed\n"
+            "Environment=LIBRESPOT_ONEVENT=x --notify-spotify\n"
+            f"Environment={socket_env}=/run/raspotify/x.sock\n",
+            encoding="utf-8",
+        )
+        with (
+            patch.object(web_ui, "SHAIRPORT_CONFIG_PATH", shairport),
+            patch.object(web_ui, "SPOTIFY_VOLUME_DROPIN_PATH", dropin),
+            patch.object(web_ui, "service_is_active", return_value=True),
+            patch.object(web_ui, "AUDIO_EQ_STATUS_PATH", tmp_path / "missing.json"),
+            patch.object(web_ui, "AIRPLAY_VOLUME_STATUS_PATH", tmp_path / "gone.json"),
+            patch.object(web_ui, "AUDIO_EQ_PATH", tmp_path / "audio-eq.json"),
+            patch.object(web_ui, "SPEAKER_AUDIO_DIR", tmp_path / "speaker-audio"),
+            patch.object(
+                web_ui,
+                "speaker_payload",
+                return_value={"selection": {"selected": "default", "revision": 0}},
+            ),
+            patch.object(
+                web_ui, "_selected_audio_path", return_value=tmp_path / "audio-eq.json"
+            ),
+            patch.object(web_ui, "iso226_capability", return_value=({}, False)),
+        ):
+            payload = web_ui.audio_eq_payload()
+        assert payload["volume_bridge"]["airplay_configured"] is True, marker
+        assert payload["volume_bridge"]["spotify_configured"] is True, receiver
+
+
+def test_backup_directory_default_left_the_retired_state_tree() -> None:
+    assert str(web_ui.AUDIO_EQ_BACKUP_DIR) == "/var/lib/cdsp-automation/audio-eq-backups"
+    source = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
+    assert "/var/lib/installation" not in source

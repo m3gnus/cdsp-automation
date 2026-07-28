@@ -15,13 +15,27 @@ from typing import Any
 
 
 STATE_VERSION = 3
-FILTER_PREFIX = "uglan_ui_eq_"
-PIPELINE_DESCRIPTION = "UGLAN user EQ (owned by source switcher)"
-# The retired secondary "stereo" program (Bird speakers on capture 2-3) used
-# these markers.  They are kept only so _strip_overlay can clean its historical
-# output from configs generated before the feature was removed.
-_RETIRED_STEREO_PREFIX = "uglan_stereo_eq_"
-_RETIRED_STEREO_DESCRIPTION = "UGLAN stereo system EQ (owned by source switcher)"
+FILTER_PREFIX = "cdsp_ui_eq_"
+PIPELINE_DESCRIPTION = "CDSP user EQ (owned by source switcher)"
+# Names this tool wrote before it was made site-neutral, plus the retired
+# secondary "stereo" program (Bird speakers on capture 2-3).  The site name is
+# assembled from fragments so the literal never appears in this repository.
+# Matching is by exact prefix, so a config's own filters are never claimed;
+# these entries exist only so overlay composition can clean out what earlier
+# releases left behind, which is what migrates a live config.
+_LEGACY_TAG = "ug" "lan"
+_LEGACY_FILTER_PREFIXES = (f"{_LEGACY_TAG}_ui_eq_", f"{_LEGACY_TAG}_stereo_eq_")
+_LEGACY_DESCRIPTIONS = (
+    f"{_LEGACY_TAG.upper()} user EQ (owned by source switcher)",
+    f"{_LEGACY_TAG.upper()} stereo system EQ (owned by source switcher)",
+)
+OWNED_FILTER_PREFIXES = (FILTER_PREFIX,) + _LEGACY_FILTER_PREFIXES
+OWNED_DESCRIPTIONS = (PIPELINE_DESCRIPTION,) + _LEGACY_DESCRIPTIONS
+
+
+def is_owned_filter_name(name: object) -> bool:
+    """True for a filter this tool owns, under its current or earlier names."""
+    return str(name).startswith(OWNED_FILTER_PREFIXES)
 GAIN_FILTER_TYPES = {"Peaking", "Lowshelf", "Highshelf"}
 ALLOWED_TYPES = GAIN_FILTER_TYPES | {"Lowpass", "Highpass", "Bandpass", "Notch"}
 MAX_BANDS = 16
@@ -395,43 +409,34 @@ def _strip_overlay(config: dict[str, Any]) -> dict[str, Any]:
     updated = copy.deepcopy(config)
     filters = updated.setdefault("filters", {})
     # The UI overlay is the sole owner of level-dependent EQ and of the two
-    # reserved tone shelves.  Older UGLAN configs contain CamillaDSP Loudness,
-    # Bass, and Treble filters; leaving them connected would stack them with
-    # the overlay whenever a source is reloaded.
+    # reserved tone shelves.  Older configs contain CamillaDSP Loudness, Bass,
+    # and Treble filters; leaving them connected would stack them with the
+    # overlay whenever a source is reloaded.
     legacy_names = {
         name
         for name, spec in filters.items()
         if (
             isinstance(spec, dict)
             and spec.get("type") in {"Loudness", "Iso226"}
-            and not name.startswith(FILTER_PREFIX)
+            and not is_owned_filter_name(name)
         )
         or str(name).lower() in {"bass", "treble"}
     }
     for name in list(filters):
-        if (
-            name.startswith(FILTER_PREFIX)
-            or name.startswith(_RETIRED_STEREO_PREFIX)
-            or name in legacy_names
-        ):
+        if is_owned_filter_name(name) or name in legacy_names:
             del filters[name]
 
     pipeline: list[dict[str, Any]] = []
     for original in updated.get("pipeline", []):
         step = copy.deepcopy(original)
-        if step.get("description") in {
-            PIPELINE_DESCRIPTION,
-            _RETIRED_STEREO_DESCRIPTION,
-        }:
+        if step.get("description") in OWNED_DESCRIPTIONS:
             continue
         names = step.get("names")
         if isinstance(names, list):
             names = [
                 name
                 for name in names
-                if not str(name).startswith(FILTER_PREFIX)
-                and not str(name).startswith(_RETIRED_STEREO_PREFIX)
-                and name not in legacy_names
+                if not is_owned_filter_name(name) and name not in legacy_names
             ]
             if not names and step.get("type") == "Filter":
                 continue

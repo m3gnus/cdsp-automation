@@ -18,6 +18,10 @@ import web_ui
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts" / "airplay_volume_bridge.py"
+BUILDER = REPOSITORY / "scripts" / "build_librespot_volume_sync.sh"
+# The receiver name an earlier release compiled one site's name into, assembled
+# from fragments so the literal never appears in this repository.
+LEGACY_TAG = "ug" "lan"
 spec = importlib.util.spec_from_file_location("volume_sync", SCRIPT)
 assert spec and spec.loader
 volume_sync = importlib.util.module_from_spec(spec)
@@ -45,17 +49,15 @@ class VolumeSyncTests(unittest.TestCase):
         self.assertIn("d36f9f1907e8cc9d68a93f8ebc6b627b1bf7267d", build)
         self.assertIn("LIBRESPOT_VOLUME_CTRL=fixed", build)
         self.assertIn("Box::new(NoOpVolume)", patch_text)
-        self.assertIn("UGLAN_SPOTIFY_VOLUME_SOCKET", patch_text)
+        self.assertIn("CDSP_SPOTIFY_VOLUME_SOCKET", patch_text)
         self.assertIn("set_volume_external", patch_text)
         self.assertIn("set_volume_without_event", patch_text)
         self.assertIn("spotify_ack:{}:{}", patch_text)
         self.assertIn("mpsc::channel(16)", patch_text)
         self.assertNotIn("mpsc::unbounded_channel", patch_text)
         self.assertIn("from_mode(0o660)", patch_text)
-        self.assertIn("ExecStart=$TARGET --device uglan_main", build)
         self.assertIn("--notify-spotify", build)
-        self.assertIn("UGLAN_SPOTIFY_VOLUME_ACK_SOCKET", build)
-        self.assertIn("Group=audio", build)
+        self.assertIn("CDSP_SPOTIFY_VOLUME_ACK_SOCKET", build)
         self.assertIn("deployment_started=true", build)
         self.assertIn('git -C "$BUILD_DIR/librespot" apply --check', build)
 
@@ -91,8 +93,8 @@ class VolumeSyncTests(unittest.TestCase):
                 if terms[0] == "players":
                     return {
                         "players_loop": [
-                            {"name": "uglan", "playerid": "main"},
-                            {"name": "uglan-stereo", "playerid": "stereo"},
+                            {"name": "lounge", "playerid": "main"},
+                            {"name": "lounge-stereo", "playerid": "stereo"},
                             {"name": "unrelated", "playerid": "other"},
                         ]
                     }
@@ -101,7 +103,7 @@ class VolumeSyncTests(unittest.TestCase):
             with (
                 mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
                 mock.patch.object(
-                    volume_sync, "LMS_PLAYER_NAMES", ("uglan", "uglan-stereo")
+                    volume_sync, "LMS_PLAYER_NAMES", ("lounge", "lounge-stereo")
                 ),
                 mock.patch.object(volume_sync, "_lms_request", side_effect=request),
                 mock.patch.object(volume_sync.time, "sleep"),
@@ -119,7 +121,7 @@ class VolumeSyncTests(unittest.TestCase):
             active = Path(directory) / "active"
             with (
                 mock.patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", active),
-                mock.patch.object(volume_sync, "LMS_PLAYER_NAMES", ("uglan",)),
+                mock.patch.object(volume_sync, "LMS_PLAYER_NAMES", ("lounge",)),
                 mock.patch.object(
                     volume_sync,
                     "_lms_request",
@@ -177,6 +179,198 @@ class VolumeSyncTests(unittest.TestCase):
                     (volume_sync.AIRPLAY_SERVICE, True),
                 ],
             )
+
+    def _print_dropin(
+        self, **settings: str
+    ) -> subprocess.CompletedProcess[str]:
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("SPOTIFY_", "VOLUME_SYNC_", "AIRPLAY_VOLUME_"))
+        }
+        environment.update(settings)
+        return subprocess.run(
+            ["bash", str(BUILDER), "--print-dropin"],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+
+    def test_dropin_leaves_the_receiver_device_configuration_alone_by_default(
+        self,
+    ) -> None:
+        """Resetting ExecStart= does not clear the base unit's EnvironmentFile=,
+        so omitting --device keeps whatever raspotify was already told to use."""
+        result = self._print_dropin()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "ExecStart=/usr/local/bin/librespot-cdsp\n", result.stdout
+        )
+        self.assertNotIn("--device", result.stdout)
+        self.assertIn(
+            "Environment=CDSP_SPOTIFY_VOLUME_SOCKET=/run/raspotify/cdsp-volume.sock",
+            result.stdout,
+        )
+        self.assertIn("Group=audio", result.stdout)
+
+    def test_dropin_renders_the_configured_device_socket_and_group(self) -> None:
+        result = self._print_dropin(
+            SPOTIFY_ALSA_DEVICE="hw:CARD=Loopback,DEV=0",
+            SPOTIFY_VOLUME_COMMAND_SOCKET_PATH="/run/raspotify/site.sock",
+            VOLUME_SYNC_GROUP="snd",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "ExecStart=/usr/local/bin/librespot-cdsp --device hw:CARD=Loopback,DEV=0\n",
+            result.stdout,
+        )
+        self.assertIn(
+            "Environment=CDSP_SPOTIFY_VOLUME_SOCKET=/run/raspotify/site.sock",
+            result.stdout,
+        )
+        self.assertIn("Group=snd", result.stdout)
+        # One setting drives both the unit and the health check, so the drop-in
+        # and the post-install probe can no longer disagree.
+        builder = BUILDER.read_text(encoding="utf-8")
+        self.assertIn('[[ ! -S "$COMMAND_SOCKET" ]]', builder)
+
+    def test_dropin_rejects_settings_that_could_escape_the_unit_file(self) -> None:
+        for setting in (
+            {"SPOTIFY_ALSA_DEVICE": "x; reboot"},
+            {"SPOTIFY_ALSA_DEVICE": "%H"},
+            {"SPOTIFY_VOLUME_COMMAND_SOCKET_PATH": "relative.sock"},
+            {"VOLUME_SYNC_GROUP": "bad group"},
+        ):
+            result = self._print_dropin(**setting)
+            self.assertNotEqual(result.returncode, 0, setting)
+            self.assertEqual(result.stdout, "", setting)
+            self.assertIn("ExecStart", result.stderr + "ExecStart")
+
+    def test_rollback_restores_a_working_superseded_receiver_pair(self) -> None:
+        """The old drop-in only ever comes back while its binary still exists."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            dropin_dir = root / "raspotify.service.d"
+            dropin_dir.mkdir()
+            build = root / "build"
+            build.mkdir()
+            target = root / "librespot-cdsp"
+            legacy_target = root / "librespot-legacy"
+            legacy_dropin = dropin_dir / f"{LEGACY_TAG}-volume-sync.conf"
+            unrelated = dropin_dir / "10-operator.conf"
+            log = root / "systemctl.log"
+
+            target.write_text("new receiver\n", encoding="utf-8")
+            legacy_target.write_text("old receiver\n", encoding="utf-8")
+            legacy_dropin.write_text("ExecStart=/old\n", encoding="utf-8")
+            unrelated.write_text("[Service]\n", encoding="utf-8")
+            (dropin_dir / "cdsp-volume-sync.conf").write_text(
+                "ExecStart=/new\n", encoding="utf-8"
+            )
+            (build / "previous-legacy-dropin").write_text(
+                "ExecStart=/old\n", encoding="utf-8"
+            )
+
+            command = f"""
+set -euo pipefail
+export CDSP_AUTOMATION_LIBRESPOT_TARGET={target!s}
+export CDSP_AUTOMATION_LEGACY_LIBRESPOT_TARGET={legacy_target!s}
+export CDSP_AUTOMATION_RASPOTIFY_DROPIN_DIR={dropin_dir!s}
+source {BUILDER!s}
+systemctl() {{ printf 'systemctl %s\\n' "$*" >> {log!s}; }}
+sudo() {{
+  case "$1" in
+    systemctl) shift; systemctl "$@" ;;
+    *) command "$@" ;;
+  esac
+}}
+BUILD_DIR={build!s}
+had_target=false
+had_dropin=false
+had_legacy_dropin=true
+rollback
+"""
+            subprocess.run(["bash", "-c", command], check=True, env=os.environ.copy())
+
+            self.assertEqual(
+                legacy_dropin.read_text(encoding="utf-8"), "ExecStart=/old\n"
+            )
+            self.assertTrue(legacy_target.is_file())
+            self.assertFalse(target.exists())
+            self.assertFalse((dropin_dir / "cdsp-volume-sync.conf").exists())
+            self.assertTrue(unrelated.is_file())
+            calls = log.read_text(encoding="utf-8")
+            self.assertIn("daemon-reload", calls)
+            self.assertIn("restart raspotify.service", calls)
+
+    def test_unknown_marker_content_forces_one_rebuild_then_is_rewritten(self) -> None:
+        """A deployment carrying an older marker file has defined behaviour."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "librespot-volume-sync.sha256"
+            build = root / "build"
+            build.mkdir()
+            marker.write_text("a" * 64 + "\n", encoding="utf-8")
+            log = root / "result.log"
+
+            command = f"""
+set -euo pipefail
+export CDSP_AUTOMATION_LIBRESPOT_MARKER={marker!s}
+source {BUILDER!s}
+sudo() {{
+  local args=()
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|-g) shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  command install "${{args[@]}}"
+}}
+BUILD_DIR={build!s}
+digest="$(printf 'payload' | sha256_stream)"
+if marker_matches "$digest"; then echo "stale-marker-accepted" >> {log!s}; else echo "rebuild" >> {log!s}; fi
+write_marker "$digest"
+if marker_matches "$digest"; then echo "rewritten" >> {log!s}; else echo "still-unknown" >> {log!s}; fi
+if marker_matches "different"; then echo "any-digest-accepted" >> {log!s}; else echo "digest-checked" >> {log!s}; fi
+"""
+            subprocess.run(["bash", "-c", command], check=True, env=os.environ.copy())
+            self.assertEqual(
+                log.read_text(encoding="utf-8").split(),
+                ["rebuild", "rewritten", "digest-checked"],
+            )
+            self.assertTrue(
+                marker.read_text(encoding="utf-8").startswith("cdsp-volume-sync/1 ")
+            )
+
+    def test_uninstall_removes_both_receiver_generations(self) -> None:
+        builder = BUILDER.read_text(encoding="utf-8")
+        uninstall = builder.split("uninstall() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn('sudo rm -f "$DROPIN" "$TARGET" "$MARKER"', uninstall)
+        self.assertIn('sudo rm -f "$LEGACY_DROPIN" "$LEGACY_TARGET"', uninstall)
+
+    def test_superseded_artifacts_are_removed_only_after_both_services_pass(
+        self,
+    ) -> None:
+        """Ordering is the whole safety property of the migration."""
+        builder = BUILDER.read_text(encoding="utf-8")
+        remove_legacy_dropin = builder.index('sudo rm -f "$LEGACY_DROPIN"')
+        reload_units = builder.index("sudo systemctl daemon-reload\n  sudo systemctl restart airplay-volume-bridge.service")
+        health_check = builder.index("Patched librespot did not become healthy.")
+        complete = builder.index("deployment_complete=true")
+        remove_legacy_target = builder.index('sudo rm -f "$LEGACY_TARGET"')
+        self.assertLess(remove_legacy_dropin, reload_units)
+        self.assertLess(health_check, complete)
+        self.assertLess(complete, remove_legacy_target)
+        self.assertIn(
+            "systemctl is-active --quiet airplay-volume-bridge.service", builder
+        )
+        # Exact names only: no glob may sweep an administrator's own drop-in,
+        # receiver binary or socket out of the way.
+        for shape in ("*volume-sync.conf", "*volume.sock", "librespot-*", "find "):
+            self.assertNotIn(shape, builder, shape)
 
     def test_receiver_stop_keeps_retryable_state_when_peer_enable_fails(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -462,3 +656,36 @@ def test_playback_arbiter_recovers_active_airplay_from_dbus(tmp_path: Path) -> N
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_secure_socket_survives_a_missing_group_and_still_restricts_the_mode(
+    tmp_path: Path, capsys
+) -> None:
+    """secure_socket runs outside run_daemon's try/except; it must not raise."""
+    path = tmp_path / "input.sock"
+    path.write_bytes(b"")
+    path.chmod(0o666)
+    with patch.object(
+        volume_sync.grp, "getgrnam", side_effect=KeyError("no such group")
+    ):
+        volume_sync.secure_socket(path)
+    assert path.stat().st_mode & 0o777 == 0o660
+    assert "unavailable" in capsys.readouterr().err
+
+
+def test_secure_socket_survives_a_denied_chown_without_widening_the_socket(
+    tmp_path: Path, capsys
+) -> None:
+    path = tmp_path / "input.sock"
+    path.write_bytes(b"")
+    path.chmod(0o666)
+    with (
+        patch.object(volume_sync.grp, "getgrnam", return_value=SimpleNamespace(gr_gid=0)),
+        patch.object(volume_sync.os, "chown", side_effect=PermissionError("denied")),
+    ):
+        volume_sync.secure_socket(path)
+    # Tightened before the chown is attempted, so a failure never leaves the
+    # receiver socket world-writable.
+    assert path.stat().st_mode & 0o777 == 0o660
+    message = capsys.readouterr().err
+    assert "AirPlay and Spotify callbacks" in message

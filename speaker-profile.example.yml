@@ -5,7 +5,8 @@
 # Prefer the parametric form: replace the hand-written `camilladsp:` fragment
 # with a `crossover:` section (ways, slopes, trims, delays, outputs) and the
 # fragment plus all routing fields are generated and validated automatically —
-# editable from the control UI. See speaker-profiles/*.yml in uglan-lights.
+# editable from the control UI. See the *.yml files already in your
+# SPEAKER_PROFILE_DIR for worked examples.
 version: 1
 id: partymeh
 label: PartyMEH

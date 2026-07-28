@@ -23,6 +23,57 @@ if [[ "${1:-}" == "--uninstall" ]]; then
   exit 0
 fi
 
+# Replacing $TARGET only changes what plays if camilladsp.service actually
+# starts that path.  Decide that before any toolchain check, clone or compile,
+# so an incompatible layout costs a message instead of a full Rust build.
+engine_preflight() {
+  local pid exec_line exec_path target resolved
+  target="$(readlink -f "$TARGET" 2>/dev/null || printf '%s' "$TARGET")"
+  if ! systemctl cat camilladsp.service >/dev/null 2>&1; then
+    echo "camilladsp.service is not installed" >&2
+    return 1
+  fi
+  pid="$(systemctl show -p MainPID --value camilladsp.service 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    # Exactly the evidence the post-install verification below trusts.
+    if [[ "$(sudo readlink -f "/proc/$pid/exe" 2>/dev/null || true)" == "$target" ]]; then
+      return 0
+    fi
+    echo "camilladsp.service is running a binary other than $TARGET" >&2
+    return 1
+  fi
+  # Stopped unit: read the unit text rather than systemd's ExecStart record
+  # format.  `systemctl cat` prints the main unit then each drop-in, so the last
+  # assignment is the effective one.
+  exec_line="$(systemctl cat camilladsp.service 2>/dev/null | grep -E '^[[:space:]]*ExecStart=' | tail -n 1 || true)"
+  exec_path="${exec_line#"${exec_line%%[![:space:]]*}"}"
+  exec_path="${exec_path#ExecStart=}"
+  exec_path="${exec_path%% *}"
+  # systemd allows any combination of these command prefixes, in any order.
+  while [[ -n "$exec_path" && "$exec_path" == [-@+!:]* ]]; do
+    exec_path="${exec_path#?}"
+  done
+  exec_path="${exec_path%\"}"
+  exec_path="${exec_path#\"}"
+  if [[ -n "$exec_path" ]]; then
+    resolved="$(readlink -f "$exec_path" 2>/dev/null || printf '%s' "$exec_path")"
+    if [[ "$resolved" == "$target" ]]; then
+      return 0
+    fi
+  fi
+  echo "camilladsp.service starts ${exec_path:-an unknown binary}, not $TARGET" >&2
+  return 1
+}
+
+if [[ "${1:-}" == "--preflight" ]]; then
+  if engine_preflight; then exit 0; fi
+  exit 1
+fi
+
+# A direct invocation gets the same gate as the installer's, so no path can
+# reach cargo with an engine this build could never replace.
+engine_preflight || exit 3
+
 for required in git cargo rustc; do
   command -v "$required" >/dev/null || { echo "Missing build prerequisite: $required" >&2; exit 1; }
 done

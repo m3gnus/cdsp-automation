@@ -203,10 +203,10 @@ index fb85803..5c78f2d 100644
      let mut discovery = None;
      let mut connecting = false;
      let mut _event_handler: Option<EventHandler> = None;
-+    let mut volume_sync = env::var_os("UGLAN_SPOTIFY_VOLUME_SOCKET")
++    let mut volume_sync = env::var_os("CDSP_SPOTIFY_VOLUME_SOCKET")
 +        .map(PathBuf::from)
 +        .and_then(start_volume_sync_socket);
-+    let volume_sync_ack_path = env::var_os("UGLAN_SPOTIFY_VOLUME_ACK_SOCKET").map(PathBuf::from);
++    let volume_sync_ack_path = env::var_os("CDSP_SPOTIFY_VOLUME_ACK_SOCKET").map(PathBuf::from);
 +    let (volume_sync_ack_tx, mut volume_sync_ack_rx) = mpsc::channel(16);
 +    let mut pending_volume_sync: Option<VolumeSyncCommand> = None;
 +    let mut volume_sync_retry = tokio::time::interval(Duration::from_secs(1));

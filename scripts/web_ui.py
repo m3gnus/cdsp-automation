@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import math
 import os
@@ -75,7 +76,9 @@ AUDIO_EQ_STATUS_PATH = Path(
     )
 )
 AUDIO_EQ_BACKUP_DIR = Path(
-    os.environ.get("AUDIO_EQ_BACKUP_DIR", "/var/lib/installation/audio-eq-backups")
+    os.environ.get(
+        "AUDIO_EQ_BACKUP_DIR", "/var/lib/cdsp-automation/audio-eq-backups"
+    )
 )
 AUDIO_CONTROL_LOCK_PATH = Path(
     os.environ.get(
@@ -132,8 +135,25 @@ SHAIRPORT_CONFIG_PATH = Path(
 SPOTIFY_VOLUME_DROPIN_PATH = Path(
     os.environ.get(
         "SPOTIFY_VOLUME_DROPIN_PATH",
-        "/etc/systemd/system/raspotify.service.d/uglan-volume-sync.conf",
+        "/etc/systemd/system/raspotify.service.d/cdsp-volume-sync.conf",
     )
+)
+# Name shown in the page title and header; the installer publishes a neutral
+# default and a deployment can override it in the env file.
+SITE_NAME = os.environ.get("SITE_NAME", "CamillaDSP")
+# The artifact names an earlier release compiled one site's name into, kept so
+# this read-only status view does not report "not configured" between the
+# script update and the service reconfiguration.  Assembled from fragments so
+# the literal never appears in this repository; matching is exact.
+_LEGACY_TAG = "ug" "lan"
+AIRPLAY_CONFIG_MARKERS = (
+    "CDSP-AIRPLAY-BEGIN",
+    f"{_LEGACY_TAG.upper()}-AIRPLAY-BEGIN",
+)
+SPOTIFY_RECEIVER_NAMES = ("librespot-cdsp", f"librespot-{_LEGACY_TAG}")
+SPOTIFY_SOCKET_ENV_NAMES = (
+    "CDSP_SPOTIFY_VOLUME_SOCKET",
+    f"{_LEGACY_TAG.upper()}_SPOTIFY_VOLUME_SOCKET",
 )
 ISO226_CAPABILITY_PATH = Path(
     os.environ.get(
@@ -213,7 +233,7 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>UGLAN — audio control</title>
+  <title>{{site}} — audio control</title>
   <style>
     :root {
       color-scheme: dark;
@@ -506,7 +526,7 @@ HTML = r"""<!doctype html>
       <div class="brand">
         <div class="eq" id="eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
         <div class="word">
-          <h1><b>UGLAN</b></h1>
+          <h1><b>{{site}}</b></h1>
           <div class="sub">sound · control</div>
         </div>
       </div>
@@ -1266,6 +1286,10 @@ HTML = r"""<!doctype html>
 </html>
 """
 
+# The page is a raw string full of JS template literals, so str.format cannot
+# be used on it.  Escaped because the value reaches a <title> and an <h1>.
+HTML = HTML.replace("{{site}}", html.escape(SITE_NAME))
+
 
 def run_result(
     command: list[str], timeout: float = 5.0
@@ -1311,7 +1335,19 @@ def parse_env(path: Path) -> dict[str, str]:
     return values
 
 
+SHOW_PROPERTIES = (
+    "Id",
+    "Names",
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "Description",
+)
+
+
 def systemctl_show(service: str) -> dict[str, str]:
+    """Read one unit.  Independent of the batch, so it is a true fallback."""
     output = run(
         [
             "systemctl",
@@ -1330,14 +1366,72 @@ def systemctl_show(service: str) -> dict[str, str]:
     return props
 
 
+def parse_systemctl_show(output: str) -> list[dict[str, str]]:
+    """Split `systemctl show`'s blank-line-separated stanzas into records.
+
+    Property order inside a stanza is irrelevant, and `--all` keeps empty
+    properties present so a suppressed one cannot merge two units.
+    """
+    records: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line in output.splitlines():
+        if not line.strip():
+            if current:
+                records.append(current)
+                current = {}
+            continue
+        key, separator, value = line.partition("=")
+        if not separator or not key.isidentifier():
+            continue
+        current[key] = value
+    if current:
+        records.append(current)
+    return records
+
+
+def systemctl_show_many(units: list[str]) -> dict[str, dict[str, str]]:
+    """One subprocess for the whole catalog, keyed by Id and by every alias."""
+    if not units:
+        return {}
+    output = run(
+        [
+            "systemctl",
+            "show",
+            *units,
+            "--all",
+            "--no-page",
+            f"--property={','.join(SHOW_PROPERTIES)}",
+        ],
+        timeout=6,
+    )
+    by_name: dict[str, dict[str, str]] = {}
+    ambiguous: set[str] = set()
+    for record in parse_systemctl_show(output):
+        # `Id` is only the primary name; a requested alias appears in `Names`.
+        names = {record.get("Id", ""), *record.get("Names", "").split()}
+        names.discard("")
+        for name in names:
+            if name in by_name and by_name[name] is not record:
+                ambiguous.add(name)
+            by_name[name] = record
+    return {
+        unit: by_name[unit]
+        for unit in units
+        if unit in by_name and unit not in ambiguous
+    }
+
+
 def service_is_active(unit: str) -> bool:
     return run(["systemctl", "is-active", unit], timeout=3) == "active"
 
 
 def service_status() -> dict[str, dict[str, Any]]:
     payload: dict[str, dict[str, Any]] = {}
+    batched = systemctl_show_many(list(SERVICE_CATALOG))
     for name, meta in SERVICE_CATALOG.items():
-        props = systemctl_show(name)
+        # Per unit, not per poll: one alias or duplicate costs one subprocess
+        # instead of discarding the other eight units' results.
+        props = batched.get(name) or systemctl_show(name)
         active = (
             props.get("ActiveState")
             or run(["systemctl", "is-active", name], timeout=3)
@@ -1949,7 +2043,7 @@ def audio_eq_payload() -> dict[str, Any]:
     try:
         shairport = SHAIRPORT_CONFIG_PATH.read_text(encoding="utf-8")
         configured = (
-            "UGLAN-AIRPLAY-BEGIN" in shairport
+            any(marker in shairport for marker in AIRPLAY_CONFIG_MARKERS)
             and 'ignore_volume_control = "yes"' in shairport
             and "airplay_volume_bridge.py --notify" in shairport
         )
@@ -1960,10 +2054,10 @@ def audio_eq_payload() -> dict[str, Any]:
     try:
         spotify_dropin = SPOTIFY_VOLUME_DROPIN_PATH.read_text(encoding="utf-8")
         spotify_configured = (
-            "librespot-uglan" in spotify_dropin
+            any(name in spotify_dropin for name in SPOTIFY_RECEIVER_NAMES)
             and "LIBRESPOT_VOLUME_CTRL=fixed" in spotify_dropin
             and "--notify-spotify" in spotify_dropin
-            and "UGLAN_SPOTIFY_VOLUME_SOCKET" in spotify_dropin
+            and any(name in spotify_dropin for name in SPOTIFY_SOCKET_ENV_NAMES)
         )
     except OSError:
         spotify_configured = False

@@ -55,7 +55,7 @@ SOCKET_PATH = Path(
 SPOTIFY_COMMAND_SOCKET_PATH = Path(
     os.environ.get(
         "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH",
-        "/run/raspotify/uglan-volume.sock",
+        "/run/raspotify/cdsp-volume.sock",
     )
 )
 POLL_INTERVAL = float(os.environ.get("VOLUME_SYNC_POLL_INTERVAL", "0.25"))
@@ -540,10 +540,24 @@ def read_mirrorable_camilla_volume(client) -> tuple[float, bool] | None:
 
 
 def secure_socket(path: Path) -> None:
-    """Restrict local volume control to the installation's audio group."""
-    gid = grp.getgrnam(VOLUME_SYNC_GROUP).gr_gid
-    os.chown(path, -1, gid)
+    """Restrict local volume control to the installation's audio group.
+
+    Runs before run_daemon's try/except, so an unknown group or a denied chown
+    used to crash-loop the unit under Restart=always.  The mode is tightened
+    first, so a failed chown never leaves the socket world-writable.
+    """
     path.chmod(0o660)
+    try:
+        os.chown(path, -1, grp.getgrnam(VOLUME_SYNC_GROUP).gr_gid)
+    except (KeyError, OSError) as exc:
+        print(
+            f"Volume-sync group {VOLUME_SYNC_GROUP!r} unavailable ({exc}); the "
+            "receiver socket keeps this service's own group, so AirPlay and "
+            "Spotify callbacks can reach it only if they already run as this "
+            "user or as root",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 class SpotifyCommandTracker:

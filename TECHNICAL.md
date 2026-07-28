@@ -233,17 +233,19 @@ The script searches for the configured `REMOTE_NAME` from `~/camilladsp/cdsp-aut
 **CamillaDSP requirements:**
 
 Tone control is stored in `/var/lib/cdsp-automation/audio-eq.json` and applied
-through the source switcher's owned `uglan_ui_eq_*` overlay. The remote adjusts
+through the source switcher's owned `cdsp_ui_eq_*` overlay. The remote adjusts
 the reserved low/high shelf bands. Source configs must not add separate
 `Bass`, `Treble`, `Loudness`, or `Iso226` stages because those would stack with
 the owned overlay; legacy stages are stripped when a config becomes active.
+Filters written under this tool's earlier owned prefix are stripped by the same
+pass, so a config recomposed after an update carries only the current names.
 
 ---
 
 ## 5. Web Control UI (optional)
 
 `scripts/web_ui.py` is a single-file stdlib `http.server` dashboard installed
-by menu option 11 as `cdsp-control-ui.service`. It reuses the sibling modules
+by menu option 12 as `cdsp-control-ui.service`. It reuses the sibling modules
 in `scripts/` (`audio_eq.py`, `speaker_profiles.py`, `speaker_config.py`,
 `speaker_xo.py`) and the shared `cdsp-automation.env`, and it respects the
 single-writer contract: every EQ or speaker edit goes through the persistent

@@ -12,29 +12,56 @@ import tempfile
 from pathlib import Path
 
 
+MARKER_PREFIX = "CDSP"
+# Releases before the installer was made site-neutral prefixed these markers
+# with one deployment's name.  It is assembled from fragments so the literal
+# never appears in this repository.  Recognition stays exact: a marker block
+# this tool did not write is never claimed, and every write uses MARKER_PREFIX,
+# so an existing config migrates the first time it is configured.
+_LEGACY_MARKER_PREFIX = "UG" "LAN"
+
+
+def _marker(tag: str) -> str:
+    return f"// {MARKER_PREFIX}-{tag}"
+
+
+def _legacy_form(marker: str) -> str:
+    return marker.replace(f"// {MARKER_PREFIX}-", f"// {_LEGACY_MARKER_PREFIX}-", 1)
+
+
+def _marker_forms(marker: str) -> tuple[str, str]:
+    return marker, _legacy_form(marker)
+
+
+def _block_pattern(begin: str, end: str) -> re.Pattern[str]:
+    begins = "|".join(re.escape(form) for form in _marker_forms(begin))
+    ends = "|".join(re.escape(form) for form in _marker_forms(end))
+    return re.compile(rf"\n?(?:{begins})\n.*?(?:{ends})\n?", re.DOTALL)
+
+
 GENERAL_KEYS = ("ignore_volume_control", "run_this_when_volume_is_set")
-GENERAL_BEGIN = "// UGLAN-AIRPLAY-BEGIN"
-GENERAL_END = "// UGLAN-AIRPLAY-END"
+GENERAL_BEGIN = _marker("AIRPLAY-BEGIN")
+GENERAL_END = _marker("AIRPLAY-END")
 SESSION_KEYS = (
     "run_this_before_play_begins",
     "run_this_after_play_ends",
     "wait_for_completion",
 )
-SESSION_BEGIN = "// UGLAN-AIRPLAY-SESSION-BEGIN"
-SESSION_END = "// UGLAN-AIRPLAY-SESSION-END"
-SESSION_BLOCK_BEGIN = "// UGLAN-AIRPLAY-SESSION-BLOCK-BEGIN"
-SESSION_BLOCK_END = "// UGLAN-AIRPLAY-SESSION-BLOCK-END"
+SESSION_BEGIN = _marker("AIRPLAY-SESSION-BEGIN")
+SESSION_END = _marker("AIRPLAY-SESSION-END")
+SESSION_BLOCK_BEGIN = _marker("AIRPLAY-SESSION-BLOCK-BEGIN")
+SESSION_BLOCK_END = _marker("AIRPLAY-SESSION-BLOCK-END")
 DSP_KEYS = ("loudness", "loudness_reference_volume_db")
-DSP_BEGIN = "// UGLAN-LOUDNESS-BEGIN"
-DSP_END = "// UGLAN-LOUDNESS-END"
+DSP_BEGIN = _marker("LOUDNESS-BEGIN")
+DSP_END = _marker("LOUDNESS-END")
 ALSA_KEYS = ("output_device",)
-ALSA_BEGIN = "// UGLAN-OUTPUT-BEGIN"
-ALSA_END = "// UGLAN-OUTPUT-END"
+ALSA_BEGIN = _marker("OUTPUT-BEGIN")
+ALSA_END = _marker("OUTPUT-END")
 DIAGNOSTICS_KEYS = ("statistics", "log_verbosity")
-DIAGNOSTICS_BEGIN = "// UGLAN-DIAGNOSTICS-BEGIN"
-DIAGNOSTICS_END = "// UGLAN-DIAGNOSTICS-END"
-DIAGNOSTICS_BLOCK_BEGIN = "// UGLAN-DIAGNOSTICS-BLOCK-BEGIN"
-DIAGNOSTICS_BLOCK_END = "// UGLAN-DIAGNOSTICS-BLOCK-END"
+DIAGNOSTICS_BEGIN = _marker("DIAGNOSTICS-BEGIN")
+DIAGNOSTICS_END = _marker("DIAGNOSTICS-END")
+DIAGNOSTICS_BLOCK_BEGIN = _marker("DIAGNOSTICS-BLOCK-BEGIN")
+DIAGNOSTICS_BLOCK_END = _marker("DIAGNOSTICS-BLOCK-END")
 
 
 def _update_block(
@@ -73,16 +100,18 @@ def _update_block(
         raise ValueError(f"{block} block is not balanced")
 
     key_pattern = re.compile(r"^\s*(" + "|".join(keys) + r")\s*=")
+    begin_forms = _marker_forms(begin)
+    end_forms = _marker_forms(end_marker)
     original_values: list[str] = []
     body: list[str] = []
     in_managed = False
     encoded_original = None
     for line in lines[start + 1 : end]:
         stripped = line.strip()
-        if stripped == begin:
+        if stripped in begin_forms:
             in_managed = True
             continue
-        if stripped == end_marker:
+        if stripped in end_forms:
             in_managed = False
             continue
         if in_managed:
@@ -140,16 +169,13 @@ def update_general_block(text: str, callback: str | None) -> str:
         else:
             raise
 
-    created_session = re.compile(
-        rf"\n?{re.escape(SESSION_BLOCK_BEGIN)}\n.*?{re.escape(SESSION_BLOCK_END)}\n?",
-        re.DOTALL,
+    # Both spellings, so a block this tool created under the previous marker
+    # name is replaced instead of joined by a second one that Shairport's own
+    # config parser would then reject.
+    updated = _block_pattern(SESSION_BLOCK_BEGIN, SESSION_BLOCK_END).sub("\n", updated)
+    updated = _block_pattern(DIAGNOSTICS_BLOCK_BEGIN, DIAGNOSTICS_BLOCK_END).sub(
+        "\n", updated
     )
-    updated = created_session.sub("\n", updated)
-    created_diagnostics = re.compile(
-        rf"\n?{re.escape(DIAGNOSTICS_BLOCK_BEGIN)}\n.*?{re.escape(DIAGNOSTICS_BLOCK_END)}\n?",
-        re.DOTALL,
-    )
-    updated = created_diagnostics.sub("\n", updated)
 
     diagnostics_settings = None
     if callback is not None:

@@ -11,6 +11,19 @@ Before installing, ensure you have:
 - CamillaDSP installed and running
 - Python 3.10 or newer
 
+**For the optional ISO 226 Loudness Engine:**
+- `camilladsp.service` must start `/usr/local/bin/camilladsp`, because the
+  engine replaces that exact binary. A CamillaDSP installed elsewhere is
+  detected before anything is compiled: Install All skips it with a note in the
+  run summary and installs everything else, while menu option 10 fails and
+  prints the reason.
+
+**For the optional Spotify Volume Sync:**
+- A `raspotify.service`. Without one the step is skipped with a note.
+- The receiver inherits raspotify's own output device. Set
+  `SPOTIFY_ALSA_DEVICE` in `~/camilladsp/cdsp-automation.env` (see `aplay -L`)
+  only to override it.
+
 **For Trigger Control:**
 - 5V relay module ([like this](https://www.aliexpress.com/item/1005007109343076.html))
 - Mono 3.5mm jack connector ([like this](https://www.aliexpress.com/item/32704200322.html))
@@ -210,7 +223,7 @@ REMOTE_VOLUME_STEP=1
 ### CamillaDSP Filter Ownership
 
 Do not add legacy filters named `Bass`, `Treble`, or `loudness` to source
-configs. The source switcher owns the persistent `uglan_ui_eq_*` overlay and
+configs. The source switcher owns the persistent `cdsp_ui_eq_*` overlay and
 uses its reserved low/high shelves for remote tone control. It also removes
 legacy connected tone and loudness stages so they cannot stack with the GUI EQ
 or the optional ISO226 filter.
@@ -476,10 +489,18 @@ The installer menu provides these options:
 7. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
 8. **Show Service Status** - Check if services are running
 9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the CamillaDSP fader
-10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build
-11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
-12. **Uninstall All Utilities** - Remove the services, units and sudoers rule.
+10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build.
+    Requires `camilladsp.service` to start `/usr/local/bin/camilladsp`.
+11. **Uninstall All Utilities** - Remove the services, units and sudoers rules.
     Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
+12. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
+
+Options 11 and 12 ask for a `y/N` confirmation before acting: one removes every
+managed service, the other exposes an unauthenticated root web server.
+
+Options 1, 2 and 9 end with a summary listing any component that was skipped or
+failed, and no longer abandon the rest of the run when one of them cannot be
+installed.
 
 ### What Gets Installed
 
