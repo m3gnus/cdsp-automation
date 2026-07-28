@@ -249,27 +249,25 @@ def apply_volume(airplay_db: float) -> dict:
             pass
 
 
-def notify(airplay_db: str) -> None:
-    """Send a non-blocking local datagram; safe for Shairport's callback path."""
-    float(airplay_db.split(",", 1)[0])
+def send_local_datagram(message: str, path: Path = SOCKET_PATH) -> None:
     client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     try:
         client.settimeout(0.1)
-        client.sendto(f"airplay:{airplay_db}".encode("ascii"), str(SOCKET_PATH))
+        client.sendto(message.encode("ascii"), str(path))
     finally:
         client.close()
+
+
+def notify(airplay_db: str) -> None:
+    """Send a non-blocking local datagram; safe for Shairport's callback path."""
+    float(airplay_db.split(",", 1)[0])
+    send_local_datagram(f"airplay:{airplay_db}")
 
 
 def notify_airplay_session(active: bool) -> None:
     """Ask the daemon to hand network playback to or from AirPlay."""
     target = "airplay-active" if active else ""
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        client.settimeout(0.1)
-        event = "start" if active else "stop"
-        client.sendto(f"airplay_session:{event}".encode("ascii"), str(SOCKET_PATH))
-    finally:
-        client.close()
+    send_local_datagram(f"airplay_session:{'start' if active else 'stop'}")
     deadline = time.monotonic() + AIRPLAY_HANDOFF_TIMEOUT
     while time.monotonic() < deadline:
         try:
@@ -372,12 +370,7 @@ def notify_spotify(environ: dict[str, str] | None = None) -> None:
         message = "spotify_session:stop"
     else:
         return
-    client = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    try:
-        client.settimeout(0.1)
-        client.sendto(message.encode("ascii"), str(SOCKET_PATH))
-    finally:
-        client.close()
+    send_local_datagram(message)
 
 
 def service_is_active(service: str) -> bool:

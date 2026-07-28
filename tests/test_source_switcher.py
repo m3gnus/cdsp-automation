@@ -332,6 +332,62 @@ def test_missing_iso226_capability_reports_bypass_when_config_is_already_safe() 
     assert "capability is missing" in statuses[-1]["error"]
 
 
+def test_periodic_eq_reconcile_locks_and_rechecks_speaker_selection(
+    tmp_path: Path,
+) -> None:
+    held: list[str] = []
+
+    @contextlib.contextmanager
+    def lock(name: str):
+        held.append(name)
+        try:
+            yield
+        finally:
+            held.pop()
+
+    def current_selection() -> dict:
+        assert held == ["audio", "selection"]
+        return {"selected": "partymeh", "revision": 4}
+
+    def ensure(_client: object, *, speaker_id: str) -> None:
+        assert held == ["audio", "selection"]
+        assert speaker_id == "partymeh"
+
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "audio_control_lock", side_effect=lambda _path: lock("audio")),
+        patch.object(
+            switcher,
+            "speaker_selection_lock",
+            side_effect=lambda _path: lock("selection"),
+        ),
+        patch.object(
+            switcher, "current_speaker_selection", side_effect=current_selection
+        ),
+        patch.object(switcher, "ensure_audio_eq", side_effect=ensure) as apply_eq,
+    ):
+        switcher.ensure_current_speaker_audio_eq(object(), "partymeh")
+
+    apply_eq.assert_called_once()
+    assert held == []
+
+
+def test_periodic_eq_reconcile_skips_a_newly_selected_speaker() -> None:
+    with (
+        patch.object(switcher, "audio_control_lock", return_value=nullcontext()),
+        patch.object(switcher, "speaker_selection_lock", return_value=nullcontext()),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": "measurement", "revision": 5},
+        ),
+        patch.object(switcher, "ensure_audio_eq") as apply_eq,
+    ):
+        switcher.ensure_current_speaker_audio_eq(object(), "partymeh")
+
+    apply_eq.assert_not_called()
+
+
 def test_speaker_config_switch_is_muted_validated_and_volume_clamped(
     tmp_path: Path,
 ) -> None:

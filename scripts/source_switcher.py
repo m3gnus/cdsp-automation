@@ -412,9 +412,7 @@ def managed_config_identity(current: str | None) -> tuple[str, str] | None:
 
 def source_for_config(current: str | None) -> str | None:
     identity = managed_config_identity(current)
-    if identity:
-        return identity[0]
-    return None
+    return identity[0] if identity else None
 
 
 def speaker_for_config(current: str | None) -> str | None:
@@ -726,9 +724,7 @@ def resolve_config_target(
 
 
 def audio_active(levels: object) -> bool:
-    if not isinstance(levels, (list, tuple)):
-        return False
-    return any(
+    return isinstance(levels, (list, tuple)) and any(
         isinstance(level, (int, float)) and level > AUDIO_THRESHOLD_DB
         for level in levels
     )
@@ -901,6 +897,16 @@ def ensure_audio_eq(
             "speaker": speaker_id,
         }
     )
+
+
+def ensure_current_speaker_audio_eq(cdsp: CamillaClient, current_speaker: str) -> None:
+    """Reconcile EQ only while the selection still matches the live crossover."""
+    with audio_control_lock(AUDIO_CONTROL_LOCK_PATH), speaker_selection_lock(
+        SPEAKER_SELECTION_PATH
+    ):
+        if current_speaker_selection()["selected"] != current_speaker:
+            return
+        ensure_audio_eq(cdsp, speaker_id=current_speaker)
 
 
 def apply_config(
@@ -1318,12 +1324,11 @@ def main() -> int:
             if now >= next_audio_eq_check and current_speaker == selected_speaker:
                 next_audio_eq_check = now + AUDIO_EQ_REAPPLY_SECONDS
                 try:
-                    ensure_audio_eq(cdsp)
+                    ensure_current_speaker_audio_eq(cdsp, current_speaker)
                 except Exception as exc:
                     try:
-                        state = speaker_audio_state(
-                            current_speaker_selection()["selected"]
-                        )
+                        failed_speaker = current_speaker_selection()["selected"]
+                        state = speaker_audio_state(failed_speaker)
                         _write_audio_eq_status(
                             {
                                 **status_payload(
@@ -1332,7 +1337,7 @@ def main() -> int:
                                     effective_preamp=effective_preamp_db(state),
                                     error=str(exc),
                                 ),
-                                "speaker": current_speaker_selection()["selected"],
+                                "speaker": failed_speaker,
                             }
                         )
                     except Exception:
