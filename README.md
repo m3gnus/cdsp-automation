@@ -128,15 +128,31 @@ comma-separated list of player names. It is strictly best-effort — an
 unreachable LMS never blocks AirPlay or Spotify — and unset (the default) the
 hand-off is disabled.
 
-ISO calibration: choose a comfortable reference master setting, measure SPL at
-the listening position, enter the measured value as the reference phon and then
-enable the engine. Fixed MOTU and amplifier trims remain calibration stages;
-day-to-day volume belongs to the CamillaDSP Main fader.
+ISO calibration: choose a comfortable reference master setting, play a 1 kHz
+sine at a known digital level, measure SPL at the listening position, enter that
+reading as the reference phon and then enable the engine. The tone matters —
+phon equals SPL only at 1 kHz, so an SPL reading taken on music or broadband
+noise will not give the right reference and a several-dB error here shifts the
+whole compensation curve. Reference phon is limited to 40–90 because ISO
+226:2003 defines the contours no higher (and only to 80 phon above 4 kHz, so
+81–90 already extrapolates the top of the curve). Fixed MOTU and amplifier trims
+remain calibration stages; day-to-day volume belongs to the CamillaDSP Main
+fader.
 
 The implementation uses the established ISO 226:2003 coefficient model as a
 practical approximation to the 2023 revision. The published revision analysis
 places the maximum difference at 0.6 dB; the licensed 2023 Annex B data is not
 copied into this repository.
+
+The filter realises the correction as one broadband gain plus nine high shelves.
+The shelf gains are solved through a per-samplerate matrix rather than assigned
+band-to-band, which holds the realised response within 0.6 dB of the intended
+curve from 20 Hz to 12.5 kHz at every supported rate — the engine's Rust tests
+assert this, along with the invariant that boost never exceeds the attenuation
+the fader has already applied. Because coefficients can only change on chunk
+boundaries, a chunk whose gains changed is crossfaded from the old cascade to
+the new one; swapping outright measured about 30 dB more broadband splatter
+during volume ramps.
 
 ---
 

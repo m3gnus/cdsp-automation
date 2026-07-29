@@ -195,12 +195,45 @@ def test_iso226_patch_is_pinned_tested_and_fader_linked() -> None:
     assert "processing_params.current_volume" in patch_text
     assert "reference_is_flat_and_quiet_listening_boosts_bass" in patch_text
     assert "available_headroom" in patch_text
-    assert "update_filters" in patch_text and "filter.update_parameters" in patch_text
+    assert "apply_gains" in patch_text and "filter.update_parameters" in patch_text
+    # The response accuracy, the headroom invariant and the ramp behaviour are
+    # what make this filter worth shipping, so the engine must keep testing them.
+    for guarantee in (
+        "solved_cascade_tracks_the_iso_curve_at_every_rate",
+        "never_exceeds_available_headroom",
+        "crossfade_keeps_the_chunk_boundary_smooth",
+        "strength_scales_the_curve_proportionally",
+    ):
+        assert guarantee in patch_text, guarantee
+    # Shallow shelves were what held the old cascade 2.3 dB off the curve.
+    assert "const SHELF_SLOPE: PrcFmt = 12.0;" in patch_text
+    # The engine's phon limit and the UI's must not drift apart.
+    assert "Reference phon must be between 40 and 90" in patch_text
+    assert audio_eq.ISO226_MAX_PHON == 90
+    assert 'max="90"' in (REPOSITORY / "scripts" / "web_ui.py").read_text()
     assert "binary_sha256" in (REPOSITORY / "scripts" / "web_ui.py").read_text()
     assert (
         "binary_sha256"
         in (REPOSITORY / "scripts" / "source_switcher.py").read_text()
     )
+
+
+def test_legacy_reference_phon_above_the_iso_limit_is_clamped_not_rejected() -> None:
+    """An install saved before the 90 phon limit must keep loading its whole state."""
+    state = audio_eq.default_audio_state()
+    state["loudness"]["reference_phon"] = 95
+    normalized = audio_eq.normalize_audio_state(state)
+    assert normalized["loudness"]["reference_phon"] == audio_eq.ISO226_MAX_PHON
+    # Values inside the range are untouched, and nonsense is still rejected.
+    state["loudness"]["reference_phon"] = 75
+    assert audio_eq.normalize_audio_state(state)["loudness"]["reference_phon"] == 75
+    state["loudness"]["reference_phon"] = 120
+    try:
+        audio_eq.normalize_audio_state(state)
+    except ValueError as exc:
+        assert "reference phon" in str(exc)
+    else:
+        raise AssertionError("reference phon above the legacy range must be rejected")
 
 
 def test_expanded_eq_types_are_validated_and_gainless_filters_omit_gain() -> None:

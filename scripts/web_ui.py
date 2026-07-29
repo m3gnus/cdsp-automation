@@ -930,8 +930,8 @@ HTML = r"""<!doctype html>
       const l=audioState.loudness;
       qs("#loudnessPlan").innerHTML = `<div class="cap">ISO 226 loudness</div><div class="val sm" style="margin-top:8px">Fader-linked calibration</div>
         <label class="row" style="margin-top:12px"><span class="switch"><input data-loudness-check="enabled" type="checkbox" ${l.enabled?"checked":""} ${audioCapability.available?"":"disabled"}><span></span></span> Enabled</label>
-        <div class="sub2" style="margin-top:8px">At the reference master setting, measure SPL at the listening position and enter that value as phon. Compensation then follows the Main fader inside CamillaDSP.</div>
-        <label class="sub2" style="display:block;margin-top:12px">Reference listening level (phon)<input data-loudness="reference_phon" type="number" min="40" max="100" step="1" value="${l.reference_phon}" style="margin-top:4px"></label>
+        <div class="sub2" style="margin-top:8px">Set the master where you normally listen, play a 1 kHz sine, and enter the SPL you measure at the listening position. Phon equals SPL only at 1 kHz — a reading taken on music or noise will not give the right number. Compensation then follows the Main fader inside CamillaDSP.</div>
+        <label class="sub2" style="display:block;margin-top:12px">Reference listening level (phon)<input data-loudness="reference_phon" type="number" min="40" max="90" step="1" value="${l.reference_phon}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Reference master volume (dB)<input data-loudness="reference_volume_db" type="number" min="-60" max="0" step="0.5" value="${l.reference_volume_db}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Strength<input data-loudness="strength" type="range" min="0" max="1" step="0.05" value="${l.strength}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Maximum bass boost (dB)<input data-loudness="max_bass_boost_db" type="number" min="0" max="18" step="0.5" value="${l.max_bass_boost_db}" style="margin-top:4px"></label>

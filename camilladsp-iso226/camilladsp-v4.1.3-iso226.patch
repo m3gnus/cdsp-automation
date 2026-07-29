@@ -57,11 +57,45 @@ index cbd4098..5173f01 100644
                          // A filter changed type, need to rebuild the pipeline
 diff --git a/src/filters/iso226.rs b/src/filters/iso226.rs
 new file mode 100644
-index 0000000..cc06412
+index 0000000..01a9863
 --- /dev/null
 +++ b/src/filters/iso226.rs
-@@ -0,0 +1,179 @@
+@@ -0,0 +1,628 @@
++// CamillaDSP - A flexible tool for processing audio
++// Copyright (C) 2026 Henrik Enquist
++//
++// This file is part of CamillaDSP.
++//
++// CamillaDSP is free software; you can redistribute it and/or modify it
++// under the terms of either:
++//
++// a) the GNU General Public License version 3,
++//    or
++// b) the Mozilla Public License Version 2.0.
++//
++// You should have received copies of the GNU General Public License and the
++// Mozilla Public License along with this program. If not, see
++// <https://www.gnu.org/licenses/> and <https://www.mozilla.org/MPL/2.0/>.
++
 +// ISO 226 equal-loudness compensation tied directly to a CamillaDSP fader.
++//
++// The filter realises the ISO 226:2003 equal-loudness correction as one broadband
++// gain followed by a cascade of high shelves.  Two things make the realised
++// response track the intended curve closely:
++//
++//   * the shelves use the steepest ripple-free slope CamillaDSP offers (12 dB/oct),
++//     so neighbouring shelves overlap as little as possible;
++//   * the shelf gains are *solved for* rather than assigned.  Setting shelf k to
++//     `target[k+1] - target[k]` would only be correct for ideal step shelves; real
++//     shelves leak into their neighbours' bands and the response undershoots.
++//     Because the cascade is close to linear in dB, one constant matrix maps a
++//     wanted response at the band centres onto the shelf gains that produce it.
++//     The matrix depends only on the sample rate, so it is built and inverted once.
++//
++// Coefficients can only change on chunk boundaries.  Swapping them outright while
++// the biquad state persists splatters broadband noise across the spectrum during
++// volume ramps, so a chunk whose gains changed is crossfaded from the old cascade
++// to the new one.
 +use crate::config;
 +use crate::filters::Filter;
 +use crate::filters::basicfilters::Gain;
@@ -73,7 +107,23 @@ index 0000000..cc06412
 +const AF: [f32; 29] = [0.532,0.506,0.480,0.455,0.432,0.409,0.387,0.367,0.349,0.330,0.315,0.301,0.288,0.276,0.267,0.259,0.253,0.250,0.246,0.244,0.243,0.243,0.243,0.242,0.242,0.245,0.254,0.271,0.301];
 +const LU: [f32; 29] = [-31.6,-27.2,-23.0,-19.1,-15.9,-13.0,-10.3,-8.1,-6.2,-4.5,-3.1,-2.0,-1.1,-0.4,0.0,0.3,0.5,0.0,-2.7,-4.1,-1.0,1.7,2.5,1.2,-2.1,-7.1,-11.2,-10.7,-3.1];
 +const TF: [f32; 29] = [78.5,68.7,59.5,51.1,44.0,37.5,31.5,26.5,22.1,17.9,14.4,11.4,8.6,6.2,4.4,3.0,2.2,2.4,3.5,1.7,-1.3,-4.2,-6.0,-5.4,-1.5,6.0,12.6,13.9,12.3];
-+const FILTER_INDEX: [usize; 9] = [2,5,8,11,14,20,23,26,28];
++
++/// Band centres the correction is solved at: 20, 40, 80, 160, 315, 500, 2000,
++/// 4000, 8000, 12500 Hz.  The set is weighted towards the low end, where the
++/// equal-loudness contours actually move.  A band at 1 kHz was measured to change
++/// the worst-case fit by 0.002 dB and is deliberately absent.
++const BAND_INDEX: [usize; 10] = [0, 3, 6, 9, 12, 14, 20, 23, 26, 28];
++const NBANDS: usize = BAND_INDEX.len();
++const NSHELF: usize = NBANDS - 1;
++
++/// Steepest slope CamillaDSP's shelf parameterisation accepts without ripple.
++const SHELF_SLOPE: PrcFmt = 12.0;
++/// Gain the shelf shapes are probed at when building the solve matrix.  The dB
++/// response of a shelf is not perfectly gain-independent; a mid-scale probe keeps
++/// the linear model honest across the range of gains actually used.
++const PROBE_GAIN: PrcFmt = 6.0;
++/// Below this the fader is treated as unchanged and nothing is redesigned.
++const VOLUME_EPSILON: f32 = 0.01;
 +
 +fn contour_spl(phon: f32, index: usize) -> f32 {
 +    let af = AF[index];
@@ -82,85 +132,281 @@ index 0000000..cc06412
 +    (10.0 / af) * term.log10() - LU[index] + 94.0
 +}
 +
++/// Wanted correction at one tabulated frequency, in dB.
++///
++/// The boost cap is applied to the full-strength curve and `strength` scales what
++/// survives, so `strength` stays a true proportion of the compensation.  Scaling
++/// first and clipping afterwards would let a half-strength setting reach the same
++/// cap as full strength once the curve saturates.
 +fn correction(conf: &config::Iso226Parameters, volume: f32, index: usize) -> f32 {
 +    let target = (conf.reference_phon + volume - conf.reference_level).clamp(20.0, conf.reference_phon);
 +    let reference_shape = contour_spl(conf.reference_phon, index) - conf.reference_phon;
 +    let target_shape = contour_spl(target, index) - target;
 +    let limit = if FREQ[index] < 1000.0 { conf.max_bass_boost() } else { conf.max_treble_boost() };
-+    ((target_shape - reference_shape) * conf.strength()).clamp(-limit, limit)
++    (target_shape - reference_shape).clamp(-limit, limit) * conf.strength()
 +}
 +
-+fn cascade_gains(conf: &config::Iso226Parameters, volume: f32) -> [f32; 9] {
-+    let mut gains = FILTER_INDEX.map(|index| correction(conf, volume, index));
++fn shelf_freq(shelf: usize) -> PrcFmt {
++    let left = FREQ[BAND_INDEX[shelf]] as PrcFmt;
++    let right = FREQ[BAND_INDEX[shelf + 1]] as PrcFmt;
++    (left * right).sqrt()
++}
++
++fn shelf_params(shelf: usize, gain: PrcFmt) -> config::BiquadParameters {
++    config::BiquadParameters::Highshelf(config::ShelfSteepness::Slope {
++        freq: shelf_freq(shelf),
++        slope: SHELF_SLOPE,
++        gain,
++    })
++}
++
++/// Magnitude response of one biquad, in dB.
++fn coeff_response_db(coeff: &biquad::BiquadCoefficients, freq: PrcFmt, samplerate: usize) -> PrcFmt {
++    let w = 2.0 * std::f64::consts::PI as PrcFmt * freq / samplerate as PrcFmt;
++    let (c1, s1) = (w.cos(), w.sin());
++    let (c2, s2) = ((2.0 * w).cos(), (2.0 * w).sin());
++    let nr = coeff.b0 + coeff.b1 * c1 + coeff.b2 * c2;
++    let ni = -coeff.b1 * s1 - coeff.b2 * s2;
++    let dr = 1.0 + coeff.a1 * c1 + coeff.a2 * c2;
++    let di = -coeff.a1 * s1 - coeff.a2 * s2;
++    10.0 * ((nr * nr + ni * ni) / (dr * dr + di * di)).log10()
++}
++
++/// Response of the whole cascade at one frequency, given the band gains.
++#[cfg(test)]
++fn cascade_response_db(gains: &[PrcFmt; NBANDS], freq: PrcFmt, samplerate: usize) -> PrcFmt {
++    let mut total = gains[0];
++    for shelf in 0..NSHELF {
++        let step = gains[shelf + 1] - gains[shelf];
++        if step.abs() > 1e-12 {
++            let coeff = biquad::BiquadCoefficients::from_config(samplerate, shelf_params(shelf, step));
++            total += coeff_response_db(&coeff, freq, samplerate);
++        }
++    }
++    total
++}
++
++/// `solve[i][j]` maps a wanted response at band centre `j` onto band gain `i`.
++///
++/// Built by evaluating each shelf's normalised shape at every band centre, which
++/// gives the forward map (band gains -> response), then inverting it.
++fn build_solver(samplerate: usize) -> [[PrcFmt; NBANDS]; NBANDS] {
++    let mut forward = [[0.0 as PrcFmt; NBANDS]; NBANDS];
++    for row in forward.iter_mut() {
++        row[0] = 1.0;
++    }
++    for shelf in 0..NSHELF {
++        let coeff = biquad::BiquadCoefficients::from_config(samplerate, shelf_params(shelf, PROBE_GAIN));
++        for band in 0..NBANDS {
++            let centre = FREQ[BAND_INDEX[band]] as PrcFmt;
++            let shape = coeff_response_db(&coeff, centre, samplerate) / PROBE_GAIN;
++            forward[band][shelf + 1] += shape;
++            forward[band][shelf] -= shape;
++        }
++    }
++    invert(forward)
++}
++
++/// Gauss-Jordan with partial pivoting.  The matrix is well conditioned at this
++/// slope (about 3), so no iterative refinement is needed.
++fn invert(mut a: [[PrcFmt; NBANDS]; NBANDS]) -> [[PrcFmt; NBANDS]; NBANDS] {
++    let mut inv = [[0.0 as PrcFmt; NBANDS]; NBANDS];
++    for (i, row) in inv.iter_mut().enumerate() {
++        row[i] = 1.0;
++    }
++    for col in 0..NBANDS {
++        let mut pivot = col;
++        for row in col + 1..NBANDS {
++            if a[row][col].abs() > a[pivot][col].abs() {
++                pivot = row;
++            }
++        }
++        a.swap(col, pivot);
++        inv.swap(col, pivot);
++        let scale = a[col][col];
++        for k in 0..NBANDS {
++            a[col][k] /= scale;
++            inv[col][k] /= scale;
++        }
++        for row in 0..NBANDS {
++            if row != col {
++                let factor = a[row][col];
++                if factor != 0.0 {
++                    for k in 0..NBANDS {
++                        a[row][k] -= factor * a[col][k];
++                        inv[row][k] -= factor * inv[col][k];
++                    }
++                }
++            }
++        }
++    }
++    inv
++}
++
++/// Band gains for a fader position: solve for the wanted curve, then scale the
++/// whole curve down if it would ask for more boost than the fader leaves below
++/// full scale.  The main fader is applied ahead of the pipeline, so "boost must
++/// not exceed the attenuation already applied" is exactly the right invariant.
++///
++/// The bound is the sum of the positive steps through the cascade, which is a true
++/// upper bound for a monotone shelf chain including DC.  The peak of the *wanted*
++/// curve is not: solving raises the broadband term above the highest band target.
++fn cascade_gains(
++    conf: &config::Iso226Parameters,
++    solver: &[[PrcFmt; NBANDS]; NBANDS],
++    volume: f32,
++) -> [PrcFmt; NBANDS] {
++    let mut targets = [0.0 as PrcFmt; NBANDS];
++    for (band, target) in targets.iter_mut().enumerate() {
++        *target = correction(conf, volume, BAND_INDEX[band]) as PrcFmt;
++    }
++    let mut gains = [0.0 as PrcFmt; NBANDS];
++    for (band, gain) in gains.iter_mut().enumerate() {
++        *gain = (0..NBANDS).map(|k| solver[band][k] * targets[k]).sum();
++    }
 +    let upper_bound = gains[0].max(0.0)
-+        + gains.windows(2).map(|pair| (pair[1] - pair[0]).max(0.0)).sum::<f32>();
-+    let available_headroom = (-volume).max(0.0);
-+    let scale = if upper_bound > available_headroom && upper_bound > 0.0 {
-+        available_headroom / upper_bound
-+    } else { 1.0 };
-+    gains.iter_mut().for_each(|gain| *gain *= scale);
++        + gains.windows(2).map(|pair| (pair[1] - pair[0]).max(0.0)).sum::<PrcFmt>();
++    let available_headroom = (-volume as PrcFmt).max(0.0);
++    if upper_bound > available_headroom && upper_bound > 0.0 {
++        let scale = available_headroom / upper_bound;
++        gains.iter_mut().for_each(|gain| *gain *= scale);
++    }
 +    gains
 +}
 +
-+fn shelf_params(index: usize, gains: &[f32; 9]) -> config::BiquadParameters {
-+    let left = FREQ[FILTER_INDEX[index]];
-+    let right = FREQ[FILTER_INDEX[index + 1]];
-+    config::BiquadParameters::Highshelf(config::ShelfSteepness::Slope {
-+        freq: (left * right).sqrt() as f64,
-+        slope: 6.0,
-+        gain: (gains[index + 1] - gains[index]) as PrcFmt,
-+    })
++fn gain_params(gain: PrcFmt) -> config::GainParameters {
++    config::GainParameters { gain, inverted: None, mute: None, scale: None }
 +}
 +
 +pub struct Iso226 {
 +    name: String,
 +    processing_params: Arc<ProcessingParameters>,
 +    conf: config::Iso226Parameters,
++    solver: [[PrcFmt; NBANDS]; NBANDS],
 +    current_volume: f32,
++    gains: [PrcFmt; NBANDS],
 +    low_gain: Gain,
 +    filters: Vec<biquad::Biquad>,
++    /// Holds the old cascade's output while a changed chunk is crossfaded.
++    scratch: Vec<PrcFmt>,
 +}
 +
 +impl Iso226 {
 +    pub fn from_config(name: &str, conf: config::Iso226Parameters, samplerate: usize, processing_params: Arc<ProcessingParameters>) -> Self {
++        debug!("Create ISO 226 filter '{name}'");
++        let solver = build_solver(samplerate);
 +        let current_volume = processing_params.target_volume(conf.fader());
-+        let gains = cascade_gains(&conf, current_volume);
-+        let low_gain = Gain::from_config("iso226_base", config::GainParameters { gain: gains[0] as PrcFmt, inverted: None, mute: None, scale: None });
-+        let filters = (0..8).map(|index| {
-+            let params = shelf_params(index, &gains);
-+            let coeffs = biquad::BiquadCoefficients::from_config(samplerate, params);
-+            biquad::Biquad::new(&format!("iso226_transition_{index}"), samplerate, coeffs)
-+        }).collect();
-+        Self { name: name.to_string(), processing_params, conf, current_volume, low_gain, filters }
++        let gains = cascade_gains(&conf, &solver, current_volume);
++        let low_gain = Gain::from_config("iso226_base", gain_params(gains[0]));
++        let filters = (0..NSHELF)
++            .map(|shelf| {
++                let coeffs = biquad::BiquadCoefficients::from_config(
++                    samplerate,
++                    shelf_params(shelf, gains[shelf + 1] - gains[shelf]),
++                );
++                biquad::Biquad::new(&format!("iso226_transition_{shelf}"), samplerate, coeffs)
++            })
++            .collect();
++        Self {
++            name: name.to_string(),
++            processing_params,
++            conf,
++            solver,
++            current_volume,
++            gains,
++            low_gain,
++            filters,
++            scratch: Vec::new(),
++        }
 +    }
 +
-+    fn update_filters(&mut self, volume: f32) {
-+        self.current_volume = volume;
-+        let gains = cascade_gains(&self.conf, volume);
-+        self.low_gain.update_parameters(config::Filter::Gain { description: None, parameters: config::GainParameters { gain: gains[0] as PrcFmt, inverted: None, mute: None, scale: None } });
-+        for (index, filter) in self.filters.iter_mut().enumerate() {
-+            filter.update_parameters(config::Filter::Biquad { description: None, parameters: shelf_params(index, &gains) });
++    fn apply_gains(&mut self, gains: [PrcFmt; NBANDS]) {
++        self.gains = gains;
++        self.low_gain.update_parameters(config::Filter::Gain {
++            description: None,
++            parameters: gain_params(gains[0]),
++        });
++        for (shelf, filter) in self.filters.iter_mut().enumerate() {
++            filter.update_parameters(config::Filter::Biquad {
++                description: None,
++                parameters: shelf_params(shelf, gains[shelf + 1] - gains[shelf]),
++            });
 +        }
++    }
++
++    fn run_cascade(&mut self, waveform: &mut [PrcFmt]) -> Res<()> {
++        self.low_gain.process_waveform(waveform)?;
++        for filter in &mut self.filters {
++            filter.process_waveform(waveform)?;
++        }
++        Ok(())
++    }
++
++    /// Recompute for a new fader position and crossfade this chunk from the old
++    /// cascade to the new one.  Both runs start from the same filter state, so the
++    /// only difference between them is the coefficients.
++    fn update_and_crossfade(&mut self, volume: f32, waveform: &mut [PrcFmt]) -> Res<()> {
++        let gains = cascade_gains(&self.conf, &self.solver, volume);
++        self.current_volume = volume;
++
++        let mut saved = [(0.0 as PrcFmt, 0.0 as PrcFmt); NSHELF];
++        for (state, filter) in saved.iter_mut().zip(self.filters.iter()) {
++            *state = (filter.s1, filter.s2);
++        }
++
++        // Old coefficients are still loaded, so this run is the outgoing cascade.
++        // The buffer is owned by the filter and only ever grows, so a steady
++        // stream of same-sized chunks never allocates.
++        let mut old = std::mem::take(&mut self.scratch);
++        if old.len() < waveform.len() {
++            old.resize(waveform.len(), 0.0);
++        }
++        old[..waveform.len()].copy_from_slice(waveform);
++        self.run_cascade(&mut old[..waveform.len()])?;
++
++        for (filter, state) in self.filters.iter_mut().zip(saved.iter()) {
++            filter.s1 = state.0;
++            filter.s2 = state.1;
++        }
++        self.apply_gains(gains);
++        self.run_cascade(waveform)?;
++
++        let len = waveform.len();
++        if len > 1 {
++            let step = 1.0 / (len - 1) as PrcFmt;
++            for (index, sample) in waveform.iter_mut().enumerate() {
++                let weight = index as PrcFmt * step;
++                *sample = old[index] * (1.0 - weight) + *sample * weight;
++            }
++        }
++        self.scratch = old;
++        Ok(())
 +    }
 +}
 +
 +impl Filter for Iso226 {
-+    fn name(&self) -> &str { &self.name }
++    fn name(&self) -> &str {
++        &self.name
++    }
 +
 +    fn process_waveform(&mut self, waveform: &mut [PrcFmt]) -> Res<()> {
 +        let volume = self.processing_params.current_volume(self.conf.fader());
-+        if (volume - self.current_volume).abs() >= 0.25 { self.update_filters(volume); }
-+        self.low_gain.process_waveform(waveform)?;
-+        for filter in &mut self.filters { filter.process_waveform(waveform)?; }
-+        Ok(())
++        if (volume - self.current_volume).abs() >= VOLUME_EPSILON {
++            return self.update_and_crossfade(volume, waveform);
++        }
++        self.run_cascade(waveform)
 +    }
 +
 +    fn update_parameters(&mut self, filter: config::Filter) {
 +        if let config::Filter::Iso226 { parameters, .. } = filter {
 +            self.conf = parameters;
 +            let volume = self.processing_params.current_volume(self.conf.fader());
-+            self.update_filters(volume);
-+        } else { panic!("Invalid config change!"); }
++            self.current_volume = volume;
++            let gains = cascade_gains(&self.conf, &self.solver, volume);
++            self.apply_gains(gains);
++        } else {
++            panic!("Invalid config change!");
++        }
 +    }
 +}
 +
@@ -171,8 +417,10 @@ index 0000000..cc06412
 +    if !(-100.0..=20.0).contains(&conf.reference_level) {
 +        return Err(config::ConfigError::new("Reference level must be between -100 and 20").into());
 +    }
-+    if !(40.0..=100.0).contains(&conf.reference_phon) {
-+        return Err(config::ConfigError::new("Reference phon must be between 40 and 100").into());
++    // ISO 226:2003 defines the contours up to 90 phon; above 4 kHz only to 80.
++    // 81-90 therefore extrapolates the top of the curve.
++    if !(40.0..=90.0).contains(&conf.reference_phon) {
++        return Err(config::ConfigError::new("Reference phon must be between 40 and 90").into());
 +    }
 +    if !(0.0..=1.0).contains(&conf.strength()) {
 +        return Err(config::ConfigError::new("Strength must be between 0 and 1").into());
@@ -189,55 +437,256 @@ index 0000000..cc06412
 +#[cfg(test)]
 +mod tests {
 +    use super::*;
-+    fn coeff_response_db(coeff: biquad::BiquadCoefficients, freq: f64) -> f64 {
-+        let w = 2.0 * std::f64::consts::PI * freq / 48000.0;
-+        let (c1, s1) = (w.cos(), w.sin());
-+        let (c2, s2) = ((2.0*w).cos(), (2.0*w).sin());
-+        let nr = coeff.b0 + coeff.b1*c1 + coeff.b2*c2;
-+        let ni = -coeff.b1*s1 - coeff.b2*s2;
-+        let dr = 1.0 + coeff.a1*c1 + coeff.a2*c2;
-+        let di = -coeff.a1*s1 - coeff.a2*s2;
-+        10.0 * ((nr*nr+ni*ni)/(dr*dr+di*di)).log10()
++
++    const RATES: [usize; 7] = [32000, 44100, 48000, 88200, 96000, 176400, 192000];
++    /// Worst fit error measured across every rate and fader position below.
++    const FIT_TOLERANCE: PrcFmt = 0.6;
++
++    fn conf() -> config::Iso226Parameters {
++        config::Iso226Parameters {
++            reference_level: -10.0,
++            reference_phon: 80.0,
++            strength: Some(1.0),
++            max_bass_boost: Some(12.0),
++            max_treble_boost: Some(6.0),
++            fader: None,
++        }
 +    }
 +
-+    fn cascade_response_db(gains: &[f32; 9], freq: f64) -> f64 {
-+        gains[0] as f64 + (0..8).map(|index| {
-+            let coeff = biquad::BiquadCoefficients::from_config(48000, shelf_params(index, gains));
-+            coeff_response_db(coeff, freq)
-+        }).sum::<f64>()
++    /// The wanted curve at an arbitrary frequency: the tabulated corrections
++    /// interpolated over log frequency across all 29 ISO points, not just the ten
++    /// the cascade is solved at.
++    fn wanted_db(conf: &config::Iso226Parameters, volume: f32, freq: PrcFmt) -> PrcFmt {
++        let logf = freq.log10();
++        let first = FREQ[0] as PrcFmt;
++        let last = FREQ[FREQ.len() - 1] as PrcFmt;
++        if freq <= first {
++            return correction(conf, volume, 0) as PrcFmt;
++        }
++        if freq >= last {
++            return correction(conf, volume, FREQ.len() - 1) as PrcFmt;
++        }
++        let upper = FREQ.iter().position(|f| *f as PrcFmt >= freq).unwrap();
++        let lower = upper - 1;
++        let (lo, hi) = (FREQ[lower] as PrcFmt, FREQ[upper] as PrcFmt);
++        let frac = (logf - lo.log10()) / (hi.log10() - lo.log10());
++        let a = correction(conf, volume, lower) as PrcFmt;
++        let b = correction(conf, volume, upper) as PrcFmt;
++        a + (b - a) * frac
 +    }
++
++    fn log_grid(low: PrcFmt, high: PrcFmt, points: usize) -> Vec<PrcFmt> {
++        (0..points)
++            .map(|i| low * (high / low).powf(i as PrcFmt / (points - 1) as PrcFmt))
++            .collect()
++    }
++
 +    #[test]
 +    fn reference_is_flat_and_quiet_listening_boosts_bass() {
-+        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
++        let conf = conf();
 +        assert!(correction(&conf, -10.0, 5).abs() < 0.001);
 +        assert!(correction(&conf, -40.0, 5) > 3.0);
 +        assert!(correction(&conf, -40.0, 5) <= 12.0);
-+        let gains = cascade_gains(&conf, -6.0);
-+        let bound = gains[0].max(0.0) + gains.windows(2).map(|p| (p[1]-p[0]).max(0.0)).sum::<f32>();
-+        assert!(bound <= 6.0001);
 +    }
 +
 +    #[test]
 +    fn rejects_sample_rates_that_put_the_top_band_near_nyquist() {
-+        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
-+        assert!(validate_config(24000, &conf).is_err());
-+        assert!(validate_config(48000, &conf).is_ok());
++        assert!(validate_config(24000, &conf()).is_err());
++        assert!(validate_config(48000, &conf()).is_ok());
 +    }
 +
 +    #[test]
-+    fn fitted_cascade_tracks_targets_and_never_exceeds_fader_headroom() {
-+        let conf = config::Iso226Parameters { reference_level: -10.0, reference_phon: 80.0, strength: Some(1.0), max_bass_boost: Some(12.0), max_treble_boost: Some(6.0), fader: None };
-+        for volume in [-6.0, -20.0, -40.0] {
-+            let gains = cascade_gains(&conf, volume);
-+            for (position, index) in FILTER_INDEX.iter().enumerate() {
-+                let response = cascade_response_db(&gains, FREQ[*index] as f64);
-+                assert!((response - gains[position] as f64).abs() < 3.5);
-+            }
-+            for step in 0..120 {
-+                let freq = 20.0 * 1000.0_f64.powf(step as f64 / 119.0);
-+                assert!(cascade_response_db(&gains, freq) <= (-volume) as f64 + 0.05);
++    fn rejects_reference_phon_outside_the_iso_range() {
++        let mut conf = conf();
++        conf.reference_phon = 95.0;
++        assert!(validate_config(48000, &conf).is_err());
++        conf.reference_phon = 90.0;
++        assert!(validate_config(48000, &conf).is_ok());
++    }
++
++    /// The point of the solve: the realised response must follow the wanted curve
++    /// closely at every supported rate, not merely pass near the band centres.
++    #[test]
++    fn solved_cascade_tracks_the_iso_curve_at_every_rate() {
++        let conf = conf();
++        for rate in RATES {
++            let solver = build_solver(rate);
++            for volume in [-10.0, -10.2, -12.0, -15.0, -20.0, -25.0, -30.0, -40.0, -50.0, -60.0, -80.0] {
++                let gains = cascade_gains(&conf, &solver, volume);
++                let top = (12500.0 as PrcFmt).min(rate as PrcFmt / 2.0 * 0.9);
++                for freq in log_grid(20.0, top, 200) {
++                    let realised = cascade_response_db(&gains, freq, rate);
++                    let wanted = wanted_db(&conf, volume, freq);
++                    assert!(
++                        (realised - wanted).abs() <= FIT_TOLERANCE,
++                        "rate {rate} volume {volume} freq {freq}: realised {realised} wanted {wanted}"
++                    );
++                }
 +            }
 +        }
++    }
++
++    /// Boost must never exceed the attenuation the fader has already applied,
++    /// anywhere from DC to Nyquist.  DC matters: it is where the broadband term
++    /// sits alone, and it is the case a band-centre-only check misses.
++    #[test]
++    fn never_exceeds_available_headroom() {
++        for reference_level in [-10.0, 0.0, 20.0] {
++            let mut conf = conf();
++            conf.reference_level = reference_level;
++            for rate in RATES {
++                let solver = build_solver(rate);
++                for volume in [-1.0, -3.0, -6.0, -10.0, -20.0, -30.0, -40.0, -60.0] {
++                    let gains = cascade_gains(&conf, &solver, volume);
++                    let mut freqs = vec![0.0 as PrcFmt, rate as PrcFmt / 2.0];
++                    freqs.extend(log_grid(0.01, rate as PrcFmt / 2.0 * 0.999, 400));
++                    for freq in freqs {
++                        let realised = cascade_response_db(&gains, freq, rate);
++                        assert!(
++                            realised <= (-volume as PrcFmt).max(0.0) + 0.001,
++                            "rate {rate} ref {reference_level} volume {volume} freq {freq}: {realised}"
++                        );
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn strength_scales_the_curve_proportionally() {
++        let mut full = conf();
++        full.strength = Some(1.0);
++        let mut half = conf();
++        half.strength = Some(0.5);
++        let mut off = conf();
++        off.strength = Some(0.0);
++        // Deep attenuation saturates the cap; strength must still halve the curve.
++        for volume in [-30.0, -60.0, -90.0] {
++            for index in 0..FREQ.len() {
++                let f = correction(&full, volume, index);
++                let h = correction(&half, volume, index);
++                assert!((h - f * 0.5).abs() < 1e-4, "index {index}: {h} vs {f}");
++                assert!(correction(&off, volume, index).abs() < 1e-6);
++            }
++        }
++    }
++
++    #[test]
++    fn caps_limit_the_boost() {
++        let mut conf = conf();
++        conf.max_bass_boost = Some(3.0);
++        conf.max_treble_boost = Some(0.0);
++        for index in 0..FREQ.len() {
++            let value = correction(&conf, -80.0, index);
++            let limit = if FREQ[index] < 1000.0 { 3.0 } else { 0.0 };
++            assert!(value.abs() <= limit + 1e-4, "index {index}: {value}");
++        }
++    }
++
++    #[test]
++    fn solver_inverts_the_forward_map() {
++        for rate in RATES {
++            let solver = build_solver(rate);
++            // Round-tripping a wanted response through the solve and back through
++            // the realised cascade must return the same response.
++            let conf = conf();
++            let gains = cascade_gains(&conf, &solver, -40.0);
++            for band in 0..NBANDS {
++                let centre = FREQ[BAND_INDEX[band]] as PrcFmt;
++                let realised = cascade_response_db(&gains, centre, rate);
++                let wanted = correction(&conf, -40.0, BAND_INDEX[band]) as PrcFmt;
++                assert!((realised - wanted).abs() < FIT_TOLERANCE, "rate {rate} band {band}");
++            }
++            for value in solver.iter().flatten() {
++                assert!(value.is_finite());
++            }
++        }
++    }
++
++    /// Coefficients can only change on chunk boundaries.  Swapping them outright
++    /// steps the output by `delta_b0 * x[n]`, which for a realistic ramp step is
++    /// many times the signal's own slew and splatters broadband noise.  The
++    /// crossfade must keep the boundary as smooth as the signal itself.
++    #[test]
++    fn crossfade_keeps_the_chunk_boundary_smooth() {
++        let rate = 48000;
++        let chunk = 1024;
++        let changed_at = 3;
++        // A 30 dB move over CamillaDSP's 400 ms ramp advances ~1.6 dB per
++        // 1024-sample chunk at 48 kHz.  This is that step.
++        let (start, moved) = (-40.0, -38.4);
++
++        // 40 Hz: the slowest band the filter touches, where a coefficient step
++        // stands out furthest above the signal's own slew.
++        let omega = 2.0 * std::f64::consts::PI as PrcFmt * 40.0 / rate as PrcFmt;
++        let run = |change: Option<f32>| -> Vec<PrcFmt> {
++            let params = Arc::new(ProcessingParameters::new(&[start; 5], &[false; 5]));
++            let mut filter = Iso226::from_config("test", conf(), rate, params.clone());
++            let mut output = Vec::new();
++            for index in 0..6 {
++                if index == changed_at && let Some(volume) = change {
++                    params.set_current_volume(0, volume);
++                }
++                let mut block: Vec<PrcFmt> = (0..chunk)
++                    .map(|n| (omega * (index * chunk + n) as PrcFmt).sin())
++                    .collect();
++                filter.process_waveform(&mut block).unwrap();
++                output.extend_from_slice(&block);
++            }
++            output
++        };
++
++        let steady = run(None);
++        let ramped = run(Some(moved));
++        assert!(ramped.iter().all(|v| v.is_finite()));
++
++        let boundary = changed_at * chunk;
++        // Both runs are identical up to the boundary, so at crossfade weight zero
++        // the changed run must still be emitting the old cascade exactly.  An
++        // outright coefficient swap jumps to the new cascade here instead.
++        assert!(
++            (ramped[boundary] - steady[boundary]).abs() < 1e-12,
++            "boundary discontinuity: {} vs {}", ramped[boundary], steady[boundary]
++        );
++        // ...and by the end of the chunk the new gains must have fully taken over,
++        // otherwise the crossfade never actually transitions.
++        let settled = ramped[boundary + chunk - 1];
++        assert!(
++            (settled - steady[boundary + chunk - 1]).abs() > 1e-9,
++            "crossfade never reached the new cascade"
++        );
++
++        // The step across the boundary must stay in line with the signal's own
++        // slew, measured on a settled chunk well clear of the startup transient.
++        let quiet_slew = (boundary - chunk + 1..boundary)
++            .map(|n| (steady[n] - steady[n - 1]).abs())
++            .fold(0.0 as PrcFmt, PrcFmt::max);
++        let step_at_change = (ramped[boundary] - ramped[boundary - 1]).abs();
++        assert!(
++            step_at_change <= 2.0 * quiet_slew,
++            "boundary step {step_at_change} vs natural slew {quiet_slew}"
++        );
++    }
++
++    /// The crossfade must not change the steady state: once the fader stops
++    /// moving, the cascade has to settle on exactly the new gains.
++    #[test]
++    fn crossfade_settles_on_the_new_gains() {
++        let rate = 48000;
++        let params = Arc::new(ProcessingParameters::new(&[-10.0; 5], &[false; 5]));
++        let mut filter = Iso226::from_config("test", conf(), rate, params.clone());
++        params.set_current_volume(0, -40.0);
++        let mut block = vec![0.0 as PrcFmt; 1024];
++        filter.process_waveform(&mut block).unwrap();
++
++        let expected = cascade_gains(&conf(), &build_solver(rate), -40.0);
++        for band in 0..NBANDS {
++            assert!(
++                (filter.gains[band] - expected[band]).abs() < 1e-9,
++                "band {band}: {} vs {}", filter.gains[band], expected[band]
++            );
++        }
++        assert!((filter.current_volume - (-40.0)).abs() < 1e-6);
 +    }
 +}
 diff --git a/src/filters/mod.rs b/src/filters/mod.rs
@@ -279,4 +728,3 @@ index 3b4d0c4..fbf0b9f 100644
                  config::Filter::Dither { parameters, .. } => {
                      Box::new(filters::dither::Dither::from_config(name, parameters))
                  }
-

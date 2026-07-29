@@ -39,6 +39,10 @@ def is_owned_filter_name(name: object) -> bool:
 GAIN_FILTER_TYPES = {"Peaking", "Lowshelf", "Highshelf"}
 ALLOWED_TYPES = GAIN_FILTER_TYPES | {"Lowpass", "Highpass", "Bandpass", "Notch"}
 MAX_BANDS = 16
+# ISO 226:2003 defines the contours up to 90 phon, and only to 80 above 4 kHz,
+# so 81-90 already extrapolates the top of the curve. The engine rejects anything
+# higher; see camilladsp-iso226/camilladsp-v4.1.3-iso226.patch.
+ISO226_MAX_PHON = 90
 
 DEFAULT_BANDS = [
     {
@@ -251,8 +255,14 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
             "enabled": _boolean(
                 loudness_in.get("enabled", False), "loudness enabled"
             ),
-            "reference_phon": _number(
-                loudness_in.get("reference_phon", 80), "reference phon", 40, 100
+            # State written before the engine adopted the ISO validity limit may
+            # carry up to 100. Clamp rather than reject, so an existing install
+            # keeps loading its EQ instead of failing the whole state read.
+            "reference_phon": min(
+                _number(
+                    loudness_in.get("reference_phon", 80), "reference phon", 40, 100
+                ),
+                ISO226_MAX_PHON,
             ),
             "reference_volume_db": _number(
                 loudness_in.get("reference_volume_db", -10), "reference volume", -60, 0
