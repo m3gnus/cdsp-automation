@@ -427,10 +427,22 @@ The source name, not a sample-rate heuristic, controls clock ownership.
 7. Uses passive MOTU meter frames to detect TOSLINK activity
 8. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
 
-If a lower-priority MOTU meter source is already active, the switcher uses
-`SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` to leave a silent higher-priority source
-faster than the normal track-gap timeout. The default is immediate handoff after
-the lower source has passed its own activity debounce.
+A source with confirmed audio cuts a silent source's grace short rather than
+waiting it out, once it has held that confirmation for
+`SOURCE_PREEMPT_DWELL_SECONDS` (default 2, so a single noisy meter frame cannot
+yank the config away mid-track). A *higher*-priority source waits for nothing
+else. A *lower*-priority one is additionally gated by
+`SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT`, which says how far into the current
+source's silence it is allowed to act; the default is immediate handoff after
+the lower source has passed its own activity debounce. A source that is merely
+ready - a connected-but-paused AirPlay session, say - never cuts a grace short,
+because that grace is exactly what protects a track gap from it.
+
+The MOTU meter sources are a special case: `toslink_available` only goes false
+after `SOURCE_TOSLINK_IDLE_SECONDS` of quiet meters, so by the time one of them
+reads silent it has already served a track-gap grace of its own. It does not
+get a second one on top - switch the TV off and the switcher starts looking
+elsewhere as soon as the meters settle, not a minute later.
 
 Hardware readiness only says a stream is open - a connected-but-paused AirPlay
 session or an idle console looks exactly like a playing one until the switcher
@@ -449,6 +461,7 @@ Edit `~/camilladsp/cdsp-automation.env`:
 ```text
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
+SOURCE_PREEMPT_DWELL_SECONDS=2
 SOURCE_PROBE_SILENCE_TIMEOUT=5
 SOURCE_PROBE_BACKOFF_SECONDS=30
 SOURCE_PROBE_BACKOFF_FACTOR=4
