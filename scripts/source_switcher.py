@@ -29,11 +29,13 @@ from audio_eq import (
 from speaker_config import (
     compile_profile_config,
     config_digest,
+    config_volume_limit,
     identify_managed_config,
     load_profile,
     load_yaml_mapping,
     prune_generated_configs,
     profile_catalog,
+    require_config_volume_limit,
     write_generated_config,
 )
 from speaker_profiles import (
@@ -42,6 +44,7 @@ from speaker_profiles import (
     audio_control_lock,
     audio_inhibit_active,
     clear_audio_inhibit,
+    normalize_volume_limit,
     read_profile_audio_state,
     read_speaker_selection,
     set_audio_inhibit,
@@ -157,6 +160,9 @@ SPEAKER_TRANSITION_PATH = Path(
 )
 CAMILLA_BINARY = os.environ.get("CAMILLA_BINARY", "camilladsp")
 CONFIG_VALIDATE_TIMEOUT = float(os.environ.get("CONFIG_VALIDATE_TIMEOUT", "10"))
+# CamillaDSP's own ceiling, and therefore the ceiling for anything that
+# declares no cap of its own (the default speaker's full configs).
+DEFAULT_VOLUME_LIMIT_DB = 0.0
 AUDIO_CONTROL_LOCK_PATH = Path(
     os.environ.get(
         "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
@@ -603,6 +609,32 @@ class ConfigRecoveryGuard:
         return False
 
 
+def _legacy_volume_limit(config: dict) -> float:
+    """Ceiling for the default speaker's hand-maintained full configs.
+
+    The default speaker declares no profile cap, so 0 dB is the ceiling unless
+    the config itself asks for something stricter. A limit this module cannot
+    parse is not allowed to read as permissive.
+    """
+    try:
+        declared = config_volume_limit(config, label="legacy config")
+    except ValueError:
+        return DEFAULT_VOLUME_LIMIT_DB
+    if declared is None:
+        return DEFAULT_VOLUME_LIMIT_DB
+    return min(DEFAULT_VOLUME_LIMIT_DB, declared)
+
+
+def target_volume_limit(target: dict | None) -> float:
+    """The ceiling a resolved target says its control surfaces must honour."""
+    if not target:
+        return DEFAULT_VOLUME_LIMIT_DB
+    limit = normalize_volume_limit(target.get("volume_limit_db"))
+    if limit is None:
+        limit = normalize_volume_limit(target.get("max_volume_db"))
+    return DEFAULT_VOLUME_LIMIT_DB if limit is None else limit
+
+
 def resolve_config_target(
     source: str, speaker_id: str, *, selection_revision: int | None = None
 ) -> dict:
@@ -621,6 +653,7 @@ def resolve_config_target(
             "source": source,
             "speaker": speaker_id,
             "max_volume_db": 0.0,
+            "volume_limit_db": _legacy_volume_limit(expected_config),
             "bypass_user_eq": False,
             "legacy": True,
             "capabilities": {},
@@ -643,6 +676,13 @@ def resolve_config_target(
     if operator_filename:
         path = Path(CONFIG_DIR) / operator_filename
         expected_config = load_yaml_mapping(path, f"operator config {speaker_id}")
+        # An operator config is the operator's artifact, so the profile cap is
+        # verified here instead of being compiled in. Rejecting the transition
+        # is the fail-closed answer: the alternative is going live on a config
+        # nothing downstream can hold below the profile's limit.
+        effective_limit = require_config_volume_limit(
+            expected_config, profile, label=f"operator config {path.name}"
+        )
         validate_config_file(path)
         return {
             "path": str(path),
@@ -650,6 +690,7 @@ def resolve_config_target(
             "source": source,
             "speaker": speaker_id,
             "max_volume_db": profile["max_volume_db"],
+            "volume_limit_db": effective_limit,
             "bypass_user_eq": profile["bypass_user_eq"],
             "legacy": False,
             "operator_config": True,
@@ -681,6 +722,9 @@ def resolve_config_target(
         "source": source,
         "speaker": speaker_id,
         "max_volume_db": profile["max_volume_db"],
+        # compile_profile_config() already wrote the native ceiling, keeping a
+        # stricter pre-existing one; publish exactly what went into the file.
+        "volume_limit_db": config_volume_limit(compiled, label="generated config"),
         "bypass_user_eq": profile["bypass_user_eq"],
         "legacy": False,
         "capabilities": profile["capabilities"],
@@ -977,7 +1021,7 @@ def apply_config(
                 or current_selection["revision"] != target["selection_revision"]
             ):
                 raise RuntimeError("speaker selection changed before unmute")
-        maximum = float(target.get("max_volume_db", 0)) if target else 0.0
+        maximum = target_volume_limit(target)
         restored_volume = min(previous_volume, maximum)
         if restored_volume != previous_volume:
             print(
@@ -996,6 +1040,10 @@ def apply_config(
                     "config_digest": target["digest"],
                     "capabilities": target.get("capabilities", {}),
                     "selection_revision": target.get("selection_revision"),
+                    # The ceiling every control surface reads back. Only a
+                    # successful apply publishes one; the failure payloads
+                    # below deliberately omit it so readers fail closed.
+                    "volume_limit_db": maximum,
                     "ok": True,
                     "error": "",
                     "updated_at": time.time(),

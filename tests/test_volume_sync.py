@@ -405,7 +405,12 @@ def test_airplay_volume_mapping_endpoints_curve_and_mute() -> None:
     assert midpoint == -25.0
     # Both source and destination are halfway through their visual sliders.
     assert (midpoint + 50.0) / 50.0 == (-15.0 + 30.0) / 30.0
-    assert 'id="volRange" data-volume type="range" min="-50" max="0"' in web_ui.HTML
+    # The UI slider spans the same -50..0 dB as the bridge's mapping, except
+    # that its top now follows the applied profile's verified ceiling.
+    assert (
+        'id="volRange" data-volume type="range" '
+        'min="${Math.min(-50, volMax)}" max="${volMax}"'
+    ) in web_ui.HTML
     for unsafe in ((-70, 3, 1.5), (-10, 0, 1.5), (-70, 0, 8)):
         try:
             volume_sync.map_airplay_volume(-10, *unsafe)
@@ -590,6 +595,64 @@ def test_airplay_cannot_unmute_while_config_transition_is_inhibited(
             raise AssertionError("AirPlay unmuted an inhibited output")
     assert client.volume.mute is True
     assert client.volume.volume == -40.0
+
+
+def test_network_sender_volume_is_capped_by_the_applied_profile(
+    tmp_path: Path,
+) -> None:
+    """A phone at 100% must not overdrive a capped speaker profile either."""
+    import speaker_profiles
+
+    class Volume:
+        def __init__(self) -> None:
+            self.mute = True
+            self.volume = -40.0
+
+        def set_main_volume(self, value: float) -> None:
+            self.volume = value
+
+        def set_main_mute(self, value: bool) -> None:
+            self.mute = value
+
+    ready = tmp_path / "ready.json"
+    ready.write_text('{"ready": true}', encoding="utf-8")
+    status = tmp_path / "speaker-profile-status.json"
+
+    def send(setter, argument):
+        client = SimpleNamespace(volume=Volume())
+        with (
+            patch.object(
+                volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"
+            ),
+            patch.object(volume_sync, "AUDIO_READY_PATH", ready),
+            patch.object(volume_sync, "SPEAKER_STATUS_PATH", status),
+            patch.object(volume_sync, "STATUS_PATH", tmp_path / "bridge-status.json"),
+        ):
+            result = setter(client, argument)
+        return client.volume.volume, result
+
+    status.write_text(
+        '{"ok": true, "applied": "partymeh", "volume_limit_db": -20.0}',
+        encoding="utf-8",
+    )
+    # AirPlay 0 dB and Spotify 65535 both map to the bridge's 0 dB maximum.
+    assert volume_sync.map_airplay_volume(0) == (0.0, False)
+    volume, result = send(volume_sync.set_client_volume, 0)
+    assert volume == -20.0
+    assert result["camilla_db"] == -20.0
+    assert result["requested_db"] == 0.0
+    assert result["volume_limit_db"] == -20.0
+    volume, _ = send(volume_sync.set_spotify_volume, 65535)
+    assert volume == -20.0
+    # Below the cap the mapping is untouched.
+    volume, result = send(volume_sync.set_client_volume, -15)
+    assert volume == -25.0
+    assert result["requested_db"] == -25.0
+
+    # No verified apply: the bridge takes the most restrictive ceiling.
+    status.unlink()
+    volume, _ = send(volume_sync.set_client_volume, 0)
+    assert volume == speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB
 
 
 def test_airplay_notify_callback_starts_without_deployment_helpers(

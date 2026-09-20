@@ -569,6 +569,52 @@ def _validate_output_contract(config: dict[str, Any], profile: dict[str, Any]) -
                     _boolean(source[key], f"output {output} source {key}", False)
 
 
+def config_volume_limit(config: Any, *, label: str = "config") -> float | None:
+    """The native ``devices.volume_limit`` a CamillaDSP config declares.
+
+    ``None`` means the config declares none at all, which is a different
+    answer from "declares a limit this module cannot parse" -- that raises,
+    because a malformed ceiling must never read as a permissive one.
+    """
+    devices = _mapping(config, label).get("devices")
+    if devices is None:
+        return None
+    value = _mapping(devices, f"{label} devices").get("volume_limit")
+    if value is None:
+        return None
+    return _finite_number(value, f"{label} devices.volume_limit", -150, 50)
+
+
+def require_config_volume_limit(
+    config: Any, profile: dict[str, Any], *, label: str
+) -> float:
+    """Fail closed unless a config caps volume at the profile's limit.
+
+    Operator-owned configs are the operator's artifact, so this validates
+    rather than rewrites: the profile's ``max_volume_db`` only protects the
+    speaker if the config itself carries a native ceiling at least as
+    restrictive, because every control surface reads that ceiling back rather
+    than the profile.  Returns the effective (config) limit.
+    """
+    maximum = _finite_number(
+        profile["max_volume_db"], "speaker profile max_volume_db", -100, 0
+    )
+    declared = config_volume_limit(config, label=label)
+    if declared is None:
+        raise ValueError(
+            f"{label} declares no devices.volume_limit, but speaker profile "
+            f"{profile['id']!r} caps volume at {maximum:+.1f} dB; add "
+            f"'volume_limit: {maximum:g}' (or stricter) under devices"
+        )
+    if declared > maximum:
+        raise ValueError(
+            f"{label} sets devices.volume_limit to {declared:+.1f} dB, which is "
+            f"looser than the {maximum:+.1f} dB cap of speaker profile "
+            f"{profile['id']!r}"
+        )
+    return declared
+
+
 def config_digest(config: dict[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

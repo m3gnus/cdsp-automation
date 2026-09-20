@@ -8,6 +8,7 @@ kept in the source switcher so it remains the only live-config writer.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -358,3 +359,65 @@ def read_profile_audio_state(
         state = default_audio_state()
         atomic_write_json(target, state)
         return state
+
+
+# ====================== VERIFIED VOLUME CEILING ======================
+
+# Every control surface derives its ceiling from the speaker-profile status
+# the switcher publishes after a verified apply. When that answer is missing,
+# stale or unparseable the surfaces must not fall back to 0 dB: an unknown
+# profile may be a capped one, so the fail-closed default is the most
+# restrictive ceiling that still leaves the system usable.
+FAILSAFE_VOLUME_LIMIT_DB = -20.0
+# Same bounds CamillaDSP accepts for devices.volume_limit.
+VOLUME_LIMIT_MIN_DB = -150.0
+VOLUME_LIMIT_MAX_DB = 50.0
+
+
+def normalize_volume_limit(value: Any) -> float | None:
+    """Coerce a stored ceiling, or ``None`` when it is not a usable number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return None
+    if not VOLUME_LIMIT_MIN_DB <= numeric <= VOLUME_LIMIT_MAX_DB:
+        return None
+    return numeric
+
+
+def read_effective_volume_limit(
+    path: Path, *, fallback: float = FAILSAFE_VOLUME_LIMIT_DB
+) -> float:
+    """Ceiling of the profile that is verified-applied right now.
+
+    Anything short of a successful apply that recorded its ceiling -- no
+    status file, unreadable JSON, ``ok`` not true, a missing or malformed
+    ``volume_limit_db`` -- returns ``fallback`` rather than a permissive 0 dB.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return fallback
+    if not isinstance(raw, dict) or raw.get("ok") is not True:
+        return fallback
+    limit = normalize_volume_limit(raw.get("volume_limit_db"))
+    return fallback if limit is None else limit
+
+
+def volume_ceiling(
+    path: Path,
+    *,
+    override: float | None = None,
+    fallback: float = FAILSAFE_VOLUME_LIMIT_DB,
+) -> float:
+    """The applied profile's ceiling, optionally tightened by a local override.
+
+    ``override`` is a deployment's own preference (an env var on one control
+    surface). It can only ever further restrict: it must not be able to lift a
+    speaker profile's cap.
+    """
+    limit = read_effective_volume_limit(path, fallback=fallback)
+    if override is None:
+        return limit
+    return min(limit, float(override))

@@ -236,6 +236,10 @@ REMOTE_VOLUME_MAX=0
 REMOTE_VOLUME_STEP=1
 ```
 
+`REMOTE_VOLUME_MAX` can only lower the ceiling. The real maximum comes from the
+speaker profile that is currently applied, so a profile capped at -20 dB stays
+capped at -20 dB on the remote, in the control UI, and over AirPlay/Spotify.
+
 ### CamillaDSP Filter Ownership
 
 Do not add legacy filters named `Bass`, `Treble`, or `loudness` to source

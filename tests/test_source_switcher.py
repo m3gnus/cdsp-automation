@@ -25,7 +25,7 @@ import audio_eq
 import speaker_profiles
 import web_ui
 from scripts import source_switcher
-from profile_fixtures import partymeh_document
+from profile_fixtures import capture_base, partymeh_document
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -170,7 +170,9 @@ def test_partymeh_uses_source_specific_operator_owned_configs(tmp_path: Path) ->
         speaker_profiles.operator_configs_for_speaker("partymeh").items()
     ):
         config_path = config_dir / filename
-        expected = {"devices": {"samplerate": 48000 + index}}
+        # Operator configs must state the native ceiling themselves; partymeh
+        # declares max_volume_db: 0, so 0 is the loosest one accepted.
+        expected = {"devices": {"samplerate": 48000 + index, "volume_limit": 0}}
         config_path.write_text(yaml.safe_dump(expected), encoding="utf-8")
         expected_by_source[source] = (config_path, expected)
     with patch.object(web_ui, "CDSP_CONFIG_DIR", config_dir):
@@ -731,6 +733,216 @@ def test_catalog_default_speaker_uses_the_plain_source_configs(tmp_path: Path) -
     assert target["legacy"] is True
     assert target["path"] == str(plain)
     assert target["max_volume_db"] == 0.0
+    assert target["volume_limit_db"] == 0.0
+
+
+def _capped_operator_environment(
+    tmp_path: Path, config_body: dict, *, max_volume_db: float = -20
+):
+    """One operator-owned streamer config for a profile capped at -20 dB."""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir(exist_ok=True)
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir(exist_ok=True)
+    document = partymeh_document()
+    document["max_volume_db"] = max_volume_db
+    (profile_dir / "partymeh.yml").write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    filename = speaker_profiles.operator_configs_for_speaker("partymeh")["streamer"]
+    (config_dir / filename).write_text(
+        yaml.safe_dump(config_body), encoding="utf-8"
+    )
+    return (
+        patch.object(switcher, "CONFIG_DIR", str(config_dir)),
+        patch.object(switcher, "SPEAKER_PROFILE_DIR", profile_dir),
+        patch.object(
+            switcher,
+            "speaker_catalog",
+            return_value={"partymeh": {"available": True}},
+        ),
+        patch.object(switcher, "speaker_audio_state", return_value={}),
+        patch.object(switcher, "validate_config_file"),
+    )
+
+
+def test_operator_config_without_the_profile_volume_cap_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """A -20 dB profile paired with an uncapped config must not go live."""
+    patches = _capped_operator_environment(
+        tmp_path, {"devices": {"samplerate": 48000}}
+    )
+    with patches[0], patches[1], patches[2], patches[3], patches[4] as validate:
+        try:
+            switcher.resolve_config_target("streamer", "partymeh")
+        except ValueError as exc:
+            message = str(exc)
+            assert "partymeh-streamer.yml" in message
+            assert "no devices.volume_limit" in message
+            assert "-20.0 dB" in message
+        else:
+            raise AssertionError("an unprotected operator config was resolved")
+    # Fail closed before the transition: nothing was even offered to CamillaDSP.
+    validate.assert_not_called()
+
+
+def test_operator_config_with_a_looser_volume_cap_is_rejected(
+    tmp_path: Path,
+) -> None:
+    patches = _capped_operator_environment(
+        tmp_path, {"devices": {"samplerate": 48000, "volume_limit": -5}}
+    )
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        try:
+            switcher.resolve_config_target("streamer", "partymeh")
+        except ValueError as exc:
+            assert "looser" in str(exc)
+            assert "-5.0 dB" in str(exc)
+        else:
+            raise AssertionError("a looser operator ceiling was resolved")
+
+
+def test_operator_config_with_a_stricter_volume_cap_is_accepted_unchanged(
+    tmp_path: Path,
+) -> None:
+    body = {"devices": {"samplerate": 48000, "volume_limit": -30}}
+    patches = _capped_operator_environment(tmp_path, body)
+    with patches[0], patches[1], patches[2], patches[3], patches[4]:
+        target = switcher.resolve_config_target("streamer", "partymeh")
+    assert target["operator_config"] is True
+    assert target["max_volume_db"] == -20
+    # The operator's stricter ceiling is what the controls must honour, and
+    # the file itself is passed through byte-for-byte.
+    assert target["volume_limit_db"] == -30
+    assert target["expected_config"] == body
+    assert yaml.safe_load(Path(target["path"]).read_text(encoding="utf-8")) == body
+
+
+def test_generated_config_target_publishes_its_compiled_volume_ceiling(
+    tmp_path: Path,
+) -> None:
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir()
+    base_dir = tmp_path / "source-bases"
+    base_dir.mkdir()
+    document = partymeh_document()
+    document["max_volume_db"] = -20
+    (profile_dir / "capped.yml").write_text(
+        yaml.safe_dump({**document, "id": "capped"}, sort_keys=False),
+        encoding="utf-8",
+    )
+    base = capture_base(2)
+    base["devices"].pop("volume_limit")
+    (base_dir / "streamer.yml").write_text(yaml.safe_dump(base), encoding="utf-8")
+
+    with (
+        patch.object(switcher, "SPEAKER_PROFILE_DIR", profile_dir),
+        patch.object(switcher, "SOURCE_BASE_DIR", base_dir),
+        patch.object(switcher, "SPEAKER_GENERATED_DIR", tmp_path / "generated"),
+        patch.object(
+            switcher,
+            "speaker_catalog",
+            return_value={"capped": {"available": True}},
+        ),
+        patch.object(
+            switcher, "speaker_audio_state", return_value=audio_eq.default_audio_state()
+        ),
+        patch.object(switcher, "validate_config_file"),
+    ):
+        target = switcher.resolve_config_target("streamer", "capped")
+
+    assert target.get("operator_config") is None
+    assert target["volume_limit_db"] == -20
+    assert target["expected_config"]["devices"]["volume_limit"] == -20
+
+
+def test_applied_speaker_status_publishes_the_verified_volume_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The controls read their ceiling back from this status payload."""
+    previous = tmp_path / "streamer.yml"
+    target_path = tmp_path / "partymeh-streamer.yml"
+    previous.write_text("devices: {}\n")
+    target_path.write_text("devices: {}\n")
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(str(previous)),
+        volume=FakeSwitcherVolume(),
+        general=FakeSwitcherGeneral(["ProcessingState.RUNNING"]),
+    )
+    client.volume.volume = 0.0
+    target = {
+        "speaker": "partymeh",
+        "source": "streamer",
+        "digest": switcher.config_digest({"devices": {}}),
+        "max_volume_db": -20,
+        "volume_limit_db": -30,
+        "operator_config": True,
+    }
+    status_path = tmp_path / "speaker-status.json"
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "SPEAKER_STATUS_PATH", status_path),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher.time, "sleep"),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        switcher.apply_config(client, str(target_path), target=target)
+
+    # The stricter config ceiling, not the profile's -20, clamps the fader.
+    assert client.volume.volume == -30
+    published = json.loads(status_path.read_text(encoding="utf-8"))
+    assert published["ok"] is True
+    assert published["volume_limit_db"] == -30
+    assert speaker_profiles.read_effective_volume_limit(status_path) == -30
+
+
+def test_failed_transition_status_leaves_the_controls_failing_closed(
+    tmp_path: Path,
+) -> None:
+    """A rollback publishes no ceiling, so readers take the failsafe one."""
+    previous = tmp_path / "streamer.yml"
+    target_path = tmp_path / "partymeh-streamer.yml"
+    previous.write_text("devices: {}\n")
+    target_path.write_text("devices: {}\n")
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(str(previous)),
+        volume=FakeSwitcherVolume(),
+        general=FakeSwitcherGeneral(["stalled", "ProcessingState.Paused"]),
+    )
+    target = {
+        "speaker": "partymeh",
+        "source": "streamer",
+        "digest": switcher.config_digest({"devices": {}}),
+        "max_volume_db": -20,
+        "volume_limit_db": -20,
+    }
+    status_path = tmp_path / "speaker-status.json"
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "SPEAKER_STATUS_PATH", status_path),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher.time, "sleep"),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        try:
+            switcher.apply_config(client, str(target_path), target=target)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a stalled transition reported success")
+
+    published = json.loads(status_path.read_text(encoding="utf-8"))
+    assert published["ok"] is False
+    assert "volume_limit_db" not in published
+    assert (
+        speaker_profiles.read_effective_volume_limit(status_path)
+        == speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB
+    )
 
 
 if __name__ == "__main__":
