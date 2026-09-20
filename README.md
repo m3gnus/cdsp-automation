@@ -493,16 +493,52 @@ writer of the live CamillaDSP configuration.
 ### Security Model
 
 Because it manages services, storage mounts, and the system clock, the
-`cdsp-control-ui.service` unit runs as **root** by design. The UI has **no
-authentication**: expose port 8088 on a trusted LAN only, never on the
-internet. Install it only if you want that trade-off; every other utility
-works without it.
+`cdsp-control-ui.service` unit runs as **root** by design. Install it only if
+you want that trade-off; every other utility works without it.
 
-### Configuration
+Out of the box it binds **every interface on port 8088 with no
+authentication** — the historical behaviour, kept as the default so that
+upgrading an existing install does not take its UI away. Two settings in
+`~/camilladsp/cdsp-automation.env` narrow that, and menu option 12 offers the
+first one before it installs anything:
 
-The unit reads `~/camilladsp/cdsp-automation.env` like the other utilities,
-plus `INSTALLATION_UI_HOST` / `INSTALLATION_UI_PORT` (defaults `0.0.0.0` /
-`8088`) set in the unit file.
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `INSTALLATION_UI_HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` for loopback only. |
+| `INSTALLATION_UI_PORT` | `8088` | Listening port. |
+| `INSTALLATION_UI_TOKEN` | *(empty)* | Empty means no authentication. Set a secret to require it. |
+
+**Loopback only.** Set `INSTALLATION_UI_HOST=127.0.0.1` and
+`sudo systemctl restart cdsp-control-ui`, then reach the UI through an SSH
+tunnel from your laptop:
+
+```bash
+ssh -N -L 8088:127.0.0.1:8088 <user>@<pi>
+# then open http://127.0.0.1:8088
+```
+
+**Shared secret.** Set a long random token and restart the service:
+
+```bash
+openssl rand -hex 32           # put the result in cdsp-automation.env
+# INSTALLATION_UI_TOKEN=<that value>
+sudo systemctl restart cdsp-control-ui
+```
+
+Every request that changes anything (volume, EQ, source, speaker profile,
+services, storage, the clock) then needs
+`Authorization: Bearer <token>`. Open the dashboard once as
+`http://<pi>:8088/#token=<token>` and the page remembers it; otherwise it
+prompts for the token the first time you change something. Status views stay
+readable without it, so the page can load in order to ask.
+
+Two protections are always on, whatever you configure: state-changing
+requests from a foreign `Origin` are refused, and request bodies are bounded
+(256 KiB) and timed out rather than buffered.
+
+The service still runs as root. A token limits *who* can drive it; it does not
+reduce what the process itself can do. Treat port 8088 as privileged either
+way, and never expose it to the internet.
 
 ---
 
@@ -526,7 +562,9 @@ The installer menu provides these options:
 12. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
 
 Options 11 and 12 ask for a `y/N` confirmation before acting: one removes every
-managed service, the other exposes an unauthenticated root web server.
+managed service, the other exposes a root web server. Option 12 first prints
+the address it is about to bind to and whether a token is configured, and
+offers to move the UI to `127.0.0.1` before you say yes.
 
 Options 1, 2 and 9 end with a summary listing any component that was skipped or
 failed, and no longer abandon the rest of the run when one of them cannot be

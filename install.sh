@@ -13,6 +13,10 @@ SCRIPTS_DIR="$BASE_DIR/scripts"
 CONFIGS_DIR="$BASE_DIR/configs"
 VENV_DIR="$BASE_DIR/.venv"
 ENV_FILE="$BASE_DIR/cdsp-automation.env"
+# The historical control-UI exposure.  Kept as the fallback everywhere so an
+# existing deployment does not silently lose its UI on upgrade.
+CONTROL_UI_HOST_DEFAULT="0.0.0.0"
+CONTROL_UI_PORT_DEFAULT="8088"
 BASE_URL="https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/scripts"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_USER="$(/usr/bin/id -un)"
@@ -129,6 +133,17 @@ VOLUME_SYNC_COMMAND_ACK_TIMEOUT=3.0
 VOLUME_SYNC_HEARTBEAT_SECONDS=10.0
 VOLUME_SYNC_GROUP=audio
 ISO226_CAPABILITY_PATH=$ISO226_CAPABILITY_DEFAULT
+# Control UI bind address.  0.0.0.0 is every interface, which is what this
+# component has always done, so an upgrade does not take the UI away from a
+# working install.  Set 127.0.0.1 to reach it only from the Pi itself, over an
+# SSH tunnel: ssh -N -L 8088:127.0.0.1:8088 $INSTALL_USER@<pi>
+INSTALLATION_UI_HOST=$CONTROL_UI_HOST_DEFAULT
+INSTALLATION_UI_PORT=$CONTROL_UI_PORT_DEFAULT
+# Empty leaves the control UI unauthenticated, exactly as before.  Set a long
+# random secret (openssl rand -hex 32) to require it on every state-changing
+# request; then open the UI once as http://<pi>:8088/#token=<secret> and the
+# page keeps it.  Read-only status pages stay open either way.
+INSTALLATION_UI_TOKEN=
 # Shown in the control UI's page title and header.
 SITE_NAME=CamillaDSP
 REMOTE_NAME=HID Remote01 Keyboard
@@ -642,12 +657,36 @@ install_spotify_volume_sync() {
   "$SCRIPTS_DIR/build_librespot_volume_sync.sh" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch"
 }
 
+# The control UI's exposure, resolved from the env file with the historical
+# values as the fallback so a file written before these keys existed still
+# yields the behaviour that install had.
+control_ui_bind_host() {
+  local host
+  host="$(get_env_value INSTALLATION_UI_HOST)"
+  printf '%s\n' "${host:-$CONTROL_UI_HOST_DEFAULT}"
+}
+
+control_ui_bind_port() {
+  local port
+  port="$(get_env_value INSTALLATION_UI_PORT)"
+  printf '%s\n' "${port:-$CONTROL_UI_PORT_DEFAULT}"
+}
+
 install_control_ui() {
+  local ui_host ui_port
+  ui_host="$(control_ui_bind_host)"
+  ui_port="$(control_ui_bind_port)"
   echo "Installing the web control UI (optional)..."
   echo ""
   echo "The UI manages sources, volume, EQ, speaker profiles, services,"
   echo "storage and the system clock, so its service runs as root."
-  echo "Expose its port on a trusted LAN only; it has no authentication."
+  echo "It will bind to ${ui_host}:${ui_port} (INSTALLATION_UI_HOST in $ENV_FILE)."
+  if [[ -n "$(get_env_value INSTALLATION_UI_TOKEN)" ]]; then
+    echo "INSTALLATION_UI_TOKEN is set: state-changing requests need that secret."
+  else
+    echo "INSTALLATION_UI_TOKEN is unset: it has no authentication."
+    echo "Expose its port on a trusted LAN only, or set a token in $ENV_FILE."
+  fi
   echo ""
   local unit_file
   unit_file="$(mktemp)"
@@ -667,8 +706,10 @@ UMask=0007
 WorkingDirectory=$BASE_DIR
 EnvironmentFile=-$ENV_FILE
 Environment=PYTHONUNBUFFERED=1
-Environment=INSTALLATION_UI_HOST=0.0.0.0
-Environment=INSTALLATION_UI_PORT=8088
+# INSTALLATION_UI_HOST / INSTALLATION_UI_PORT / INSTALLATION_UI_TOKEN come from
+# the EnvironmentFile above and are deliberately not pinned here: an
+# Environment= line would shadow the operator's edit.  web_ui.py falls back to
+# $CONTROL_UI_HOST_DEFAULT:$CONTROL_UI_PORT_DEFAULT when they are unset.
 ExecStart=$VENV_DIR/bin/python3 -u $SCRIPTS_DIR/web_ui.py
 Restart=always
 RestartSec=2
@@ -684,7 +725,10 @@ EOL
   sudo systemctl daemon-reload
   sudo systemctl reenable cdsp-control-ui.service
   sudo systemctl restart cdsp-control-ui.service
-  echo "Control UI installed on port 8088."
+  echo "Control UI installed on ${ui_host}:${ui_port}."
+  if [[ "$ui_host" == "127.0.0.1" || "$ui_host" == "localhost" ]]; then
+    echo "Reach it with: ssh -N -L ${ui_port}:127.0.0.1:${ui_port} ${INSTALL_USER}@<pi>"
+  fi
 }
 
 install_iso226_engine() {
@@ -967,6 +1011,44 @@ confirm_action() {
   [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
+# Menu option 12.  Names the address the UI is about to bind to before asking
+# for anything, and offers loopback-only first so the LAN-wide default is a
+# choice rather than an accident.  Answering No to both questions changes
+# nothing.
+confirm_control_ui_exposure() {
+  local ui_host ui_port exposure auth
+  ui_host="$(control_ui_bind_host)"
+  ui_port="$(control_ui_bind_port)"
+  echo ""
+  echo "The web control UI is a root web server: it restarts services, mounts"
+  echo "storage, sets the system clock and changes volume."
+  echo "It will bind to ${ui_host}:${ui_port} (INSTALLATION_UI_HOST in $ENV_FILE)."
+  if [[ -n "$(get_env_value INSTALLATION_UI_TOKEN)" ]]; then
+    auth="a shared secret is required"
+    echo "INSTALLATION_UI_TOKEN is set, so state-changing requests need it."
+  else
+    auth="unauthenticated"
+    echo "INSTALLATION_UI_TOKEN is unset, so it has no authentication."
+    echo "Set one in $ENV_FILE (openssl rand -hex 32) to require a secret."
+  fi
+  if [[ "$ui_host" == "$CONTROL_UI_HOST_DEFAULT" ]]; then
+    echo "$CONTROL_UI_HOST_DEFAULT is every interface: anyone on the LAN can reach it."
+    echo ""
+    if confirm_action "Bind it to 127.0.0.1 instead (loopback only, reach it over an SSH tunnel)?"; then
+      set_env_value INSTALLATION_UI_HOST 127.0.0.1
+      ui_host="127.0.0.1"
+      echo "INSTALLATION_UI_HOST set to 127.0.0.1 in $ENV_FILE."
+    fi
+  fi
+  if [[ "$ui_host" == "$CONTROL_UI_HOST_DEFAULT" ]]; then
+    exposure="every interface"
+  else
+    exposure="loopback only"
+  fi
+  echo ""
+  confirm_action "Install a root web server on ${ui_host}:${ui_port} (${exposure}, ${auth})?"
+}
+
 print_menu() {
   cat <<MENU
 =============================================
@@ -1007,7 +1089,7 @@ main() {
       9) install_network_volume_sync ;;
       10) prepare_install; install_iso226_engine ;;
       11) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
-      12) if confirm_action "Install an unauthenticated root web server on 0.0.0.0:8088?"; then prepare_install; install_control_ui; else echo "Cancelled."; fi ;;
+      12) if confirm_control_ui_exposure; then prepare_install; install_control_ui; else echo "Cancelled."; fi ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac

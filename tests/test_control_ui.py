@@ -3,13 +3,18 @@
 from __future__ import annotations
 
 import copy
+import email
+import hmac
 import inspect
+import io
 import json
 import math
+import os
 import subprocess
 import sys
 from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1005,3 +1010,317 @@ def test_operator_profile_preflight_requires_the_profile_volume_cap(
     assert sorted(checked) == sorted(
         Path(name).stem for name in operator_configs.values()
     )
+
+
+# --------------------------------------------------------------------------
+# Request-guard harness.  The handler's socket plumbing is replaced so do_POST
+# can be driven directly, which is the only way to observe that an oversized or
+# unauthorized body is refused *without being read*.
+# --------------------------------------------------------------------------
+
+
+class _CountingReader(io.BytesIO):
+    """A request body that records every read, so "never buffered" is testable."""
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.reads: list[int] = []
+
+    def read(self, size: int = -1) -> bytes:  # type: ignore[override]
+        self.reads.append(size)
+        return super().read(size)
+
+
+class _DrivableHandler(web_ui.Handler):
+    def __init__(self, path: str, raw_headers: str, body: bytes) -> None:
+        # Deliberately not calling BaseHTTPRequestHandler.__init__: it would
+        # try to serve a real socket.
+        self.path = path
+        self.headers = email.message_from_string(raw_headers)
+        self.rfile = _CountingReader(body)
+        self.wfile = io.BytesIO()
+        self.command = "POST"
+        self.requestline = f"POST {path} HTTP/1.1"
+        self.request_version = "HTTP/1.1"
+        self.close_connection = False
+        self.status: HTTPStatus | int | None = None
+        self.sent_headers: dict[str, str] = {}
+
+    def send_response(self, code, message=None):  # type: ignore[no-untyped-def]
+        self.status = code
+
+    def send_header(self, keyword, value):  # type: ignore[no-untyped-def]
+        self.sent_headers[keyword] = value
+
+    def end_headers(self) -> None:
+        return None
+
+    def send_error(self, code, message=None, explain=None):  # type: ignore[no-untyped-def]
+        self.status = code
+
+    def log_message(self, fmt, *args):  # type: ignore[no-untyped-def]
+        return None
+
+    def response_body(self) -> dict:
+        raw = self.wfile.getvalue()
+        return json.loads(raw.decode("utf-8")) if raw else {}
+
+
+def _raw_headers(
+    *,
+    host: str = "pi.local:8088",
+    origin: str | None = None,
+    token: str | None = None,
+    token_header: str = "Authorization",
+    content_length: int | None = None,
+    extra: str = "",
+) -> str:
+    lines = [f"Host: {host}"]
+    if origin is not None:
+        lines.append(f"Origin: {origin}")
+    if token is not None:
+        value = f"Bearer {token}" if token_header == "Authorization" else token
+        lines.append(f"{token_header}: {value}")
+    if content_length is not None:
+        lines.append(f"Content-Length: {content_length}")
+    if extra:
+        lines.append(extra)
+    return "\n".join(lines) + "\n\n"
+
+
+def _post(
+    path: str = "/api/amps/off",
+    *,
+    body: bytes = b"{}",
+    declared_length: int | None = None,
+    **header_kwargs: object,
+) -> _DrivableHandler:
+    length = len(body) if declared_length is None else declared_length
+    raw = _raw_headers(content_length=length, **header_kwargs)  # type: ignore[arg-type]
+    return _DrivableHandler(path, raw, body)
+
+
+def _environment_without(*names: str) -> dict[str, str]:
+    env = dict(os.environ)
+    for name in names:
+        env.pop(name, None)
+    return env
+
+
+def test_bind_host_reads_the_env_and_falls_back_to_every_interface() -> None:
+    """0.0.0.0 stays the fallback so an upgrade never takes an install's UI away."""
+    with patch.dict(
+        os.environ, _environment_without("INSTALLATION_UI_HOST"), clear=True
+    ):
+        assert web_ui.ui_bind_host() == "0.0.0.0"
+    with patch.dict(os.environ, {"INSTALLATION_UI_HOST": "   "}):
+        assert web_ui.ui_bind_host() == "0.0.0.0"
+    with patch.dict(os.environ, {"INSTALLATION_UI_HOST": "127.0.0.1"}):
+        assert web_ui.ui_bind_host() == "127.0.0.1"
+    with patch.dict(
+        os.environ, _environment_without("INSTALLATION_UI_PORT"), clear=True
+    ):
+        assert web_ui.ui_bind_port() == 8088
+    with patch.dict(os.environ, {"INSTALLATION_UI_PORT": "9000"}):
+        assert web_ui.ui_bind_port() == 9000
+    assert web_ui.DEFAULT_UI_HOST == "0.0.0.0"
+
+
+def test_state_change_without_the_configured_token_is_refused() -> None:
+    with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+        handler = _post()
+        with patch.object(web_ui, "turn_amps_off") as amps:
+            handler.do_POST()
+        assert handler.status == HTTPStatus.UNAUTHORIZED
+        amps.assert_not_called()
+        assert handler.sent_headers["WWW-Authenticate"].startswith("Bearer")
+        # The body was never read, so the connection cannot be reused.
+        assert handler.rfile.reads == []
+        assert handler.close_connection is True
+
+        wrong = _post(token="not-the-secret")
+        with patch.object(web_ui, "turn_amps_off") as amps:
+            wrong.do_POST()
+        assert wrong.status == HTTPStatus.UNAUTHORIZED
+        amps.assert_not_called()
+
+
+def test_state_change_with_the_configured_token_is_accepted() -> None:
+    with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+        for header, value in (
+            ("Authorization", "s3cret-value"),
+            ("X-Control-Token", "s3cret-value"),
+        ):
+            handler = _post(token=value, token_header=header)
+            with patch.object(web_ui, "turn_amps_off") as amps:
+                handler.do_POST()
+            assert handler.status == HTTPStatus.OK, header
+            assert handler.response_body() == {"ok": True}
+            amps.assert_called_once()
+
+
+def test_token_comparison_uses_a_constant_time_primitive() -> None:
+    """A plain == leaks the matching prefix length through its timing."""
+    source = inspect.getsource(web_ui.authorize_state_change)
+    assert "hmac.compare_digest(supplied, expected)" in source
+    assert "supplied == expected" not in source
+    assert "expected == supplied" not in source
+
+    seen: list[tuple[str, str]] = []
+    real = hmac.compare_digest
+
+    def spy(left: str, right: str) -> bool:
+        seen.append((left, right))
+        return real(left, right)
+
+    # A wrong first byte, a wrong length and a wrong last byte must all reach
+    # the same primitive rather than being decided by a short-circuit.
+    attempts = ("X3cret-value", "s", "s3cret-value-and-more", "s3cret-valuX")
+    with (
+        patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}),
+        patch.object(web_ui.hmac, "compare_digest", spy),
+    ):
+        for attempt in attempts:
+            try:
+                web_ui.authorize_state_change(
+                    email.message_from_string(_raw_headers(token=attempt))
+                )
+            except web_ui.RequestRefused as refusal:
+                assert refusal.status == HTTPStatus.UNAUTHORIZED
+            else:
+                raise AssertionError(f"a wrong token was accepted: {attempt}")
+    assert [left for left, _ in seen] == list(attempts)
+
+
+def test_state_change_from_a_foreign_origin_is_refused() -> None:
+    """Origin is checked with or without a token: a LAN browser is otherwise a
+    confused deputy for anyone who can serve it a page."""
+    with patch.dict(os.environ, _environment_without("INSTALLATION_UI_TOKEN"), clear=True):
+        foreign = _post(origin="http://attacker.example")
+        with patch.object(web_ui, "turn_amps_off") as amps:
+            foreign.do_POST()
+        assert foreign.status == HTTPStatus.FORBIDDEN
+        assert "cross-origin" in foreign.response_body()["error"]
+        amps.assert_not_called()
+        assert foreign.rfile.reads == []
+
+        same = _post(origin="http://pi.local:8088")
+        with patch.object(web_ui, "turn_amps_off") as amps:
+            same.do_POST()
+        assert same.status == HTTPStatus.OK
+        amps.assert_called_once()
+
+
+def test_origin_matching_handles_absent_null_and_default_ports() -> None:
+    same_site = web_ui.origin_is_same_site
+    # No Origin at all is a non-browser client (curl, a shell script): allowed,
+    # so scripted callers that worked before still work.
+    assert same_site(None, "pi.local:8088") is True
+    assert same_site("", "pi.local:8088") is True
+    # A sandboxed or file:// page sends "null"; it is nobody's same site.
+    assert same_site("null", "pi.local:8088") is False
+    assert same_site("http://PI.local:8088", "pi.local:8088") is True
+    assert same_site("http://pi.local", "pi.local:80") is True
+    assert same_site("https://pi.local", "pi.local:443") is False
+    assert same_site("http://pi.local:8089", "pi.local:8088") is False
+    assert same_site("http://evil.example", "pi.local:8088") is False
+    assert same_site("not-a-url", "pi.local:8088") is False
+    assert same_site("http://pi.local:8088", "") is False
+
+
+def test_oversized_body_is_refused_rather_than_buffered() -> None:
+    oversized = web_ui.MAX_REQUEST_BODY_BYTES + 1
+    handler = _post("/api/audio", body=b"{}", declared_length=oversized)
+    with patch.object(web_ui, "write_audio_eq_state") as write_state:
+        handler.do_POST()
+    assert handler.status == HTTPStatus.REQUEST_ENTITY_TOO_LARGE
+    assert str(web_ui.MAX_REQUEST_BODY_BYTES) in handler.response_body()["error"]
+    # The refusal is decided from Content-Length alone: nothing was read.
+    assert handler.rfile.reads == []
+    write_state.assert_not_called()
+    assert handler.close_connection is True
+
+
+def test_undeclared_and_malformed_body_lengths_are_refused() -> None:
+    chunked = _DrivableHandler(
+        "/api/audio", _raw_headers(extra="Transfer-Encoding: chunked"), b"{}"
+    )
+    with patch.object(web_ui, "write_audio_eq_state") as write_state:
+        chunked.do_POST()
+    assert chunked.status == HTTPStatus.LENGTH_REQUIRED
+    assert chunked.rfile.reads == []
+    write_state.assert_not_called()
+
+    for bad in ("not-a-number", "-1"):
+        handler = _DrivableHandler(
+            "/api/audio", _raw_headers(extra=f"Content-Length: {bad}"), b"{}"
+        )
+        handler.do_POST()
+        assert handler.status == HTTPStatus.BAD_REQUEST, bad
+        assert handler.rfile.reads == []
+
+
+def test_a_body_at_the_limit_is_still_accepted() -> None:
+    payload = json.dumps({"source": "toslink"}).encode("utf-8")
+    assert len(payload) <= web_ui.MAX_REQUEST_BODY_BYTES
+    handler = _post("/api/source", body=payload)
+    with (
+        patch.object(web_ui, "write_source_override") as override,
+        patch.object(web_ui, "run_checked", return_value=""),
+        patch.object(web_ui, "camilla_status", return_value={}),
+        patch.object(web_ui, "source_status", return_value={"source": "toslink"}),
+    ):
+        handler.do_POST()
+    assert handler.status == HTTPStatus.OK
+    override.assert_called_once_with("toslink")
+    assert handler.rfile.reads == [len(payload)]
+
+
+def test_without_a_token_state_changes_behave_exactly_as_before() -> None:
+    """No regression for the installs that never set INSTALLATION_UI_TOKEN."""
+    for value in ({}, {"INSTALLATION_UI_TOKEN": "   "}):
+        env = _environment_without("INSTALLATION_UI_TOKEN")
+        env.update(value)  # type: ignore[arg-type]
+        with patch.dict(os.environ, env, clear=True):
+            assert web_ui.configured_ui_token() == ""
+            handler = _post()
+            with patch.object(web_ui, "turn_amps_off") as amps:
+                handler.do_POST()
+            assert handler.status == HTTPStatus.OK
+            assert handler.response_body() == {"ok": True}
+            amps.assert_called_once()
+            assert "WWW-Authenticate" not in handler.sent_headers
+
+
+def test_read_only_endpoints_stay_open_when_a_token_is_configured() -> None:
+    """Only state changes are gated: the page itself must load so it can ask
+    for the secret, and a GET cannot carry a header on a top-level navigation."""
+    gated = inspect.getsource(web_ui.Handler.do_POST)
+    assert "authorize_state_change(self.headers)" in gated
+    assert "authorize_state_change" not in inspect.getsource(web_ui.Handler.do_GET)
+
+    with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+        handler = _DrivableHandler("/api/storage", _raw_headers(), b"")
+        handler.command = "GET"
+        with patch.object(web_ui, "storage_status", return_value={"mounted": False}):
+            handler.do_GET()
+    assert handler.status == HTTPStatus.OK
+
+
+def test_handler_bounds_a_stalled_connection_with_a_socket_timeout() -> None:
+    assert web_ui.Handler.timeout == web_ui.REQUEST_TIMEOUT_SECONDS
+    assert 0 < web_ui.REQUEST_TIMEOUT_SECONDS <= 60
+
+
+def test_frontend_sends_the_token_and_recovers_from_a_challenge() -> None:
+    page = web_ui.HTML
+    # Bearer header on every request the page makes.
+    assert 'headers["Authorization"] = `Bearer ${controlToken}`' in page
+    # Handed in out of band via the fragment, which servers and proxies do not
+    # log, then remembered and scrubbed from the address bar.
+    assert 'new URLSearchParams((location.hash || "").replace(/^#/, "")).get("token")' in page
+    assert 'history.replaceState(null, "", location.pathname + location.search)' in page
+    assert "window.localStorage.setItem(TOKEN_KEY, value)" in page
+    # A 401 asks once and retries once; `retried` stops it looping.
+    assert "if (res.status === 401 && !retried)" in page
+    assert "return api(path, options, true);" in page

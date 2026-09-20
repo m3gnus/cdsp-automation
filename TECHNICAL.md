@@ -284,9 +284,64 @@ single-writer contract: every EQ or speaker edit goes through the persistent
 state files and is composed into the live config by the source switcher.
 
 The unit deliberately runs as root because the UI restarts services, mounts
-USB storage, and sets the system clock. It has no authentication; bind it to
-a trusted LAN only. Users who do not want a root web service simply skip
-this component — nothing else depends on it.
+USB storage, and sets the system clock. Users who do not want a root web
+service simply skip this component — nothing else depends on it.
+
+### Request guards
+
+Two guards are unconditional, because they are safe whatever the
+configuration:
+
+- **Origin validation.** Every state-changing request (every `POST`) is
+  refused with `403` when its `Origin` header names anything other than this
+  server. A browser attaches `Origin` to every cross-site `POST`, so this is
+  what stops a page on some other site using a LAN browser as a confused
+  deputy for the whole audio stack. A request with *no* `Origin` is a
+  non-browser client (`curl`, a shell script) and stays allowed, so existing
+  scripted callers keep working.
+- **Body bounds and timeouts.** `Content-Length` is validated before a single
+  byte of a body is read: an undeclared length (`Transfer-Encoding: chunked`)
+  is `411`, a malformed or negative one is `400`, and anything over
+  `MAX_REQUEST_BODY_BYTES` (256 KiB) is `413`. The refusal never buffers the
+  body, and the connection is closed rather than reused, because the unread
+  bytes would otherwise be parsed as the next request. `Handler.timeout`
+  (20 s) is applied to the connection by `socketserver`, so a client that
+  opens a socket and stalls cannot pin a handler thread.
+
+Two settings are opt-in, so that upgrading an existing install changes
+nothing until the operator chooses otherwise:
+
+- **`INSTALLATION_UI_HOST`** (default `0.0.0.0`) is the bind address. The
+  historical value is kept as the fallback in both `install.sh` and
+  `web_ui.py` so an upgrade cannot silently take a working UI away. Set it to
+  `127.0.0.1` for loopback only and reach the UI over an SSH tunnel
+  (`ssh -N -L 8088:127.0.0.1:8088 <user>@<pi>`). Menu option 12 prints the
+  address it is about to bind to and offers loopback before it asks to
+  install. `INSTALLATION_UI_PORT` (default `8088`) is read the same way. The
+  unit deliberately carries no `Environment=INSTALLATION_UI_HOST` or
+  `Environment=INSTALLATION_UI_PORT` line — either would shadow the operator's
+  edit to `cdsp-automation.env`.
+- **`INSTALLATION_UI_TOKEN`** (default empty) is an optional shared secret.
+  While it is empty the UI is unauthenticated, exactly as it always was. When
+  it is set, every `POST` must carry it as `Authorization: Bearer <token>`
+  (or `X-Control-Token: <token>`) or it is refused with `401` and a
+  `WWW-Authenticate: Bearer` challenge. The comparison uses
+  `hmac.compare_digest`; a plain `==` would leak the matching prefix length
+  through its timing. `GET` endpoints stay open either way — a top-level
+  browser navigation cannot carry a header, so the page has to load before it
+  can ask for the secret.
+
+The page picks the token up from a URL fragment
+(`http://<pi>:8088/#token=<secret>`), which neither the server nor a proxy
+logs, keeps it in `localStorage`, scrubs it out of the address bar, and sends
+it on every request. If a state change comes back `401` it prompts once and
+retries once.
+
+This is authentication for a single trusted operator, not a login system, and
+it does not make the service less privileged. The remaining work is splitting
+the UI into an unprivileged web process and a narrowly scoped privileged
+helper, so that a flaw in the request handling is not automatically root; that
+is a larger change and has not been done.
 
 Because it shares the `flock` files with daemons that run as the install user,
 its unit sets `Group=` to the install group and `UMask=0007`, and the locks
