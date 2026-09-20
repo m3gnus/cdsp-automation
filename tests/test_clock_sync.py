@@ -392,3 +392,48 @@ def test_clock_send_failure_is_not_latched_and_equal_rates_use_source_identity()
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _reload_clock_sync(env: dict):
+    """Re-import clock_sync with a patched environment."""
+    import importlib, os, sys
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update({k: v for k, v in env.items()})
+    for k, v in env.items():
+        if v is None:
+            os.environ.pop(k, None)
+    try:
+        import clock_sync
+        return importlib.reload(clock_sync)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_datastore_read_back_can_be_switched_off_explicitly() -> None:
+    """An interface that serves no datastore must be able to stop being asked.
+
+    Unset means "derive it from the WebSocket host"; set-but-empty means
+    "this device has none". Conflating the two left a USB-only interface
+    logging a failed read-back forever with no way to silence it.
+    """
+    import importlib
+
+    derived = _reload_clock_sync({"MOTU_WS_URL": "ws://10.0.0.5:1280"})
+    assert derived.MOTU_DATASTORE_URL == "http://10.0.0.5/datastore"
+
+    disabled = _reload_clock_sync(
+        {"MOTU_WS_URL": "ws://10.0.0.5:1280", "MOTU_DATASTORE_URL": ""}
+    )
+    assert disabled.MOTU_DATASTORE_URL == ""
+    # And it must not even attempt a request, so nothing is logged.
+    assert disabled.read_motu_clock() is None
+
+    explicit = _reload_clock_sync(
+        {"MOTU_WS_URL": "ws://10.0.0.5:1280",
+         "MOTU_DATASTORE_URL": "http://elsewhere/ds"}
+    )
+    assert explicit.MOTU_DATASTORE_URL == "http://elsewhere/ds"

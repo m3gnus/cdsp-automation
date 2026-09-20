@@ -64,7 +64,17 @@ def _datastore_url(ws_url: str) -> str:
 # publishes its current settings over the plain HTTP datastore document. A
 # deployment whose interface does not serve one simply never gets a read-back,
 # and the daemon falls back to the cached value exactly as it always did.
-MOTU_DATASTORE_URL = os.environ.get("MOTU_DATASTORE_URL") or _datastore_url(MOTU_WS_URL)
+# Unset derives the URL from the WebSocket host; set-but-empty is an explicit
+# "this interface has no datastore, stop asking". Without that distinction an
+# empty value fell back to the derived URL, so a USB-only interface such as an
+# UltraLite mk5 -- which answers port 80 but serves no datastore -- could not
+# be told to stop, and logged a failed read-back every retry interval forever.
+_DATASTORE_URL_ENV = os.environ.get("MOTU_DATASTORE_URL")
+MOTU_DATASTORE_URL = (
+    _datastore_url(MOTU_WS_URL)
+    if _DATASTORE_URL_ENV is None
+    else _DATASTORE_URL_ENV.strip()
+)
 MOTU_READBACK_TIMEOUT = float(os.environ.get("MOTU_CLOCK_READBACK_TIMEOUT", "3"))
 # How often a *confirmed* clock value is re-checked. It is one small HTTP GET,
 # and it is what notices a clock changed behind our back from the MOTU web UI.
