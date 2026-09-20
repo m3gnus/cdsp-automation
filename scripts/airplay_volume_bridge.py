@@ -47,6 +47,12 @@ AUDIO_READY_PATH = Path(
         "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
     )
 )
+SPEAKER_STATUS_PATH = Path(
+    os.environ.get(
+        "SPEAKER_STATUS_PATH",
+        "/run/cdsp-source-switcher/speaker-profile-status.json",
+    )
+)
 SOCKET_PATH = Path(
     os.environ.get(
         "AIRPLAY_VOLUME_SOCKET_PATH", "/run/airplay-volume-bridge/input.sock"
@@ -183,18 +189,29 @@ def set_mapped_volume(
     # copy in /usr/local/libexec merely to send a datagram; deployment helpers
     # used by the daemon live beside the daemon script and may not be installed
     # beside that callback copy.
-    from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
+    from speaker_profiles import (
+        audio_control_lock,
+        require_audio_unmute_allowed,
+        volume_ceiling,
+    )
 
+    # A network sender's 100% maps onto VOLUME_MAX_DB, which knows nothing
+    # about the speaker profile in service. The ceiling the switcher verified
+    # wins, so a capped profile cannot be overdriven from a phone either.
+    ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
+    capped_db = min(mapped_db, ceiling)
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         if not muted:
             require_audio_unmute_allowed(AUDIO_READY_PATH)
-        client.volume.set_main_volume(mapped_db)
+        client.volume.set_main_volume(capped_db)
         client.volume.set_main_mute(muted)
     result = {
         "ok": True,
         "source": source,
         "source_volume": source_volume,
-        "camilla_db": mapped_db,
+        "camilla_db": capped_db,
+        "requested_db": mapped_db,
+        "volume_limit_db": ceiling,
         "muted": muted,
         "updated_at": time.time(),
     }

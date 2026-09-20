@@ -22,6 +22,7 @@ from speaker_profiles import (
     require_audio_unmute_allowed,
     resolve_profile_audio_path,
     speaker_selection_lock,
+    volume_ceiling,
 )
 
 
@@ -62,9 +63,22 @@ AUDIO_READY_PATH = Path(
         "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
     )
 )
+SPEAKER_STATUS_PATH = Path(
+    os.environ.get(
+        "SPEAKER_STATUS_PATH",
+        "/run/cdsp-source-switcher/speaker-profile-status.json",
+    )
+)
 
 VOLUME_MIN = float(os.environ.get("REMOTE_VOLUME_MIN", "-80"))
-VOLUME_MAX = float(os.environ.get("REMOTE_VOLUME_MAX", "0"))
+# The ceiling comes from the profile the switcher verified into service, not
+# from this module. REMOTE_VOLUME_MAX stays available as a deployment's own
+# preference, but it can only tighten that ceiling -- never lift it.
+VOLUME_MAX_OVERRIDE = (
+    float(os.environ["REMOTE_VOLUME_MAX"])
+    if os.environ.get("REMOTE_VOLUME_MAX")
+    else None
+)
 VOLUME_STEP = float(os.environ.get("REMOTE_VOLUME_STEP", "1"))
 
 ENTER_HOLD_SECONDS = float(os.environ.get("REMOTE_ENTER_HOLD_SECONDS", "1"))
@@ -217,13 +231,22 @@ def current_audio_eq_path() -> tuple[Path, str]:
     )
 
 
+def current_volume_max() -> float:
+    """Ceiling of the applied speaker profile, tightened by any override."""
+    return volume_ceiling(SPEAKER_STATUS_PATH, override=VOLUME_MAX_OVERRIDE)
+
+
 def adjust_volume(change: float) -> None:
     """Adjust the main volume by the specified amount."""
     try:
         client = ensure_cdsp_connected()
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+            maximum = current_volume_max()
+            # A ceiling below the usual floor still wins; clamping up to
+            # VOLUME_MIN afterwards would hand back the volume just refused.
+            minimum = min(VOLUME_MIN, maximum)
             current_volume = client.volume.main_volume()
-            new_volume = max(VOLUME_MIN, min(VOLUME_MAX, current_volume + change))
+            new_volume = max(minimum, min(maximum, current_volume + change))
             client.volume.set_main_volume(new_volume)
         print(f"Volume: {new_volume:.1f} dB", flush=True)
     except Exception as exc:

@@ -20,6 +20,7 @@ import audio_eq
 import speaker_config
 import speaker_profiles
 import web_ui
+from profile_fixtures import partymeh_document
 
 
 REPOSITORY = Path(__file__).resolve().parents[1]
@@ -885,3 +886,122 @@ def test_backup_directory_default_left_the_retired_state_tree() -> None:
     assert str(web_ui.AUDIO_EQ_BACKUP_DIR) == "/var/lib/cdsp-automation/audio-eq-backups"
     source = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
     assert "/var/lib/installation" not in source
+
+
+def _apply_web_volume(status_path: Path, payload: dict) -> tuple[list[float], float]:
+    applied: list[float] = []
+    client = SimpleNamespace(
+        volume=SimpleNamespace(
+            main_volume=lambda: -60.0,
+            set_main_volume=applied.append,
+            main_mute=lambda: False,
+        )
+    )
+    with (
+        patch.object(web_ui, "SPEAKER_STATUS_PATH", status_path),
+        patch.object(web_ui, "camilla_client", return_value=nullcontext(client)),
+        patch.object(web_ui, "audio_control_lock", return_value=nullcontext()),
+        patch.object(web_ui, "camilla_status", return_value={}),
+    ):
+        web_ui.set_camilla_volume(payload)
+        return applied, web_ui.current_volume_max()
+
+
+def test_web_volume_cannot_exceed_the_applied_profile_ceiling(tmp_path: Path) -> None:
+    """The UI has no ceiling of its own; the verified profile sets it."""
+    status = tmp_path / "speaker-profile-status.json"
+    status.write_text(
+        json.dumps({"ok": True, "applied": "partymeh", "volume_limit_db": -20.0}),
+        encoding="utf-8",
+    )
+    applied, ceiling = _apply_web_volume(status, {"volume_db": 0.0})
+    assert ceiling == -20.0
+    assert applied == [-20.0]
+    # The same refusal on the relative path the +/- buttons use.
+    applied, _ = _apply_web_volume(status, {"delta_db": 100.0})
+    assert applied == [-20.0]
+    # Below the cap the UI still passes the request through untouched.
+    applied, _ = _apply_web_volume(status, {"volume_db": -35.0})
+    assert applied == [-35.0]
+
+
+def test_web_volume_fails_closed_without_a_verified_profile_status(
+    tmp_path: Path,
+) -> None:
+    failsafe = speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB
+    assert failsafe < 0.0
+    status = tmp_path / "speaker-profile-status.json"
+    for payload in (
+        None,
+        {"ok": False, "volume_limit_db": 0.0},
+        {"ok": True},
+        {"ok": True, "volume_limit_db": None},
+        {"ok": True, "volume_limit_db": "0"},
+    ):
+        if payload is None:
+            status.unlink(missing_ok=True)
+        else:
+            status.write_text(json.dumps(payload), encoding="utf-8")
+        applied, ceiling = _apply_web_volume(status, {"volume_db": 0.0})
+        assert ceiling == failsafe, payload
+        assert applied == [failsafe], payload
+
+
+def test_web_volume_slider_bounds_follow_the_enforced_ceiling() -> None:
+    """The control the operator sees must not offer what the server refuses."""
+    assert "volume_max_db" in web_ui.HTML
+    assert 'max="${volMax}"' in web_ui.HTML
+    source = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
+    assert "VOLUME_MAX_DB = " not in source
+
+
+def test_operator_profile_preflight_requires_the_profile_volume_cap(
+    tmp_path: Path,
+) -> None:
+    """Selecting a capped profile reports an uncapped config before it goes live."""
+    config_dir = tmp_path / "configs"
+    profile_dir = tmp_path / "profiles"
+    config_dir.mkdir()
+    profile_dir.mkdir()
+    document = partymeh_document()
+    document["max_volume_db"] = -20
+    (profile_dir / "partymeh.yml").write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    operator_configs = speaker_profiles.operator_configs_for_speaker("partymeh")
+    for filename in operator_configs.values():
+        (config_dir / filename).write_text(
+            yaml.safe_dump({"devices": {"samplerate": 48000}}), encoding="utf-8"
+        )
+
+    checked: list[str] = []
+
+    def fake_run_result(command: list[str], **_kwargs: object) -> SimpleNamespace:
+        checked.append(Path(command[-1]).stem)
+        return SimpleNamespace(returncode=0, stdout="")
+
+    context = (
+        patch.object(web_ui, "CDSP_CONFIG_DIR", config_dir),
+        patch.object(web_ui, "SPEAKER_PROFILE_DIR", profile_dir),
+        patch.object(web_ui, "run_result", side_effect=fake_run_result),
+    )
+    with context[0], context[1], context[2]:
+        try:
+            web_ui.preflight_speaker_profile("partymeh")
+        except ValueError as exc:
+            assert "no devices.volume_limit" in str(exc)
+            assert "-20.0 dB" in str(exc)
+        else:
+            raise AssertionError("an uncapped operator config passed preflight")
+    assert checked == []
+
+    for filename in operator_configs.values():
+        (config_dir / filename).write_text(
+            yaml.safe_dump({"devices": {"samplerate": 48000, "volume_limit": -25}}),
+            encoding="utf-8",
+        )
+    with context[0], context[1], context[2]:
+        web_ui.preflight_speaker_profile("partymeh")
+    assert sorted(checked) == sorted(
+        Path(name).stem for name in operator_configs.values()
+    )

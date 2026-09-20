@@ -3,11 +3,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import json
 import stat
 import subprocess
 import sys
+import tempfile
 import types
 import unittest
+from contextlib import nullcontext
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -24,6 +29,7 @@ if "evdev" not in sys.modules:
     evdev.InputDevice = object
     sys.modules["evdev"] = evdev
 
+import speaker_profiles
 from scripts import cdsp_remote
 
 
@@ -168,6 +174,87 @@ class RemoteTests(unittest.TestCase):
         self.assertTrue(old.closed)
         self.assertIs(cdsp_remote.remote_device, replacement)
         grab.assert_called_once_with(replacement)
+
+
+class RemoteVolumeCeilingTests(unittest.TestCase):
+    """The remote's ceiling is the applied profile's, never a fixed 0 dB."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.status = Path(self.directory.name, "speaker-profile-status.json")
+        self.addCleanup(self.directory.cleanup)
+        self.addCleanup(setattr, cdsp_remote, "cdsp", None)
+
+    def write_status(self, payload: dict) -> None:
+        self.status.write_text(json.dumps(payload), encoding="utf-8")
+
+    def applied(self, limit: float) -> None:
+        self.write_status(
+            {"ok": True, "applied": "partymeh", "volume_limit_db": limit}
+        )
+
+    def raise_volume(self, start: float, *, override: float | None = None) -> float:
+        volume = SimpleNamespace(
+            main_volume=lambda: start,
+            set_main_volume=lambda value: applied.append(value),
+        )
+        applied: list[float] = []
+        client = SimpleNamespace(volume=volume)
+        with (
+            mock.patch.object(cdsp_remote, "SPEAKER_STATUS_PATH", self.status),
+            mock.patch.object(cdsp_remote, "VOLUME_MAX_OVERRIDE", override),
+            mock.patch.object(
+                cdsp_remote, "ensure_cdsp_connected", return_value=client
+            ),
+            mock.patch.object(
+                cdsp_remote, "audio_control_lock", return_value=nullcontext()
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            # Far more than any ceiling: the answer is always the ceiling.
+            cdsp_remote.adjust_volume(500.0)
+        self.assertEqual(len(applied), 1)
+        return applied[0]
+
+    def test_remote_volume_ceiling_follows_the_applied_profile(self) -> None:
+        self.applied(-20.0)
+        with mock.patch.object(cdsp_remote, "SPEAKER_STATUS_PATH", self.status):
+            self.assertEqual(cdsp_remote.current_volume_max(), -20.0)
+        self.assertEqual(self.raise_volume(-25.0), -20.0)
+        # Already at the cap: a further volume-up must not move it.
+        self.assertEqual(self.raise_volume(-20.0), -20.0)
+
+    def test_remote_volume_ceiling_fails_closed_without_a_verified_apply(self) -> None:
+        failsafe = speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB
+        unverified = (
+            None,  # no status file at all
+            {"ok": False, "volume_limit_db": 0.0},
+            {"ok": True},  # applied, but published no ceiling
+            {"ok": True, "volume_limit_db": "loud"},
+            {"ok": True, "volume_limit_db": True},
+            {"ok": True, "volume_limit_db": 900.0},
+        )
+        for payload in unverified:
+            with self.subTest(payload=payload):
+                if payload is None:
+                    self.status.unlink(missing_ok=True)
+                else:
+                    self.write_status(payload)
+                self.assertEqual(self.raise_volume(-40.0), failsafe)
+                self.assertLess(failsafe, 0.0)
+
+    def test_remote_env_override_can_only_tighten_the_profile_ceiling(self) -> None:
+        self.applied(-20.0)
+        # A stricter deployment preference wins.
+        self.assertEqual(self.raise_volume(-40.0, override=-30.0), -30.0)
+        # A looser one -- including the old 0 dB default -- does not.
+        self.assertEqual(self.raise_volume(-40.0, override=0.0), -20.0)
+        self.assertEqual(self.raise_volume(-40.0, override=10.0), -20.0)
+
+    def test_remote_floor_follows_a_ceiling_stricter_than_the_floor(self) -> None:
+        """A -90 dB cap must not be clamped back up to REMOTE_VOLUME_MIN."""
+        self.applied(-90.0)
+        self.assertEqual(self.raise_volume(-100.0), -90.0)
 
 
 if __name__ == "__main__":

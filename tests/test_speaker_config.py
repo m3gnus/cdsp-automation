@@ -365,3 +365,84 @@ def test_source_base_program_map_remaps_parametric_profiles() -> None:
         base2, classic, state, source_id="streamer"
     )
     assert "program" not in config
+
+
+def test_compiled_profile_config_always_carries_the_profile_volume_cap() -> None:
+    """Generated configs get the native ceiling; a stricter one survives."""
+    profile = make_test_speaker_profile()  # max_volume_db: -6
+    state = audio_eq.default_audio_state()
+
+    uncapped = capture_base(2)
+    uncapped["devices"].pop("volume_limit")
+    compiled = speaker_config.compile_profile_config(
+        uncapped, profile, state, source_id="streamer"
+    )
+    assert compiled["devices"]["volume_limit"] == -6
+
+    stricter = capture_base(2)
+    stricter["devices"]["volume_limit"] = -30
+    compiled = speaker_config.compile_profile_config(
+        stricter, profile, state, source_id="streamer"
+    )
+    assert compiled["devices"]["volume_limit"] == -30
+
+    looser = capture_base(2)
+    looser["devices"]["volume_limit"] = 0
+    compiled = speaker_config.compile_profile_config(
+        looser, profile, state, source_id="streamer"
+    )
+    assert compiled["devices"]["volume_limit"] == -6
+
+
+def test_config_volume_limit_separates_absent_from_unparseable() -> None:
+    assert speaker_config.config_volume_limit({"devices": {}}) is None
+    assert speaker_config.config_volume_limit({}) is None
+    assert speaker_config.config_volume_limit({"devices": {"volume_limit": -12}}) == -12
+    for broken in (True, "-20", [], 999):
+        try:
+            speaker_config.config_volume_limit({"devices": {"volume_limit": broken}})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"unparseable volume_limit accepted: {broken!r}")
+
+
+def test_operator_config_must_declare_the_profile_volume_cap() -> None:
+    """The profile cap is validated, never written into an operator's file."""
+    profile = copy.deepcopy(make_test_speaker_profile())
+    profile["max_volume_db"] = -20.0
+
+    missing = {"devices": {"samplerate": 48000}}
+    try:
+        speaker_config.require_config_volume_limit(
+            missing, profile, label="operator config partymeh-streamer.yml"
+        )
+    except ValueError as exc:
+        assert "partymeh-streamer.yml" in str(exc)
+        assert "no devices.volume_limit" in str(exc)
+        assert "-20.0 dB" in str(exc)
+    else:
+        raise AssertionError("a config with no native ceiling was accepted")
+    # The operator's document is theirs; validation must not have touched it.
+    assert missing == {"devices": {"samplerate": 48000}}
+
+    looser = {"devices": {"volume_limit": -10}}
+    try:
+        speaker_config.require_config_volume_limit(
+            looser, profile, label="operator config partymeh-streamer.yml"
+        )
+    except ValueError as exc:
+        assert "looser" in str(exc)
+    else:
+        raise AssertionError("a ceiling looser than the profile cap was accepted")
+    assert looser == {"devices": {"volume_limit": -10}}
+
+    exact = {"devices": {"volume_limit": -20}}
+    assert speaker_config.require_config_volume_limit(
+        exact, profile, label="operator config partymeh-streamer.yml"
+    ) == -20.0
+    stricter = {"devices": {"volume_limit": -35}}
+    assert speaker_config.require_config_volume_limit(
+        stricter, profile, label="operator config partymeh-streamer.yml"
+    ) == -35.0
+    assert stricter == {"devices": {"volume_limit": -35}}

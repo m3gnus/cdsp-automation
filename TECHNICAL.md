@@ -37,6 +37,25 @@ audio-control lock make reload a fail-closed transaction: inhibit → mute →
 validate/reload/verify → overlay → restore requested mute → publish ready.
 Rollback always re-inhibits and asserts mute before loading the previous graph.
 
+### Volume limits
+
+A profile's `max_volume_db` is enforced through CamillaDSP's native
+`devices.volume_limit`, never through a one-time clamp. For generated configs
+the compiler writes it (keeping a stricter limit the source base already
+declared). An operator-owned config is the operator's artifact, so it is
+validated instead of rewritten: it must itself declare a `devices.volume_limit`
+at least as restrictive as the profile's cap, or both selection preflight and
+the transition refuse it by name.
+
+A successful apply publishes the effective ceiling as `volume_limit_db` in the
+speaker-profile status at `SPEAKER_STATUS_PATH`. Every volume writer — the HID
+remote, the control UI, and the AirPlay/Spotify bridge — derives its maximum
+from that verified value rather than a constant of its own. Anything short of
+a successful apply that recorded a ceiling (no status, `ok` not true, a missing
+or malformed value) means the most restrictive sane ceiling
+(`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
+survives as a deployment's own preference but can only tighten that ceiling.
+
 I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
 
 ## Installation

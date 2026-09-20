@@ -34,6 +34,7 @@ from speaker_config import (
     load_profile,
     load_yaml_mapping,
     profile_catalog,
+    require_config_volume_limit,
 )
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
@@ -47,6 +48,7 @@ from speaker_profiles import (
     set_audio_inhibit,
     speaker_selection_lock,
     update_speaker_selection,
+    volume_ceiling,
 )
 
 
@@ -161,7 +163,9 @@ ISO226_CAPABILITY_PATH = Path(
     )
 )
 VOLUME_MIN_DB = -80.0
-VOLUME_MAX_DB = 0.0
+# There is deliberately no VOLUME_MAX_DB here. The UI has no ceiling of its
+# own: it honours whichever ceiling the switcher verified into service, and
+# falls back to the most restrictive one when that answer is unavailable.
 
 SOURCE_CHOICES = {
     "streamer": "Streamer",
@@ -756,12 +760,13 @@ HTML = r"""<!doctype html>
     function renderVolume(data) {
       const c = data.camilla || {};
       const vol = c.volume_db != null ? Number(c.volume_db) : -40;
+      const volMax = c.volume_max_db != null ? Number(c.volume_max_db) : 0;
       const focus = document.activeElement;
       if (!qs("#volRange")) {
         qs("#volumePanel").innerHTML =
           `<div class="volume">
-            <input id="volRange" data-volume type="range" min="-50" max="0" step="0.5" value="${vol}">
-            <input id="volNum" class="num" data-volume type="number" min="-80" max="0" step="0.5" value="${vol.toFixed(1)}">
+            <input id="volRange" data-volume type="range" min="${Math.min(-50, volMax)}" max="${volMax}" step="0.5" value="${vol}">
+            <input id="volNum" class="num" data-volume type="number" min="${Math.min(-80, volMax)}" max="${volMax}" step="0.5" value="${vol.toFixed(1)}">
           </div>
           <div class="row" style="margin-top:14px">
             <button class="btn sm" data-volume-action="down">−1 dB</button>
@@ -777,6 +782,8 @@ HTML = r"""<!doctype html>
         qsa("[data-volume-action]").forEach(b => b.addEventListener("click", volumeAction));
         qs("#muteToggle").addEventListener("change", e => setVolume({ muted: e.target.checked }));
       } else {
+        qs("#volRange").min = Math.min(-50, volMax); qs("#volRange").max = volMax;
+        qs("#volNum").min = Math.min(-80, volMax); qs("#volNum").max = volMax;
         if (focus !== qs("#volRange") && focus !== qs("#volNum")) {
           qs("#volRange").value = vol; qs("#volNum").value = vol.toFixed(1);
         }
@@ -1461,8 +1468,17 @@ def _finite_volume(value: Any) -> float:
     return numeric
 
 
+def current_volume_max() -> float:
+    """Ceiling of the profile the switcher last verified into service."""
+    return volume_ceiling(SPEAKER_STATUS_PATH)
+
+
 def clamp_volume(value: Any) -> float:
-    return max(VOLUME_MIN_DB, min(VOLUME_MAX_DB, _finite_volume(value)))
+    maximum = current_volume_max()
+    # A ceiling stricter than the usual floor still wins, so the floor follows
+    # it down instead of clamping the refused volume back up.
+    minimum = min(VOLUME_MIN_DB, maximum)
+    return max(minimum, min(maximum, _finite_volume(value)))
 
 
 @contextmanager
@@ -1531,6 +1547,7 @@ def camilla_status() -> dict[str, Any]:
                 "config_file": client.config.file_path(),
                 "sample_rate": config.get("devices", {}).get("samplerate"),
                 "volume_db": client.volume.main_volume(),
+                "volume_max_db": current_volume_max(),
                 "muted": client.volume.main_mute(),
             }
     except Exception as exc:
@@ -1887,6 +1904,15 @@ def preflight_speaker_profile(speaker_id: str) -> None:
             (source, CDSP_CONFIG_DIR / operator_configs[source])
             for source in profile["supported_sources"]
         ]
+        # Report the missing cap here rather than letting the transition fail
+        # later: the operator owns these files and has to edit them by hand.
+        for _source, path in configs:
+            if path.is_file():
+                require_config_volume_limit(
+                    load_yaml_mapping(path, f"operator config {path.name}"),
+                    profile,
+                    label=f"operator config {path.name}",
+                )
     else:
         profile = load_profile(SPEAKER_PROFILE_DIR, speaker_id)
         audio_state = read_profile_audio_state(
