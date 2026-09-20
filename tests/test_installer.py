@@ -376,12 +376,17 @@ ensure_audio_state_storage
             # fresh install never depends on the root UI creating it.
             self.assertTrue((state / "audio-eq-backups").is_dir())
 
-    def _run(self, body: str, *, env: dict[str, str] | None = None) -> str:
+    def _run(
+        self, body: str, *, env: dict[str, str] | None = None, stdin: str = ""
+    ) -> str:
         """Source the installer and run `body`, returning one ordered stream."""
         environment = os.environ.copy()
         environment.update(env or {})
         result = subprocess.run(
             ["bash", "-c", f"set -euo pipefail\nsource {INSTALLER!s}\n{body}"],
+            # A pipe, never the caller's terminal: a `read` the body reaches
+            # must end in EOF rather than waiting for whoever ran the suite.
+            input=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -496,6 +501,176 @@ ensure_audio_state_storage
                 seen.read_text(encoding="utf-8").strip(),
                 f"--uninstall {capability}",
             )
+
+    # --- The source switcher is a dependency, not a sibling ------------------
+    # Only the switcher writes the audio-ready token that permits an unmute,
+    # and only the switcher applies a persisted tone/EQ edit.  So a remote, a
+    # volume bridge or a web UI installed without it would never be able to
+    # unmute and its tone edits would go nowhere.  The installer resolves that
+    # rather than shipping the broken combination, and says so.
+
+    def test_remote_only_install_installs_the_switcher_it_depends_on(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "steps.log"
+            output = self._run(
+                "\n".join(
+                    [
+                        f'record() {{ printf "%s\\n" "$1" >> {log!s}; }}',
+                        "getent() { return 1; }",
+                        "set_env_value() { :; }",
+                        "install_remote_sudoers() { record remote-sudoers; }",
+                        'create_unit() { record "unit:$3"; }',
+                        "install_source_switcher() { record switcher; }",
+                        "reset_install_notes",
+                        "install_remote",
+                        "print_install_summary",
+                    ]
+                ),
+                env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
+                # The remote's own device-name prompt; the default is taken.
+                stdin="\n",
+            )
+            steps = log.read_text(encoding="utf-8").split()
+            # The dependency is satisfied before the remote's own unit starts.
+            self.assertEqual(
+                steps, ["switcher", "remote-sudoers", "unit:cdsp-remote"]
+            )
+            self.assertIn("REQUIRED DEPENDENCY: Remote Control", output)
+            self.assertIn(
+                "Also installed, because the components you chose require it:", output
+            )
+            self.assertIn(
+                "Source Switcher: installed because Remote Control requires it", output
+            )
+
+    def test_dependency_explains_the_unmute_and_tone_consequences_to_the_operator(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = self._run(
+                "\n".join(
+                    [
+                        "install_source_switcher() { :; }",
+                        "reset_install_notes",
+                        'ensure_source_switcher "Web control UI"',
+                        "print_install_summary",
+                    ]
+                ),
+                env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
+            )
+            self.assertIn("audio-ready token that allows an", output)
+            self.assertIn("persisted Bass/Treble/EQ edits", output)
+            self.assertIn("could never unmute", output)
+            # Installing the switcher is not the same as configuring it.
+            self.assertIn("give it its source configs", output)
+            # A pulled-in dependency is not a skipped or failed component.
+            self.assertIn("All requested components installed.", output)
+            self.assertNotIn("skipped or failed component(s)", output)
+
+    def test_an_already_installed_switcher_is_not_reinstalled_by_a_dependent(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "steps.log"
+            output = self._run(
+                "\n".join(
+                    [
+                        # Every queried unit is reported installed.
+                        'systemctl() { echo "$3 enabled"; }',
+                        f'install_source_switcher() {{ printf "switcher\\n" >> {log!s}; }}',
+                        "reset_install_notes",
+                        'ensure_source_switcher "Remote Control"',
+                        "print_install_summary",
+                    ]
+                ),
+                env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
+            )
+            self.assertFalse(log.exists(), "an installed switcher was reinstalled")
+            self.assertNotIn("REQUIRED DEPENDENCY", output)
+            self.assertNotIn("Also installed", output)
+
+    def test_install_all_is_unchanged_and_needs_no_dependency_rescue(self) -> None:
+        """Option 1 already installs the switcher, so nothing extra happens."""
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "steps.log"
+            output = self._run(
+                "\n".join(
+                    [
+                        f'record() {{ printf "%s\\n" "$1" >> {log!s}; }}',
+                        "prepare_install() { record prepare; }",
+                        "install_trigger() { record trigger; }",
+                        "install_motu_sync() { record motu; }",
+                        "install_source_switcher() { record switcher; "
+                        "SOURCE_SWITCHER_INSTALLED_THIS_RUN=1; }",
+                        'install_remote() { ensure_source_switcher "Remote Control"; '
+                        "record remote; }",
+                        "install_airplay_volume_bridge() { "
+                        'ensure_source_switcher "AirPlay/Spotify volume bridge"; '
+                        "record airplay; }",
+                        "install_spotify_volume_sync() { record spotify; }",
+                        "install_iso226_engine() { record engine; }",
+                        "install_all",
+                    ]
+                ),
+                env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
+            )
+            self.assertEqual(
+                log.read_text(encoding="utf-8").split(),
+                [
+                    "prepare",
+                    "trigger",
+                    "motu",
+                    "switcher",
+                    "remote",
+                    "airplay",
+                    "spotify",
+                    "engine",
+                ],
+            )
+            self.assertNotIn("REQUIRED DEPENDENCY", output)
+            self.assertNotIn("Also installed", output)
+            self.assertIn("All requested components installed.", output)
+
+    def test_dependent_menu_entries_name_the_switcher_and_print_a_summary(
+        self,
+    ) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        dispatch = installer.split('read -r -p "Enter your choice: "', 1)[1]
+        # Options 6 and 12 can now pull a component in, so they gained the
+        # summary that already closed options 1, 2 and 9.
+        self.assertIn(
+            "6) reset_install_notes; prepare_install; install_remote; "
+            "print_install_summary ;;",
+            dispatch,
+        )
+        self.assertIn(
+            "install_control_ui; print_install_summary;",
+            dispatch,
+        )
+        menu = self._run("print_menu")
+        self.assertIn("Options 6, 9 and 12 also install option 5", menu)
+        self.assertIn("permit an unmute", menu)
+        # Every dependent routes through the one helper.
+        for component in (
+            "install_remote()",
+            "install_airplay_volume_bridge()",
+            "install_control_ui()",
+        ):
+            body = installer.split(component, 1)[1].split("\n}\n", 1)[0]
+            self.assertIn("ensure_source_switcher", body, component)
+
+    def test_docs_no_longer_claim_the_unmuting_components_stand_alone(self) -> None:
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        technical = (REPOSITORY / "TECHNICAL.md").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "Install **Remote Control** by itself for volume, mute", readme
+        )
+        self.assertNotIn("designed to work together or independently", technical)
+        for text, label in ((readme, "README"), (technical, "TECHNICAL")):
+            self.assertIn("require_audio_unmute_allowed", text, label)
+            self.assertIn("audio-ready token", text, label)
+        self.assertIn("each require **Source Switcher**", readme)
+        self.assertIn("Each requires the Source Switcher", technical)
 
     def test_summary_notes_do_not_leak_between_menu_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -797,6 +972,7 @@ ensure_audio_state_storage
                 "\n".join(
                     [
                         "sudo() { :; }",
+                        f'install_source_switcher() {{ printf "switcher\\n" >> {log!s}; }}',
                         f'install_receiver_sudoers() {{ printf "sudoers\\n" >> {log!s}; }}',
                         f'create_unit() {{ printf "unit\\n" >> {log!s}; }}',
                         f'configure_shairport_bridge() {{ printf "shairport\\n" >> {log!s}; }}',
@@ -805,9 +981,11 @@ ensure_audio_state_storage
                 ),
                 env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
             )
+            # The switcher the bridge depends on for its unmute permission comes
+            # first, then the bridge's own three steps in their previous order.
             self.assertEqual(
                 log.read_text(encoding="utf-8").split(),
-                ["sudoers", "unit", "shairport"],
+                ["switcher", "sudoers", "unit", "shairport"],
             )
 
     def test_refresh_writes_receiver_authorization_before_narrowing_the_remote_file(

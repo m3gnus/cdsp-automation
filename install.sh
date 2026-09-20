@@ -213,11 +213,20 @@ get_env_value() {
 # reset when the action starts, printed and cleared when it ends, so a note from
 # one menu choice can never surface in the next one's summary.
 INSTALL_NOTES=()
-reset_install_notes() { INSTALL_NOTES=(); }
+# Components this run pulled in because another component requires them.  Kept
+# apart from INSTALL_NOTES so the skipped/failed count stays a count of things
+# that did not happen; these did happen, and the operator is told why.
+INSTALL_DEPENDENCIES=()
+reset_install_notes() { INSTALL_NOTES=(); INSTALL_DEPENDENCIES=(); }
 
 note_skip() {
   INSTALL_NOTES+=("$1")
   echo "$1" >&2
+}
+
+note_dependency() {
+  INSTALL_DEPENDENCIES+=("$1")
+  echo "$1"
 }
 
 print_install_summary() {
@@ -225,6 +234,11 @@ print_install_summary() {
   count=${#INSTALL_NOTES[@]}
   echo ""
   echo "============================================="
+  if [[ "${#INSTALL_DEPENDENCIES[@]}" -gt 0 ]]; then
+    echo "Also installed, because the components you chose require it:"
+    printf '  - %s\n' ${INSTALL_DEPENDENCIES[@]+"${INSTALL_DEPENDENCIES[@]}"}
+    echo ""
+  fi
   if [[ "$count" -eq 0 ]]; then
     echo "All requested components installed."
   else
@@ -233,6 +247,45 @@ print_install_summary() {
   fi
   echo "============================================="
   INSTALL_NOTES=()
+  INSTALL_DEPENDENCIES=()
+}
+
+# The control core.  Three components - the HID remote, the AirPlay/Spotify
+# volume bridge and the web control UI - call
+# speaker_profiles.require_audio_unmute_allowed() before they are permitted to
+# unmute, and persist tone/EQ edits for something else to apply.  Only the
+# source switcher ever writes that audio-ready token
+# (speaker_profiles.clear_audio_inhibit, called from scripts/source_switcher.py)
+# and only the switcher applies the persisted overlay.  The token is a JSON
+# document carrying the live engine generation, so it cannot be hand-written
+# either, and the check is deliberately never relaxed: it is what stops audio
+# being unmuted against an unverified engine.  So those three are not
+# standalone, and this installer installs the switcher with them rather than
+# producing a deployment that can never unmute.
+SOURCE_SWITCHER_INSTALLED_THIS_RUN=0
+
+source_switcher_present() {
+  [[ "$SOURCE_SWITCHER_INSTALLED_THIS_RUN" == "1" ]] && return 0
+  # Same query the update path uses.  A host without systemctl answers "not
+  # installed" quietly: the redirection covers the lookup failure too.
+  systemctl list-unit-files --no-legend cdsp-source-switcher.service 2>/dev/null \
+    | grep -q '^cdsp-source-switcher.service'
+}
+
+ensure_source_switcher() {
+  local component="$1"
+  if source_switcher_present; then
+    return 0
+  fi
+  echo ""
+  echo "REQUIRED DEPENDENCY: $component needs the Source Switcher."
+  echo "  Only the Source Switcher publishes the audio-ready token that allows an"
+  echo "  unmute, and only it applies persisted Bass/Treble/EQ edits to the engine."
+  echo "  Installed alone, $component could never unmute and its tone edits would"
+  echo "  go nowhere, so the Source Switcher is being installed alongside it."
+  echo ""
+  install_source_switcher
+  note_dependency "Source Switcher: installed because $component requires it (give it its source configs in $CONFIGS_DIR, or it will not run)"
 }
 
 # Move settings this installer used to hard-code onto their neutral names.
@@ -534,6 +587,9 @@ install_source_switcher() {
   echo "   - $CONFIGS_DIR/gadget.yml"
   echo ""
   echo "Source Switcher installed."
+  # Remembered for the rest of this run so a component installed after it never
+  # re-installs it just because systemd has not caught up with the new unit.
+  SOURCE_SWITCHER_INSTALLED_THIS_RUN=1
 }
 
 install_remote_sudoers() {
@@ -575,6 +631,9 @@ EOF
 
 install_remote() {
   echo "Installing Remote Control..."
+  # Mute/unmute and the tone keys are the remote's reason to exist, and both
+  # run through the switcher.  Pull it in before the remote's own unit starts.
+  ensure_source_switcher "Remote Control"
 
   if getent group input >/dev/null; then
     sudo usermod -aG input "$INSTALL_USER"
@@ -639,6 +698,9 @@ configure_shairport_bridge() {
 
 install_airplay_volume_bridge() {
   echo "Installing AirPlay volume bridge daemon and system callback..."
+  # The bridge unmutes when a receiver starts playing, so it needs the same
+  # audio-ready token the remote does.
+  ensure_source_switcher "AirPlay/Spotify volume bridge"
   sudo install -d -m 0755 /usr/local/libexec
   sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
   sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
@@ -693,6 +755,9 @@ install_control_ui() {
     echo "Expose its port on a trusted LAN only, or set a token in $ENV_FILE."
   fi
   echo ""
+  # The UI's audio page unmutes and edits tone through the same gate the remote
+  # uses, so it carries the same dependency.
+  ensure_source_switcher "Web control UI"
   local unit_file
   unit_file="$(mktemp)"
   cat > "$unit_file" <<EOL
@@ -1072,6 +1137,8 @@ CamillaDSP Utilities - Choose an Option
 11) Uninstall All Utilities
 12) Install Web Control UI (optional)
 0)  Exit
+Options 6, 9 and 12 also install option 5 when it is missing: the Source
+Switcher is the only thing that can permit an unmute or apply tone/EQ edits.
 Options 11 and 12 ask for confirmation before acting.
 =============================================
 MENU
@@ -1088,13 +1155,13 @@ main() {
       3) prepare_install; install_trigger ;;
       4) prepare_install; install_motu_sync ;;
       5) prepare_install; install_source_switcher ;;
-      6) prepare_install; install_remote ;;
+      6) reset_install_notes; prepare_install; install_remote; print_install_summary ;;
       7) pair_bluetooth_remote ;;
       8) show_status ;;
       9) install_network_volume_sync ;;
       10) prepare_install; install_iso226_engine ;;
       11) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
-      12) if confirm_control_ui_exposure; then prepare_install; install_control_ui; else echo "Cancelled."; fi ;;
+      12) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac
