@@ -312,6 +312,47 @@ ensure_audio_state_storage
             self.assertIn("ISO 226 loudness engine: FAILED", output)
             self.assertIn("2 skipped or failed component(s)", output)
 
+    def test_uninstall_all_points_the_engine_helper_at_the_configured_receipt(
+        self,
+    ) -> None:
+        """The helper refuses to touch the binary without its receipt, so it has
+        to be told where this deployment keeps one."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "site"
+            scripts = base / "scripts"
+            scripts.mkdir(parents=True)
+            capability = root / "custom" / "iso226-engine.json"
+            (base / "cdsp-automation.env").write_text(
+                f"ISO226_CAPABILITY_PATH={capability}\n", encoding="utf-8"
+            )
+            seen = root / "helper.log"
+            helper = scripts / "build_camilladsp_iso226.sh"
+            helper.write_text(
+                f'#!/bin/bash\nprintf "%s %s\\n" "$1" "$ISO226_CAPABILITY_PATH" >> {seen!s}\n',
+                encoding="utf-8",
+            )
+            helper.chmod(0o755)
+
+            self._run(
+                "\n".join(
+                    [
+                        "systemctl() { :; }",
+                        'sudo() { if [[ "$1" == systemctl ]]; then shift; systemctl "$@"; fi; }',
+                        "remove_unit_file() { :; }",
+                        f"SCRIPTS_DIR={scripts!s}",
+                        f"SHAIRPORT_CONFIG={root!s}/absent.conf",
+                        "uninstall_all",
+                    ]
+                ),
+                env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
+            )
+
+            self.assertEqual(
+                seen.read_text(encoding="utf-8").strip(),
+                f"--uninstall {capability}",
+            )
+
     def test_summary_notes_do_not_leak_between_menu_actions(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = self._run(
