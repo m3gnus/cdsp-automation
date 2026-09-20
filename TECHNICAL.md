@@ -69,7 +69,7 @@ or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
 
-I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
+I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control and MOTU clock sync run on their own. The source switcher is the control core: it is the only writer of the audio-ready token that permits an unmute, and the only thing that applies a persisted tone/EQ edit, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
 
 ## Installation
 
@@ -78,7 +78,7 @@ wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/install.sh -O
 chmod +x install.sh && ./install.sh
 ```
 
-The installer provides a menu to install utilities individually or all at once, and sets up systemd services for each one.
+The installer provides a menu to install utilities individually or all at once, and sets up systemd services for each one. The entries that install a component depending on the source switcher (menu options 6, 9 and 12) install the switcher too when it is missing, say so before they act, and list it in their closing summary.
 
 Python 3.10 or newer is required.
 
@@ -395,17 +395,26 @@ journalctl -u cdsp-remote -f
 
 ## Can I Use Just One?
 
-Trigger control and MOTU clock sync are independent. The source switcher owns
-the persistent EQ overlay, so remote tone controls and web audio controls need
-it:
+Trigger control and MOTU clock sync are independent. The source switcher is a
+required dependency of every component that unmutes or edits tone: the remote,
+the AirPlay/Spotify volume bridge and the web control UI all call
+`speaker_profiles.require_audio_unmute_allowed()` before unmuting, and
+`clear_audio_inhibit()` - the only thing that grants it - is called from
+`scripts/source_switcher.py` alone. The switcher is likewise the only applier
+of the persisted EQ overlay.
 
 - **Just Trigger** - For basic amp power control
 - **Just MOTU Sync** - If you only need clock management
 - **Just Source Switcher** - For automatic source selection
-- **Just Remote** - For volume, mute, and recovery controls; add Source Switcher
-  for persistent tone control
+- **Remote, volume bridge, web UI** - Each requires the Source Switcher; the
+  installer pulls it in rather than producing a component that can never unmute
+  and whose tone edits are never applied
 - **Compatible combinations** - Shared volume writers serialize through the
   audio-control lock
+
+The token is a JSON document naming the engine generation it was verified
+against, so it cannot be forged by creating the file, and the check is never
+weakened: it is what keeps audio muted until a verified config is live.
 
 ---
 

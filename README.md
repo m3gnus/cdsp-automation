@@ -60,7 +60,9 @@ chmod +x install.sh
 **Notes:**
 - Run the installer on the Raspberry Pi where you want the utilities installed
 - The installer uses `sudo` where required, so you do not need to run the whole script as root
-- Choose option **1** to install all utilities at once, or install them individually
+- Choose option **1** to install all utilities at once, or install them
+  individually - but note that options 6, 9 and 12 also install the source
+  switcher, which they require in order to unmute or apply tone changes
 
 ## Audio control architecture
 
@@ -579,24 +581,37 @@ The installer menu provides these options:
 3. **Install Trigger Control** - GPIO relay control only
 4. **Install MOTU Clock Sync** - MOTU clock management only
 5. **Install Source Switcher** - Config switching only
-6. **Install Remote Control** - Bluetooth/USB remote control only
+6. **Install Remote Control** - Bluetooth/USB remote control (also installs
+   option 5, which it requires)
 7. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
 8. **Show Service Status** - Check if services are running
-9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the CamillaDSP fader
+9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the
+   CamillaDSP fader (also installs option 5, which it requires)
 10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build.
     Requires `camilladsp.service` to start `/usr/local/bin/camilladsp`.
 11. **Uninstall All Utilities** - Remove the services, units and sudoers rules.
     Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
-12. **Install Web Control UI** - Optional root web dashboard (trusted LAN only)
+12. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
+    also installs option 5, which it requires)
+
+Options 6, 9 and 12 install the source switcher when it is missing, because
+the components they install cannot unmute without it. The switcher is the only
+writer of the audio-ready token that permits an unmute, and the only thing that
+applies persisted Bass/Treble/EQ edits to the running engine, so installing any
+of them alone would produce a remote, bridge or UI that can never unmute and
+whose tone edits go nowhere. Each run says so before it acts, and lists the
+switcher under "Also installed, because the components you chose require it"
+in its closing summary. Installing the switcher does not give it its source
+configs - you still have to create them, or its service will not run.
 
 Options 11 and 12 ask for a `y/N` confirmation before acting: one removes every
 managed service, the other exposes a root web server. Option 12 first prints
 the address it is about to bind to and whether a token is configured, and
 offers to move the UI to `127.0.0.1` before you say yes.
 
-Options 1, 2 and 9 end with a summary listing any component that was skipped or
-failed, and no longer abandon the rest of the run when one of them cannot be
-installed.
+Options 1, 2, 6, 9 and 12 end with a summary listing anything that was pulled
+in as a dependency and any component that was skipped or failed, and no longer
+abandon the rest of the run when one of them cannot be installed.
 
 ### What Gets Installed
 
@@ -834,16 +849,26 @@ journalctl -u cdsp-source-switcher -n 100 | grep "MOTU meters"
 
 ## Can I Use Just One Utility?
 
-**Yes.** Trigger control and MOTU clock sync can run independently. Source
-switching owns the persistent EQ overlay; install it when using the remote's
-tone controls or the web UI's audio controls:
+**Some of them.** Trigger control and MOTU clock sync are genuinely standalone.
+The remote, the AirPlay/Spotify volume bridge and the web control UI are not:
+they all ask `require_audio_unmute_allowed()` for permission before unmuting,
+and only the source switcher ever grants it by publishing the audio-ready
+token. The switcher is also the only thing that applies a persisted
+Bass/Treble/EQ edit to the running engine. So:
 
 - Install only **Trigger Control** for amp power management
 - Install only **MOTU Clock Sync** for clock source automation
 - Install only **Source Switcher** for config switching
-- Install **Remote Control** by itself for volume, mute, and recovery controls,
-  or alongside **Source Switcher** for persistent tone adjustment
-- Install any compatible combination; shared writers use the audio-control lock
+- **Remote Control**, **AirPlay + Spotify Volume Sync** and the **Web Control
+  UI** each require **Source Switcher**. The installer adds it for you rather
+  than leaving you with a component that can never unmute and whose tone edits
+  are never applied
+- Install any combination of the above; shared writers use the audio-control lock
+
+The ready token is a JSON document carrying the generation of the engine it was
+verified against, so writing one by hand is not a way around this - and the
+check is what stops audio being unmuted against an unverified engine, so it is
+never relaxed.
 
 ---
 
