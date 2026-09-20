@@ -65,6 +65,14 @@ LOWER_PRIORITY_ACTIVE_TIMEOUT = float(
     os.environ.get("SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT", "0")
 )
 SETTLE_TIME = float(os.environ.get("SOURCE_SETTLE_TIME", "2.0"))
+# SetConfig/Reload acknowledge that a change was queued, not that the
+# processing controller finished applying it. SETTLE_TIME remains the grace
+# period before the first state read; the read-back of the applied config is
+# then polled until it converges or this bounded deadline expires.
+CONFIG_APPLY_TIMEOUT = float(os.environ.get("SOURCE_CONFIG_APPLY_TIMEOUT", "10.0"))
+CONFIG_APPLY_POLL_INTERVAL = float(
+    os.environ.get("SOURCE_CONFIG_APPLY_POLL_INTERVAL", "0.25")
+)
 AUDIO_THRESHOLD_DB = float(os.environ.get("SOURCE_AUDIO_THRESHOLD_DB", "-80"))
 DEBUG_MODE = env_bool("SOURCE_DEBUG", False)
 MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
@@ -778,17 +786,107 @@ def _audio_overlay_matches(actual: dict, expected: dict) -> bool:
     return actual_steps == expected_steps
 
 
+def _without_null_fields(value: object) -> object:
+    """Drop null-valued mapping keys anywhere in a config tree.
+
+    CamillaDSP serializes its *parsed* configuration for GetConfig, so every
+    optional field the submitted YAML omitted reads back as null -- not only
+    inside ``filters`` (where ``_comparable_filter`` patched this narrowly)
+    but also for ALSA device options such as ``stop_on_inactive``,
+    ``link_volume_control`` and ``labels``.
+
+    Only the absent/null pairing collapses. A field the submitted config
+    actually specifies is still compared strictly against the engine's value,
+    and a concrete value the engine reports where the request said nothing is
+    still a difference. Routing, channel counts, ``volume_limit`` and ``mute``
+    therefore keep their exact comparison.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _without_null_fields(item)
+            for key, item in value.items()
+            if item is not None
+        }
+    if isinstance(value, list):
+        return [_without_null_fields(item) for item in value]
+    return value
+
+
 def _configs_equivalent(actual: dict, expected: dict) -> bool:
     """Ignore CamillaDSP's materialization of omitted optional fields."""
-    def comparable(config: dict) -> dict:
-        result = copy.deepcopy(config)
-        result["filters"] = {
-            name: _comparable_filter(value)
-            for name, value in result.get("filters", {}).items()
-        }
-        return result
+    return _without_null_fields(actual) == _without_null_fields(expected)
 
-    return comparable(actual) == comparable(expected)
+
+def _engine_parsed_config(cdsp: CamillaClient, file_path: str) -> dict | None:
+    """Return the engine's own parse of ``file_path``, or None if unavailable.
+
+    Normalization approach: let the engine define it. ``config.active()`` is
+    the engine's serialization of a config it loaded through ReadConfigFile,
+    which fills in defaults and resolves relative coefficient paths against
+    the config file's own directory. Asking the engine to read that same file
+    yields the identical representation, so the read-back comparison is
+    like-for-like without this module maintaining an allowlist of optional
+    fields that would drift with every upstream release.
+
+    The file we ask the engine to parse is the file we just handed it, and
+    ``apply_config`` has already checked its digest against the target, so
+    this does not widen what counts as an acceptable config.
+
+    Older pycamilladsp clients (and engines that reject the request) have no
+    such call; the caller then falls back to structural null-stripping.
+    """
+    reader = getattr(getattr(cdsp, "config", None), "read_and_parse_file", None)
+    if reader is None:
+        return None
+    try:
+        parsed = reader(file_path)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _accepted_config_matches(
+    cdsp: CamillaClient, file_path: str, accepted: object, expected: dict
+) -> bool:
+    """Compare an accepted read-back against the requested configuration."""
+    if not isinstance(accepted, dict) or not accepted:
+        return False
+    reference = _engine_parsed_config(cdsp, file_path)
+    if reference is None:
+        reference = expected
+    return _configs_equivalent(accepted, reference)
+
+
+def _await_active_config(
+    cdsp: CamillaClient,
+    file_path: str,
+    expected: dict,
+    *,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> None:
+    """Poll until the engine reports the requested config, or fail closed.
+
+    A single read after a fixed sleep races the asynchronous application of a
+    queued config. Poll against a bounded deadline instead; on timeout raise,
+    which leaves the caller's rollback and latched mute intact.
+    """
+    if timeout is None:
+        timeout = CONFIG_APPLY_TIMEOUT
+    if poll_interval is None:
+        poll_interval = CONFIG_APPLY_POLL_INTERVAL
+    poll_interval = max(poll_interval, 0.01)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        if _accepted_config_matches(
+            cdsp, file_path, cdsp.config.active(), expected
+        ):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "CamillaDSP active config differs from requested config"
+            )
+        time.sleep(poll_interval)
 
 
 def ensure_audio_eq(
@@ -946,12 +1044,9 @@ def apply_config(
         if not same_config(cdsp.config.file_path(), file_path):
             raise RuntimeError("CamillaDSP did not retain the requested config path")
         if target:
-            accepted = cdsp.config.active()
             expected = target.get("expected_config")
-            if expected is not None and (
-                not accepted or not _configs_equivalent(accepted, expected)
-            ):
-                raise RuntimeError("CamillaDSP active config differs from requested config")
+            if expected is not None:
+                _await_active_config(cdsp, file_path, expected)
 
         if target and target.get("selection_revision") is not None:
             current_selection = current_speaker_selection()
@@ -1035,8 +1130,9 @@ def apply_config(
                     rollback_state in {"running", "paused"}
                     and same_config(cdsp.config.file_path(), previous_path)
                     and previous_expected is not None
-                    and bool(rollback_active)
-                    and _configs_equivalent(rollback_active, previous_expected)
+                    and _accepted_config_matches(
+                        cdsp, previous_path, rollback_active, previous_expected
+                    )
                 )
             except Exception as rollback_exc:
                 print(f"Config rollback failed: {rollback_exc}", flush=True)
