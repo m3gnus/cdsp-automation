@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import io
 import json
 import sys
@@ -93,9 +94,69 @@ class ConfigRecoveryTests(unittest.TestCase):
         self.assertIn("remembered config is not a file", output.getvalue())
 
 
+# CamillaDSP serializes its *parsed* configuration for GetConfig, so optional
+# fields the submitted YAML omitted read back as null. These are the ALSA
+# device options that bit the read-back comparison in practice.
+ENGINE_OPTIONAL_DEVICE_FIELDS = ("stop_on_inactive", "link_volume_control", "labels")
+
+
+def engine_materialized(config: dict) -> dict:
+    """Mirror how the engine materializes omitted optional fields on read-back."""
+    result = copy.deepcopy(config)
+    devices = result.get("devices")
+    if isinstance(devices, dict):
+        for side in ("capture", "playback"):
+            section = devices.get(side)
+            if isinstance(section, dict):
+                for field in ENGINE_OPTIONAL_DEVICE_FIELDS:
+                    section.setdefault(field, None)
+    filters = result.get("filters")
+    if isinstance(filters, dict):
+        for value in filters.values():
+            if isinstance(value, dict):
+                value.setdefault("description", None)
+                parameters = value.get("parameters")
+                if isinstance(parameters, dict):
+                    for field in ("inverted", "mute"):
+                        parameters.setdefault(field, None)
+    return result
+
+
 class FakeSwitcherConfig:
-    def __init__(self, path: str) -> None:
+    """Config endpoint that reproduces the engine's read-back behaviour.
+
+    ``active()`` serves the config the engine has actually applied, always in
+    the materialized form the real GetConfig returns. ``apply_after`` models an
+    asynchronously applied reload: the first N reads still report the previous
+    config. ``active_config`` pins a config that never converges.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        *,
+        apply_after: int = 0,
+        active_config: dict | None = None,
+        parses_files: bool = True,
+    ) -> None:
         self.path = path
+        self.applied_path = path
+        self.apply_after = apply_after
+        self.active_config = active_config
+        self.active_calls = 0
+        if parses_files:
+            # Newer pycamilladsp clients expose the engine's own parser.
+            self.read_and_parse_file = self._read_and_parse_file
+
+    @staticmethod
+    def _load(path: str) -> dict:
+        try:
+            return yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+        except OSError:
+            return {}
+
+    def _read_and_parse_file(self, path: str) -> dict:
+        return engine_materialized(self._load(path))
 
     def file_path(self) -> str:
         return self.path
@@ -104,7 +165,30 @@ class FakeSwitcherConfig:
         self.path = path
 
     def active(self) -> dict:
-        return {"devices": {}}
+        self.active_calls += 1
+        if self.active_config is not None:
+            return engine_materialized(self.active_config)
+        if self.active_calls > self.apply_after:
+            self.applied_path = self.path
+        return engine_materialized(self._load(self.applied_path))
+
+
+class FakeClock:
+    """Deterministic stand-in for the time module used by apply_config."""
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = start
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
 
 
 class FakeSwitcherVolume:
@@ -643,6 +727,178 @@ def test_ambiguous_final_unmute_failure_reinhibits_before_rollback(
             raise AssertionError("ambiguous unmute did not fail closed")
     assert client.volume.mute is True
     assert client.config.path == str(previous)
+    assert not (tmp_path / "ready.json").exists()
+
+
+# A valid config that omits every optional ALSA device field. The engine
+# materializes those as null on read-back, which is what the verification has
+# to tolerate without loosening anything that affects routing or protection.
+MINIMAL_ALSA_CONFIG = {
+    "devices": {
+        "samplerate": 48000,
+        "chunksize": 1024,
+        "capture": {
+            "type": "Alsa",
+            "channels": 2,
+            "device": "hw:Loopback,1",
+            "format": "S32LE",
+        },
+        "playback": {
+            "type": "Alsa",
+            "channels": 2,
+            "device": "hw:MOTU,0",
+            "format": "S32LE",
+        },
+    },
+}
+
+
+def run_verified_switch(
+    tmp_path: Path,
+    expected: dict,
+    *,
+    statuses: list[dict] | None = None,
+    clock: FakeClock | None = None,
+    timeout: float = 1.0,
+    poll_interval: float = 0.25,
+    **config_kwargs: object,
+) -> tuple[SimpleNamespace, Exception | None]:
+    """Apply a config whose target carries expected_config, capturing failure."""
+    previous = tmp_path / "streamer.yml"
+    target_path = tmp_path / "streamer--partymeh.yml"
+    previous.write_text("devices: {}\n")
+    target_path.write_text(
+        yaml.safe_dump(expected, sort_keys=False), encoding="utf-8"
+    )
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(str(previous), **config_kwargs),
+        volume=FakeSwitcherVolume(),
+        general=FakeSwitcherGeneral(["running", "running"]),
+    )
+    target = {
+        "speaker": "partymeh",
+        "source": "streamer",
+        "digest": switcher.config_digest(expected),
+        "max_volume_db": -6,
+        "expected_config": expected,
+    }
+    error: Exception | None = None
+    if statuses is None:
+        statuses = []
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "CONFIG_DIR", str(tmp_path)),
+        patch.object(
+            switcher, "SPEAKER_TRANSITION_PATH", tmp_path / "transition.json"
+        ),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher, "_write_speaker_status", side_effect=statuses.append),
+        patch.object(switcher, "time", clock or FakeClock()),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", timeout),
+        patch.object(switcher, "CONFIG_APPLY_POLL_INTERVAL", poll_interval),
+    ):
+        try:
+            switcher.apply_config(client, str(target_path), target=target)
+        except Exception as exc:  # noqa: BLE001 - the assertion is the message
+            error = exc
+    return client, error
+
+
+def test_omitted_optional_device_fields_round_trip_through_verification(
+    tmp_path: Path,
+) -> None:
+    """Nulls the engine materializes are not a difference from the request."""
+    statuses: list[dict] = []
+    client, error = run_verified_switch(
+        tmp_path, MINIMAL_ALSA_CONFIG, statuses=statuses
+    )
+    assert error is None
+    assert client.volume.mute is False
+    assert statuses[-1]["ok"] is True
+    # The read-back genuinely carried the materialized nulls.
+    assert client.config.active()["devices"]["playback"]["stop_on_inactive"] is None
+
+
+def test_verification_tolerates_materialized_nulls_without_engine_parsing(
+    tmp_path: Path,
+) -> None:
+    """Older clients without ReadConfigFile fall back to null-stripping."""
+    statuses: list[dict] = []
+    client, error = run_verified_switch(
+        tmp_path, MINIMAL_ALSA_CONFIG, statuses=statuses, parses_files=False
+    )
+    assert not hasattr(client.config, "read_and_parse_file")
+    assert error is None
+    assert client.volume.mute is False
+    assert statuses[-1]["ok"] is True
+
+
+def test_verification_still_rejects_a_genuinely_different_active_config(
+    tmp_path: Path,
+) -> None:
+    """Routing and protection differences must survive the normalization."""
+    rerouted = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    rerouted["devices"]["playback"]["channels"] = 4
+    limited = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    limited["devices"]["playback"]["volume_limit"] = 0.0
+    for divergent in (rerouted, limited):
+        statuses: list[dict] = []
+        client, error = run_verified_switch(
+            tmp_path,
+            MINIMAL_ALSA_CONFIG,
+            statuses=statuses,
+            active_config=divergent,
+        )
+        assert isinstance(error, RuntimeError)
+        assert "differs from requested config" in str(error)
+        assert client.volume.mute is True
+        assert statuses[-1]["ok"] is False
+
+
+def test_queued_config_is_accepted_once_it_becomes_active_before_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """Reload only queues the change; polling waits it out instead of racing."""
+    clock = FakeClock()
+    statuses: list[dict] = []
+    client, error = run_verified_switch(
+        tmp_path,
+        MINIMAL_ALSA_CONFIG,
+        statuses=statuses,
+        clock=clock,
+        apply_after=2,
+    )
+    assert error is None
+    assert client.config.active_calls > 2
+    assert 0.25 in clock.slept
+    assert client.volume.mute is False
+    assert statuses[-1]["ok"] is True
+
+
+def test_config_that_never_becomes_active_fails_closed_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """A bounded deadline still rolls back and latches mute on timeout."""
+    clock = FakeClock()
+    statuses: list[dict] = []
+    stale = {"devices": {"samplerate": 44100}}
+    client, error = run_verified_switch(
+        tmp_path,
+        MINIMAL_ALSA_CONFIG,
+        statuses=statuses,
+        clock=clock,
+        timeout=1.0,
+        poll_interval=0.25,
+        active_config=stale,
+    )
+    assert isinstance(error, RuntimeError)
+    assert "differs from requested config" in str(error)
+    # Polling stopped at the deadline rather than spinning forever.
+    assert clock.slept.count(0.25) == 4
+    assert client.volume.mute is True
+    assert statuses[-1]["ok"] is False
     assert not (tmp_path / "ready.json").exists()
 
 
