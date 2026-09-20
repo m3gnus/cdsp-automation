@@ -44,11 +44,13 @@ from speaker_profiles import (
     audio_control_lock,
     audio_inhibit_active,
     clear_audio_inhibit,
+    new_engine_generation,
     normalize_volume_limit,
     read_profile_audio_state,
     read_speaker_selection,
     set_audio_inhibit,
     speaker_selection_lock,
+    stamp_engine_generation,
     operator_config_for_source,
 )
 
@@ -191,6 +193,22 @@ CONFIGS = {
 
 _iso226_capability_result = False
 _iso226_capability_next_check = 0.0
+
+# Readiness generation for the CamillaDSP connection this process currently
+# holds.  Rotated on every (re)connection, so a token minted for an earlier
+# engine instance — or by an earlier switcher run — never authorizes unmuting.
+_engine_generation = ""
+
+
+def rotate_engine_generation() -> str:
+    """Start a new readiness generation; every older token stops counting."""
+    global _engine_generation
+    _engine_generation = new_engine_generation()
+    return _engine_generation
+
+
+def engine_generation() -> str:
+    return _engine_generation or rotate_engine_generation()
 
 
 def iso226_capability_available() -> bool:
@@ -583,6 +601,21 @@ class ConfigRecoveryGuard:
             self.last_message = message
             self.next_log = now + self.log_seconds
 
+    def _inhibit(self, cdsp: CamillaClient, now: float) -> None:
+        """Latch muted before recovery so the reload cannot become audible.
+
+        A remembered config that failed to activate has never been through the
+        verified apply path.  Dropping readiness here makes the main loop treat
+        the recovered graph exactly like an intentional transition: muted,
+        re-resolved, re-validated and re-stamped before anything may unmute.
+        """
+        try:
+            with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+                set_audio_inhibit(AUDIO_READY_PATH)
+                cdsp.volume.set_main_mute(True)
+        except Exception as exc:
+            self._log(f"CamillaDSP recovery could not latch mute: {exc}", now)
+
     def ready(self, cdsp: CamillaClient, now: float) -> bool:
         state = _processing_state(cdsp)
         active_config = None if state == "inactive" else cdsp.config.active()
@@ -591,6 +624,7 @@ class ConfigRecoveryGuard:
             self.next_log = 0.0
             self.last_message = None
             return True
+        self._inhibit(cdsp, now)
         if now < self.next_attempt:
             return False
         self.next_attempt = now + self.retry_seconds
@@ -1166,9 +1200,26 @@ def apply_config(
                     "updated_at": time.time(),
                 }
             )
+        # Bind readiness to this engine instance before sound may return: the
+        # marker lives in the live config only, so an engine that restarts or
+        # reloads comes back without it and every consumer inhibits on its own.
+        generation = engine_generation()
+        stamp_engine_generation(cdsp, generation)
         cdsp.volume.set_main_mute(previous_mute)
         clear_pending_transition(target)
-        clear_audio_inhibit(AUDIO_READY_PATH)
+        clear_audio_inhibit(
+            AUDIO_READY_PATH,
+            generation=generation,
+            applied={
+                "config_path": file_path,
+                "config_digest": target.get("digest", "") if target else "",
+                "source": target.get("source") if target else None,
+                "speaker": target.get("speaker") if target else None,
+                "selection_revision": (
+                    target.get("selection_revision") if target else None
+                ),
+            },
+        )
         if (
             target
             and not target.get("legacy", False)
@@ -1299,13 +1350,35 @@ def main() -> int:
         try:
             if not cdsp.is_connected():
                 cdsp.connect()
+                # A new websocket may be a new engine process.  Rotate the
+                # generation and drop the token: whatever was verified belonged
+                # to the connection that just ended, and startup validation has
+                # to run again before audio may return.
+                rotate_engine_generation()
+                with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+                    set_audio_inhibit(AUDIO_READY_PATH)
+                startup_restore_mute = None
+                startup_configs_validated = False
                 print("Connected to CamillaDSP", flush=True)
 
             if not recovery.ready(cdsp, time.monotonic()):
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if startup_restore_mute is None and audio_inhibit_active(AUDIO_READY_PATH):
+            # One engine round-trip per pass decides readiness for the whole
+            # iteration: the token must exist, belong to this switcher run, and
+            # name the generation the live engine instance still carries.
+            inhibited = audio_inhibit_active(
+                AUDIO_READY_PATH, cdsp, generation=engine_generation()
+            )
+            if inhibited:
+                # An engine that dropped the marker without dropping the
+                # connection (restart, external reload, foreign set_active) is
+                # unverified; make that visible to every other control now.
+                with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+                    set_audio_inhibit(AUDIO_READY_PATH)
+
+            if startup_restore_mute is None and inhibited:
                 startup_restore_mute = mute_for_startup_validation(cdsp)
             current_config = cdsp.config.file_path()
             selection = current_speaker_selection()
@@ -1314,7 +1387,7 @@ def main() -> int:
                 # Missing configs now fail only after the live engine is muted.
                 validate_configs(selected_speaker)
                 startup_configs_validated = True
-            if audio_inhibit_active(AUDIO_READY_PATH):
+            if inhibited:
                 requested_mute = pending_transition_mute(selection)
                 if requested_mute is not None:
                     startup_restore_mute = requested_mute
@@ -1331,11 +1404,12 @@ def main() -> int:
                 current_config=current_config,
             )
 
-            # A restart begins inhibited. Re-apply even a matching managed
-            # config once so provenance, Camilla validation, overlays, and the
-            # selected revision are all verified before controls may unmute.
+            # A restart — of this switcher or of the engine — begins inhibited.
+            # Re-apply even a matching managed config once so provenance,
+            # Camilla validation, overlays, and the selected revision are all
+            # verified before controls may unmute.
             if (
-                audio_inhibit_active(AUDIO_READY_PATH)
+                inhibited
                 and current_source
                 and current_speaker == selected_speaker
             ):
@@ -1816,6 +1890,14 @@ def main() -> int:
                 )
 
         except Exception as exc:
+            # An unhandled fault leaves the engine unverified from here on:
+            # drop the token and re-run startup validation before audio may
+            # return, whatever the fault was.
+            try:
+                set_audio_inhibit(AUDIO_READY_PATH)
+            except Exception:
+                pass
+            startup_configs_validated = False
             # Throttle identical errors to once per 30s. A CamillaDSP outage
             # otherwise floods the journal (~430 lines/incident observed) and
             # wears the SD card; a newly-changed error still logs immediately.

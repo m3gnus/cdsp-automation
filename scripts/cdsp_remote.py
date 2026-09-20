@@ -260,7 +260,7 @@ def toggle_mute() -> None:
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
             is_muted = client.volume.main_mute()
             if is_muted:
-                require_audio_unmute_allowed(AUDIO_READY_PATH)
+                require_audio_unmute_allowed(AUDIO_READY_PATH, client)
             client.volume.set_main_mute(not is_muted)
         print(f"Mute: {'ON' if not is_muted else 'OFF'}", flush=True)
     except Exception as exc:

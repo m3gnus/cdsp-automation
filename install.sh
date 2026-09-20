@@ -424,6 +424,15 @@ create_unit() {
   local unit_ordering=""
   if [[ "$sysname" == "cdsp-source-switcher" ]]; then
     runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes'
+    # The switcher owns the audio-ready token, so it must not outlive the
+    # engine instance the token describes.  PartOf propagates only explicit
+    # stop/restart jobs on camilladsp.service (an operator restart, or the
+    # control UI's), never camilladsp's own Restart= cycles, so it cannot
+    # create a restart loop; BindsTo would additionally stop the switcher
+    # whenever the engine fails, leaving nobody to enforce the inhibit.
+    # An engine that restarts by itself is caught in-process instead, by the
+    # readiness marker no longer matching the live config.
+    unit_ordering='PartOf=camilladsp.service'
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
     unit_ordering='Before=shairport-sync.service raspotify.service'

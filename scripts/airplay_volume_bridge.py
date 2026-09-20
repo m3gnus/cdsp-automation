@@ -202,7 +202,7 @@ def set_mapped_volume(
     capped_db = min(mapped_db, ceiling)
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         if not muted:
-            require_audio_unmute_allowed(AUDIO_READY_PATH)
+            require_audio_unmute_allowed(AUDIO_READY_PATH, client)
         client.volume.set_main_volume(capped_db)
         client.volume.set_main_mute(muted)
     result = {
@@ -550,7 +550,7 @@ def read_mirrorable_camilla_volume(client) -> tuple[float, bool] | None:
 
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         try:
-            require_audio_unmute_allowed(AUDIO_READY_PATH)
+            require_audio_unmute_allowed(AUDIO_READY_PATH, client)
         except RuntimeError:
             return None
         return read_camilla_volume(client)

@@ -70,6 +70,11 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             self.assertIn("RuntimeDirectory=cdsp-source-switcher", unit)
             self.assertIn("RuntimeDirectoryPreserve=yes", unit)
             self.assertIn("WantedBy=multi-user.target", unit)
+            # The switcher owns the audio-ready token, so an operator restart
+            # of the engine must restart it too.  BindsTo would instead leave
+            # the switcher stopped whenever the engine fails.
+            self.assertIn("PartOf=camilladsp.service", unit)
+            self.assertNotIn("BindsTo=", unit)
             self.assertFalse((legacy_dir / "cdsp-source-switcher.service").exists())
 
             calls = log_path.read_text(encoding="utf-8").splitlines()

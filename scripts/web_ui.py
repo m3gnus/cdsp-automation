@@ -40,6 +40,7 @@ from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
     audio_control_lock,
+    audio_inhibit_active,
     operator_configs_for_speaker,
     read_profile_audio_state,
     read_speaker_selection,
@@ -1571,7 +1572,7 @@ def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
                 if not isinstance(muted, bool):
                     raise ValueError("muted must be true or false")
                 if not muted:
-                    require_audio_unmute_allowed(AUDIO_READY_PATH)
+                    require_audio_unmute_allowed(AUDIO_READY_PATH, client)
 
             if target_volume is not None:
                 client.volume.set_main_volume(target_volume)
@@ -1863,12 +1864,21 @@ def _read_json_object(path: Path) -> dict[str, Any]:
         return {}
 
 
+def audio_ready() -> bool:
+    """Report readiness exactly the way an unmute request would be judged."""
+    try:
+        with camilla_client() as client:
+            return not audio_inhibit_active(AUDIO_READY_PATH, client)
+    except Exception:
+        return False
+
+
 def speaker_payload() -> dict[str, Any]:
     return {
         "selection": current_speaker_selection(),
         "catalog": installed_profile_catalog(),
         "status": _read_json_object(SPEAKER_STATUS_PATH),
-        "ready": AUDIO_READY_PATH.is_file(),
+        "ready": audio_ready(),
     }
 
 

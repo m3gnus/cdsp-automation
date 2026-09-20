@@ -615,11 +615,18 @@ def test_network_sender_volume_is_capped_by_the_applied_profile(
             self.mute = value
 
     ready = tmp_path / "ready.json"
-    ready.write_text('{"ready": true}', encoding="utf-8")
+    # Readiness is bound to a live engine instance, so the bridge only reaches
+    # the volume writer when the token and the engine name the same generation.
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+    marker = speaker_profiles.engine_generation_marker(generation)
     status = tmp_path / "speaker-profile-status.json"
 
     def send(setter, argument):
-        client = SimpleNamespace(volume=Volume())
+        client = SimpleNamespace(
+            volume=Volume(),
+            config=SimpleNamespace(description=lambda: marker),
+        )
         with (
             patch.object(
                 volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"

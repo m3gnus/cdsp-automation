@@ -10,6 +10,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import secrets
+import time
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -252,9 +255,138 @@ def audio_control_lock(path: Path):
     return exclusive_file_lock(Path(path))
 
 
-def audio_inhibit_active(path: Path) -> bool:
-    """A missing boot-scoped ready token is the fail-closed default."""
-    return not Path(path).is_file()
+# ---------------------------------------------------------------------------
+# Audio readiness
+#
+# Readiness is a property of one CamillaDSP *instance*, not of the boot.  A
+# token that only proves "some verified transition happened at some point since
+# boot" still authorizes unmuting an engine that restarted underneath it and is
+# now running an unverified graph.  So readiness is bound to an engine
+# generation: a random id the source switcher mints for every CamillaDSP
+# connection it makes, stamped into the live engine's own config description and
+# recorded in the token.
+#
+# CamillaDSP 4.1.3 exposes no process/instance identifier over its websocket
+# (GetVersion is the build, not the run), so the generation is synthesized here
+# and rotated on every (re)connection.  Stamping it into the *active* config
+# rather than the config file is what makes it instance-scoped: an engine that
+# restarts, reloads from disk, or has its config replaced by anyone else comes
+# back without the marker, so every consumer sees the mismatch on its own live
+# client without needing to observe the restart.
+# ---------------------------------------------------------------------------
+
+AUDIO_READY_VERSION = 2
+ENGINE_MARKER_PREFIX = "cdsp-audio-ready:"
+_ENGINE_GENERATION_RE = re.compile(r"[0-9a-f]{32}")
+_ENGINE_MARKER_RE = re.compile(
+    rf"^{re.escape(ENGINE_MARKER_PREFIX)}([0-9a-f]{{32}})$", re.MULTILINE
+)
+
+
+def new_engine_generation() -> str:
+    """Mint the readiness generation for one CamillaDSP connection."""
+    return secrets.token_hex(16)
+
+
+def engine_generation_marker(generation: str) -> str:
+    return f"{ENGINE_MARKER_PREFIX}{generation}"
+
+
+def description_without_marker(description: Any) -> str:
+    """Return an engine config description with any marker line removed."""
+    if not isinstance(description, str):
+        return ""
+    return "\n".join(
+        line
+        for line in description.splitlines()
+        if not line.startswith(ENGINE_MARKER_PREFIX)
+    ).strip("\n")
+
+
+def description_with_marker(description: Any, generation: str) -> str:
+    base = description_without_marker(description)
+    marker = engine_generation_marker(generation)
+    return f"{base}\n{marker}" if base else marker
+
+
+def engine_generation_from_description(description: Any) -> str | None:
+    if not isinstance(description, str):
+        return None
+    match = _ENGINE_MARKER_RE.search(description)
+    return match.group(1) if match else None
+
+
+def live_engine_generation(client: Any) -> str | None:
+    """Read the generation the live engine instance carries, if any.
+
+    One cheap ``GetConfigDescription`` round-trip on the client the caller
+    already holds.  Any failure reads as "no generation", which inhibits.
+    """
+    try:
+        return engine_generation_from_description(client.config.description())
+    except Exception:
+        return None
+
+
+def stamp_engine_generation(client: Any, generation: str) -> None:
+    """Mark the live engine instance as verified for this generation."""
+    if not generation:
+        raise RuntimeError("cannot stamp an empty engine generation")
+    marked = description_with_marker(client.config.description(), generation)
+    try:
+        client.config.set_value("/description", marked)
+    except Exception:
+        pass
+    if live_engine_generation(client) == generation:
+        return
+    # SetConfigValue was rejected or did not take.  Fall back to a whole-config
+    # write; the switcher is the only live-config writer, so this is safe.
+    config = client.config.active()
+    if not config:
+        raise RuntimeError("CamillaDSP has no active config to mark ready")
+    marked_config = dict(config)
+    marked_config["description"] = marked
+    client.config.set_active(marked_config)
+    if live_engine_generation(client) != generation:
+        raise RuntimeError("CamillaDSP did not retain the audio-ready marker")
+
+
+def read_audio_ready_token(path: Path) -> dict[str, Any] | None:
+    """Parse the ready token; anything unknown or malformed reads as absent."""
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != AUDIO_READY_VERSION:
+        return None
+    generation = raw.get("engine_generation")
+    if not isinstance(generation, str) or not _ENGINE_GENERATION_RE.fullmatch(
+        generation
+    ):
+        return None
+    return raw
+
+
+def audio_ready_generation(path: Path) -> str | None:
+    token = read_audio_ready_token(path)
+    return token["engine_generation"] if token else None
+
+
+def audio_inhibit_active(
+    path: Path, client: Any, *, generation: str | None = None
+) -> bool:
+    """Fail closed unless the token names the generation the engine carries.
+
+    ``generation`` is the caller's own current generation; only the source
+    switcher has one, and passing it additionally rejects a token minted by a
+    previous switcher run against a still-running engine.
+    """
+    stored = audio_ready_generation(path)
+    if stored is None:
+        return True
+    if generation is not None and stored != generation:
+        return True
+    return live_engine_generation(client) != stored
 
 
 def set_audio_inhibit(path: Path) -> None:
@@ -262,12 +394,26 @@ def set_audio_inhibit(path: Path) -> None:
     Path(path).unlink(missing_ok=True)
 
 
-def clear_audio_inhibit(path: Path) -> None:
-    atomic_write_json(Path(path), {"ready": True})
+def clear_audio_inhibit(
+    path: Path, *, generation: str, applied: dict[str, Any] | None = None
+) -> None:
+    """Publish readiness for one engine generation and applied config."""
+    if not isinstance(generation, str) or not _ENGINE_GENERATION_RE.fullmatch(
+        generation
+    ):
+        raise ValueError("a ready token needs the current engine generation")
+    payload: dict[str, Any] = {
+        "version": AUDIO_READY_VERSION,
+        "engine_generation": generation,
+        "updated_at": time.time(),
+    }
+    if applied:
+        payload.update(applied)
+    atomic_write_json(Path(path), payload)
 
 
-def require_audio_unmute_allowed(path: Path) -> None:
-    if audio_inhibit_active(path):
+def require_audio_unmute_allowed(path: Path, client: Any) -> None:
+    if audio_inhibit_active(path, client):
         raise RuntimeError("audio output is inhibited until a verified config is active")
 
 
