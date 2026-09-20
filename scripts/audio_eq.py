@@ -456,6 +456,48 @@ def _strip_overlay(config: dict[str, Any]) -> dict[str, Any]:
     return updated
 
 
+def _program_channels(
+    config: dict[str, Any],
+    pipeline: list[Any],
+    insert_at: int,
+    capture_channels: int,
+) -> list[int]:
+    """The capture channels the program actually arrives on.
+
+    The overlay belongs on the channels the first mixer reads, not on 0..1.
+    A multichannel interface gives every input its own channel -- on a MOTU
+    UltraLite mk5 the analog pair lands on 2/3 and TOSLINK on 12/13 -- so a
+    fixed 0..1 applies the whole user EQ, loudness included, to channels the
+    pipeline never reads, and the correction silently does nothing.
+
+    Anything this cannot read confidently falls back to the leading pair,
+    which is what a plain stereo capture uses anyway.
+    """
+    fallback = list(range(min(2, max(1, capture_channels))))
+    if insert_at >= len(pipeline):
+        return fallback
+    step = pipeline[insert_at]
+    if not isinstance(step, dict) or step.get("type") != "Mixer":
+        return fallback
+    mixer = (config.get("mixers") or {}).get(step.get("name"))
+    if not isinstance(mixer, dict):
+        return fallback
+    channels: set[int] = set()
+    for mapping in mixer.get("mapping") or []:
+        if not isinstance(mapping, dict):
+            continue
+        for source in mapping.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            channel = source.get("channel")
+            if isinstance(channel, bool) or not isinstance(channel, int):
+                return fallback
+            channels.add(channel)
+    if not channels or any(c < 0 or c >= capture_channels for c in channels):
+        return fallback
+    return sorted(channels)
+
+
 def apply_audio_overlay(
     config: dict[str, Any], state: dict[str, Any]
 ) -> tuple[dict[str, Any], float]:
@@ -517,7 +559,9 @@ def apply_audio_overlay(
             insert_at,
             {
                 "type": "Filter",
-                "channels": list(range(min(2, max(1, capture_channels)))),
+                "channels": _program_channels(
+                    updated, pipeline, insert_at, capture_channels
+                ),
                 "names": names,
                 "description": PIPELINE_DESCRIPTION,
                 "bypassed": False,

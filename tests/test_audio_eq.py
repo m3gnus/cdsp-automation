@@ -93,6 +93,71 @@ def test_audio_eq_overlay_is_idempotent_and_precedes_crossover() -> None:
     assert 'for key in ("inverted", "mute")' in source_switcher
 
 
+def _motu_config(capture_channels, sources, *, mixer_name="20x22", declare=True):
+    """A multichannel capture whose program arrives away from channels 0/1."""
+    mixers = {
+        mixer_name: {
+            "channels": {"in": capture_channels, "out": 22},
+            "mapping": [
+                {
+                    "dest": index,
+                    "sources": [{"channel": channel, "gain": 0}],
+                }
+                for index, channel in enumerate(sources)
+            ],
+        }
+    }
+    return {
+        "devices": {"capture": {"channels": capture_channels}},
+        "mixers": mixers if declare else {},
+        "pipeline": [{"type": "Mixer", "name": mixer_name}],
+    }
+
+
+def test_overlay_follows_the_mixer_source_channels() -> None:
+    """On a 20-channel MOTU capture the program is not on channels 0/1."""
+    state = audio_eq.default_audio_state()
+    state["bands"][0]["gain"] = 3
+    for sources in ([2, 3], [12, 13]):
+        updated, _ = audio_eq.apply_audio_overlay(
+            _motu_config(20, sources), state
+        )
+        step = next(
+            s for s in updated["pipeline"]
+            if s.get("description") == audio_eq.PIPELINE_DESCRIPTION
+        )
+        assert step["channels"] == sources
+
+
+def test_overlay_keeps_the_leading_pair_for_a_stereo_capture() -> None:
+    """The ordinary 2-channel case is unchanged."""
+    state = audio_eq.default_audio_state()
+    state["bands"][0]["gain"] = 3
+    updated, _ = audio_eq.apply_audio_overlay(
+        _motu_config(2, [0, 1], mixer_name="2x10"), state
+    )
+    step = next(
+        s for s in updated["pipeline"]
+        if s.get("description") == audio_eq.PIPELINE_DESCRIPTION
+    )
+    assert step["channels"] == [0, 1]
+
+
+def test_overlay_falls_back_when_the_mixer_cannot_be_read() -> None:
+    """An unreadable or out-of-range mapping must not place the EQ nowhere."""
+    state = audio_eq.default_audio_state()
+    state["bands"][0]["gain"] = 3
+    undeclared = _motu_config(20, [2, 3], declare=False)
+    out_of_range = _motu_config(20, [2, 99])
+    for config in (undeclared, out_of_range):
+        updated, _ = audio_eq.apply_audio_overlay(config, state)
+        step = next(
+            s for s in updated["pipeline"]
+            if s.get("description") == audio_eq.PIPELINE_DESCRIPTION
+        )
+        assert step["channels"] == [0, 1]
+
+
 def test_audio_eq_bypass_and_validation_are_safe() -> None:
     state = audio_eq.default_audio_state()
     state["bands"][2]["enabled"] = False
