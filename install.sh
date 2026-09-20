@@ -803,7 +803,14 @@ uninstall_all() {
   done
   sudo rm -f "$SUDOERS_DIR/cdsp-automation" "$SUDOERS_DIR/cdsp-automation-receivers"
   if [[ -x "$SCRIPTS_DIR/build_camilladsp_iso226.sh" ]]; then
-    "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
+    # The receipt is the builder's only proof that it - and not the operator -
+    # installed /usr/local/bin/camilladsp, so it has to look where this
+    # deployment actually keeps it or it would find nothing and skip its work.
+    local iso_capability
+    iso_capability="$(get_env_value ISO226_CAPABILITY_PATH)"
+    : "${iso_capability:=$ISO226_CAPABILITY_DEFAULT}"
+    ISO226_CAPABILITY_PATH="$iso_capability" \
+      "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
   fi
   if [[ -x "$SCRIPTS_DIR/build_librespot_volume_sync.sh" ]]; then
     "$SCRIPTS_DIR/build_librespot_volume_sync.sh" --uninstall || true

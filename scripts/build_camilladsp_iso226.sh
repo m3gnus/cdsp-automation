@@ -7,14 +7,53 @@ UPSTREAM_COMMIT="05e9cfcdf43c0dfe078ed3feb8af4c8bd701fd74"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_FILE="${1:-$SCRIPT_DIR/../camilladsp-iso226/camilladsp-v4.1.3-iso226.patch}"
 BUILD_DIR="$(mktemp -d)"
-TARGET="/usr/local/bin/camilladsp"
-BACKUP="/usr/local/bin/camilladsp.pre-iso226"
-CAPABILITY="/var/lib/cdsp-automation/iso226-engine.json"
+TARGET="${CDSP_AUTOMATION_CAMILLADSP_TARGET:-/usr/local/bin/camilladsp}"
+BACKUP="${CDSP_AUTOMATION_CAMILLADSP_BACKUP:-$TARGET.pre-iso226}"
+CAPABILITY="${ISO226_CAPABILITY_PATH:-/var/lib/cdsp-automation/iso226-engine.json}"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 
+# The Pi only ever has sha256sum; the test-suite also runs on machines that
+# ship shasum instead, and both must agree with the digest in the receipt.
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
 if [[ "${1:-}" == "--uninstall" ]]; then
+  # $TARGET is the canonical CamillaDSP path, so it is far more likely to hold
+  # a stock binary the operator installed than one of ours.  The receipt is the
+  # only evidence that this helper ever wrote it, and "Uninstall All" invokes
+  # us on every install path - including ones that never built an engine.
+  if [[ ! -f "$CAPABILITY" ]]; then
+    echo "No ISO 226 install receipt at $CAPABILITY; leaving $TARGET untouched."
+    exit 0
+  fi
+  # A 64-hex match or nothing: a receipt we cannot read is a receipt we cannot
+  # act on, and falls through to the same "not ours" branch as a mismatch.
+  recorded_sha="$(sed -n 's/.*"binary_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$CAPABILITY")"
+  recorded_sha="${recorded_sha%%$'\n'*}"
+  # $TARGET is mode 0755 and world-readable, so this needs no sudo.
+  current_sha=""
+  if [[ -f "$TARGET" ]]; then
+    current_sha="$(sha256_of "$TARGET")"
+  fi
+  if [[ -z "$recorded_sha" || "$current_sha" != "$recorded_sha" ]]; then
+    # The binary changed hands after our install - a package upgrade, a manual
+    # replacement, a newer build.  Whatever is there now belongs to the
+    # operator; only our own bookkeeping is stale.
+    echo "$TARGET does not match the ISO 226 receipt; leaving it in place and removing the stale receipt." >&2
+    sudo rm -f "$CAPABILITY"
+    exit 0
+  fi
   if [[ -f "$BACKUP" ]]; then
     sudo install -m 0755 "$BACKUP" "$TARGET"
+    # The pre-install binary is live again, so the copy has served its purpose.
+    # Keeping it would let a later install/uninstall cycle roll back to a build
+    # that is by then two generations old.
+    sudo rm -f "$BACKUP"
   else
     sudo rm -f "$TARGET"
   fi
@@ -136,7 +175,7 @@ fi
 install_user="$(id -un)"
 sudo install -d -m 0750 -o "$install_user" -g "$install_user" /var/lib/cdsp-automation
 marker="$BUILD_DIR/iso226-engine.json"
-binary_sha256="$(sha256sum "$CANDIDATE" | awk '{print $1}')"
+binary_sha256="$(sha256_of "$CANDIDATE")"
 printf '{"engine":"Iso226","upstream_commit":"%s","binary_sha256":"%s","installed_at":%s}\n' "$UPSTREAM_COMMIT" "$binary_sha256" "$(date +%s)" > "$marker"
 sudo install -m 0644 "$marker" "$CAPABILITY"
 echo "Installed ISO 226-enabled CamillaDSP at /usr/local/bin/camilladsp"
