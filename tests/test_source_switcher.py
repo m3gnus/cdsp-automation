@@ -1551,5 +1551,491 @@ def test_failed_transition_status_leaves_the_controls_failing_closed(
     )
 
 
+# ---------------------------------------------------------------------------
+# Source arbitration
+#
+# The switcher used to treat hardware readiness as reason enough to select a
+# source again, and reset the silence timers on every switch.  Two ready but
+# silent inputs - the normal idle state of a rig whose TOSLINK and analog
+# readiness both come off the same MOTU meter socket - therefore alternated
+# forever, one full config reload plus a mute/restore per cycle.
+# ---------------------------------------------------------------------------
+
+
+def stream_source(ready: bool, playing: bool | None = None) -> switcher.SourceSnapshot:
+    """A source whose readiness only means 'the stream is open'."""
+    return switcher.SourceSnapshot(ready=ready, playing=playing)
+
+
+def meter_source(active: bool) -> switcher.SourceSnapshot:
+    """A meter source, whose readiness is itself a signal-presence measure."""
+    return switcher.SourceSnapshot(ready=active, playing=active)
+
+
+class ArbitrationRig:
+    """Replay wall-clock against arbitrate(), tracking selections.
+
+    ``playing`` names the source (if any) that would be heard once selected,
+    so a source's confirmed-playback state is only observable while it is the
+    selected one - exactly the constraint the real capture meters impose.
+    """
+
+    def __init__(
+        self,
+        ready: set[str],
+        *,
+        playing: str | None = None,
+        interval: float = 1.0,
+        start: float = 1000.0,
+    ) -> None:
+        self.ready = set(ready)
+        self.playing = playing
+        self.interval = interval
+        self.now = start
+        self.probes: dict[str, switcher.ProbeRecord] = {}
+        self.current: str | None = None
+        self.last_active: str | None = None
+        self.selections: list[tuple[float, str]] = []
+        self.manual: str | None = None
+
+    def snapshot(self) -> dict[str, switcher.SourceSnapshot]:
+        sources = {}
+        for name in switcher.SOURCE_PRIORITY:
+            ready = name in self.ready
+            if name == self.current:
+                playing = self.playing == name
+            else:
+                playing = None
+            sources[name] = stream_source(ready, playing)
+        return sources
+
+    def step(self) -> switcher.ArbitrationDecision:
+        decision = switcher.arbitrate(
+            now=self.now,
+            elapsed=self.interval,
+            current_source=self.current,
+            last_active=self.last_active,
+            manual_source=self.manual,
+            sources=self.snapshot(),
+            probes=self.probes,
+        )
+        self.probes = decision.probes
+        self.last_active = decision.last_active
+        if decision.source is not None and decision.source != self.current:
+            self.selections.append((self.now, decision.source))
+            self.current = decision.source
+        self.now += self.interval
+        return decision
+
+    def run(self, seconds: float) -> None:
+        for _ in range(int(seconds / self.interval)):
+            self.step()
+
+    def reloads_after(self, timestamp: float) -> list[tuple[float, str]]:
+        return [entry for entry in self.selections if entry[0] >= timestamp]
+
+
+def test_arbitration_probes_a_ready_source_then_records_it_as_silent() -> None:
+    """Readiness buys one probe; the silence it finds is remembered."""
+    rig = ArbitrationRig({"streamer"})
+    assert rig.step().source == "streamer"
+    assert rig.probes["streamer"].confirmed is False
+
+    # Listened to for the probe window, then written off with a backoff.
+    rig.run(switcher.PROBE_SILENCE_TIMEOUT)
+    record = rig.probes["streamer"]
+    assert record.backoff_level == 1
+    assert record.backoff_until > rig.now
+    assert rig.selections == [(1000.0, "streamer")]
+
+
+def test_ready_but_silent_source_is_not_requalified_by_readiness_alone() -> None:
+    """The headline bug: hardware readiness must not re-arm a silent source."""
+    rig = ArbitrationRig({"streamer", "gadget"})
+    rig.run(switcher.PROBE_SILENCE_TIMEOUT + 1)
+    assert [name for _, name in rig.selections] == ["streamer", "gadget"]
+
+    # Both are still ready, and both have now been heard out.  Nothing may be
+    # selected again until a backoff expires.
+    rig.run(switcher.PROBE_SILENCE_TIMEOUT + 1)
+    decision = rig.step()
+    assert decision.source is None
+    assert decision.reason == "no source qualified"
+    assert [name for _, name in rig.selections] == ["streamer", "gadget"]
+
+
+def test_two_ready_but_silent_sources_settle_instead_of_alternating() -> None:
+    """Ten simulated minutes with two ready, silent inputs.
+
+    Before the fix this alternated once per SOURCE_IDLE_TIMEOUT forever - ten
+    reloads plus ten mute/restore cycles over this window, and sixty an hour
+    after that.  The bound below is absolute, not 'fewer than before', and the
+    quiet tail is what 'settles' means.
+    """
+    rig = ArbitrationRig({"streamer", "gadget"})
+    rig.run(600.0)
+
+    assert len(rig.selections) <= 8, rig.selections
+    # The cadence decays: nothing at all in the last three minutes.
+    assert rig.reloads_after(rig.now - 180.0) == []
+    # And it really did try both, rather than settling by going deaf to one.
+    assert {name for _, name in rig.selections} == {"streamer", "gadget"}
+
+
+def test_silent_probe_backoff_keeps_decaying_over_an_hour() -> None:
+    """The bound holds on the long horizon, well under the old 60/hour."""
+    rig = ArbitrationRig({"streamer", "gadget"})
+    rig.run(3600.0)
+    assert len(rig.selections) <= 16, rig.selections
+    first_half = [entry for entry in rig.selections if entry[0] < 1000.0 + 1800.0]
+    second_half = rig.reloads_after(1000.0 + 1800.0)
+    assert len(second_half) < len(first_half)
+
+
+def test_a_source_that_starts_playing_after_a_silent_probe_is_picked_up() -> None:
+    """The backoff must rate-limit probing without making the rig deaf."""
+    rig = ArbitrationRig({"streamer", "gadget"})
+    rig.run(120.0)
+    assert rig.current == "gadget"
+    silent_selections = list(rig.selections)
+
+    # Music starts on the streamer while the gadget holds the config.  Nothing
+    # can see it from here: capture levels describe the selected source only,
+    # so the next probe is what finds it.
+    rig.playing = "streamer"
+    rig.run(switcher.PROBE_BACKOFF_MAX + switcher.PROBE_SILENCE_TIMEOUT + 2)
+    assert rig.current == "streamer"
+    assert len(rig.selections) > len(silent_selections)
+
+    # Once confirmed it is held, and its silent history is forgotten.
+    before = list(rig.selections)
+    rig.run(600.0)
+    assert rig.selections == before
+    assert rig.probes["streamer"].backoff_level == 0
+    assert rig.probes["streamer"].confirmed is True
+
+
+def test_a_source_that_becomes_ready_again_is_probed_without_waiting() -> None:
+    """A genuinely new session is not the one we gave up on."""
+    rig = ArbitrationRig({"streamer"})
+    rig.run(switcher.PROBE_SILENCE_TIMEOUT + 2)
+    assert rig.probes["streamer"].backoff_level == 1
+    assert rig.step().source is None
+
+    # The AirPlay session ends and a new one opens a moment later.
+    rig.ready = set()
+    rig.run(switcher.PROBE_SILENCE_TIMEOUT + 1)
+    rig.ready = {"streamer"}
+    rig.playing = "streamer"
+    assert rig.step().source == "streamer"
+
+
+def test_flapping_readiness_does_not_forgive_the_probe_backoff() -> None:
+    """A one-pass readiness blip is not a new session."""
+    probes = {
+        "streamer": switcher.ProbeRecord(
+            was_ready=True, backoff_level=1, backoff_until=2000.0
+        )
+    }
+    now = 1000.0
+
+    def pass_with(streamer_ready: bool) -> switcher.ArbitrationDecision:
+        nonlocal probes, now
+        decision = switcher.arbitrate(
+            now=now,
+            elapsed=1.0,
+            current_source="gadget",
+            last_active=None,
+            sources={
+                "streamer": stream_source(streamer_ready),
+                "gadget": stream_source(True, playing=False),
+            },
+            probes=probes,
+        )
+        probes = decision.probes
+        now += 1.0
+        return decision
+
+    for step in range(40):
+        assert pass_with(step % 2 == 0).source != "streamer", now
+    assert probes["streamer"].backoff_until == 2000.0
+
+    # Really gone for longer than a probe window, then back: a new session,
+    # and the switcher owes it a look straight away.
+    for _ in range(int(switcher.PROBE_SILENCE_TIMEOUT) + 1):
+        pass_with(False)
+    assert pass_with(True).source == "streamer"
+
+
+def test_genuinely_playing_source_wins_immediately_over_a_backed_off_one() -> None:
+    """Confirmed audio is never rate-limited."""
+    probes = {
+        "streamer": switcher.ProbeRecord(
+            was_ready=True, backoff_level=3, backoff_until=5000.0
+        )
+    }
+    decision = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source=None,
+        sources={
+            "streamer": stream_source(True),
+            "gadget": stream_source(False),
+            "toslink": meter_source(True),
+            "analog": meter_source(False),
+        },
+        probes=probes,
+    )
+    # Streamer outranks TOSLINK but has been written off; TOSLINK's meter is
+    # direct evidence of signal, so it is taken at once.
+    assert decision.source == "toslink"
+    assert decision.reason == "confirmed playing"
+    assert decision.probes["toslink"].backoff_until == 0.0
+
+
+def test_playing_current_source_is_not_preempted_by_a_higher_priority_one() -> None:
+    decision = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source="toslink",
+        last_active="toslink",
+        sources={
+            "streamer": stream_source(True),
+            "gadget": stream_source(False),
+            "toslink": meter_source(True),
+            "analog": meter_source(False),
+        },
+        probes={},
+    )
+    assert decision.source == "toslink"
+    assert decision.reason == "current source playing"
+
+
+def test_confirmed_playback_gets_the_track_gap_grace_not_the_probe_window() -> None:
+    """IDLE_TIMEOUT keeps its meaning; the probe window is a new, shorter one."""
+    playing = switcher.ProbeRecord(was_ready=True, confirmed=True)
+    probing = switcher.ProbeRecord(was_ready=True, confirmed=False)
+    silent = {
+        "streamer": stream_source(True, playing=False),
+        "gadget": stream_source(True),
+    }
+
+    def hold_for(record: switcher.ProbeRecord) -> float:
+        probes = {"streamer": record, "gadget": switcher.ProbeRecord(was_ready=True)}
+        now = 1000.0
+        while True:
+            decision = switcher.arbitrate(
+                now=now,
+                elapsed=1.0,
+                current_source="streamer",
+                last_active="streamer",
+                sources=silent,
+                probes=probes,
+            )
+            probes = decision.probes
+            if decision.source != "streamer":
+                return now - 1000.0
+            now += 1.0
+
+    assert hold_for(probing) == switcher.PROBE_SILENCE_TIMEOUT - 1
+    assert hold_for(playing) == switcher.IDLE_TIMEOUT - 1
+
+
+def test_lower_priority_meter_source_cuts_a_silent_hold_short() -> None:
+    """SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT keeps working for a played source."""
+    probes = {
+        "streamer": switcher.ProbeRecord(was_ready=True, confirmed=True, silence=1.0)
+    }
+    decision = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source="streamer",
+        last_active="streamer",
+        sources={
+            "streamer": stream_source(True, playing=False),
+            "gadget": stream_source(False),
+            "toslink": meter_source(True),
+            "analog": meter_source(False),
+        },
+        probes=probes,
+        lower_priority_timeout=0.0,
+    )
+    assert decision.source == "toslink"
+
+    # Raise the timeout and the streamer keeps its grace instead.
+    held = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source="streamer",
+        last_active="streamer",
+        sources={
+            "streamer": stream_source(True, playing=False),
+            "gadget": stream_source(False),
+            "toslink": meter_source(True),
+            "analog": meter_source(False),
+        },
+        probes=probes,
+        lower_priority_timeout=30.0,
+    )
+    assert held.source == "streamer"
+
+
+def test_manual_override_overrides_a_backed_off_source() -> None:
+    """An operator can always reach a source the switcher has written off."""
+    probes = {
+        "gadget": switcher.ProbeRecord(
+            was_ready=True, backoff_level=4, backoff_until=9000.0
+        )
+    }
+    decision = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source="streamer",
+        last_active="streamer",
+        manual_source="gadget",
+        sources={
+            "streamer": stream_source(True, playing=True),
+            "gadget": stream_source(True),
+        },
+        probes=probes,
+    )
+    assert decision.source == "gadget"
+    assert decision.manual is True
+    assert decision.reason == "manual override"
+    assert decision.probes["gadget"].backoff_until == 0.0
+    assert decision.probes["gadget"].backoff_level == 0
+
+
+def test_no_qualifying_source_leaves_the_idle_decision_to_the_caller() -> None:
+    """Idle keep-last semantics: arbitration names no source, it does not idle."""
+    decision = switcher.arbitrate(
+        now=1000.0,
+        elapsed=1.0,
+        current_source="toslink",
+        last_active=None,
+        sources={
+            "streamer": stream_source(False),
+            "gadget": stream_source(False),
+            "toslink": meter_source(False),
+            "analog": meter_source(False),
+        },
+        probes={},
+    )
+    assert decision.source is None
+    assert decision.last_active is None
+
+
+def test_probe_backoff_delay_escalates_and_is_capped() -> None:
+    delays = [
+        switcher.probe_backoff_delay(level, base=30.0, factor=4.0, maximum=900.0)
+        for level in range(6)
+    ]
+    assert delays == [30.0, 120.0, 480.0, 900.0, 900.0, 900.0]
+    assert switcher.probe_backoff_delay(3, base=0.0) == 0.0
+
+
+class SwitcherLoopClock:
+    """A monotonic clock the switcher loop drives forward by sleeping."""
+
+    def __init__(self, budget: float, start: float = 1000.0) -> None:
+        self.now = start
+        self.deadline = start + budget
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+        if self.now >= self.deadline:
+            raise LoopStop
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return self.now
+
+
+def test_switcher_loop_stops_reloading_two_ready_but_silent_sources(
+    tmp_path: Path,
+) -> None:
+    """The same settling, end to end through main()'s own apply path."""
+    ready = tmp_path / "ready.json"
+    configs = {}
+    for name in ("streamer", "gadget"):
+        path = tmp_path / f"{name}.yml"
+        path.write_text("devices: {}\n")
+        configs[name] = str(path)
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+
+    config = FakeSwitcherConfig(
+        configs["streamer"],
+        description=speaker_profiles.engine_generation_marker(generation),
+    )
+    client = SimpleNamespace(
+        config=config,
+        volume=FakeSwitcherVolume(mute=False),
+        general=SimpleNamespace(reload=lambda: None, state=lambda: "running"),
+        # Everything is silent, always.
+        levels=SimpleNamespace(capture_rms=lambda: [-120.0, -120.0]),
+        is_connected=lambda: True,
+        connect=lambda: None,
+    )
+    applied: list[str] = []
+    clock = SwitcherLoopClock(budget=600.0)
+
+    def fake_apply(_cdsp, path, **_kwargs) -> None:
+        applied.append(Path(path).stem)
+        config.path = path
+        config.applied_path = path
+        # A real apply verifies the graph and re-publishes readiness; without
+        # that the loop would re-apply the same config forever and never reach
+        # arbitration at all.
+        speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+
+    def identity(current: str | None) -> tuple[str, str] | None:
+        if not current:
+            return None
+        return Path(current).stem, switcher.DEFAULT_SPEAKER_ID
+
+    with (
+        patch.object(switcher, "CamillaClient", lambda *_args: client),
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.object(switcher, "TOSLINK_MOTU_METERS", False),
+        patch.object(switcher, "ANALOG_MOTU_METERS", False),
+        patch.dict(switcher.CONFIGS, configs, clear=True),
+        patch.object(switcher, "validate_configs"),
+        patch.object(switcher, "require_selected_profile_available"),
+        patch.object(switcher, "ensure_current_speaker_audio_eq"),
+        patch.object(switcher, "read_manual_source", return_value=None),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(switcher, "managed_config_identity", side_effect=identity),
+        # Both inputs are wired up and both are dead quiet.
+        patch.object(switcher, "is_alsa_active", return_value=True),
+        patch.object(switcher, "is_gadget_available", return_value=True),
+        patch.object(
+            switcher,
+            "resolve_config_target",
+            side_effect=lambda source, *_a, **_k: {"path": configs[source]},
+        ),
+        patch.object(switcher, "apply_config", side_effect=fake_apply),
+        patch.object(switcher, "time", clock),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        try:
+            switcher.main()
+        except LoopStop:
+            pass
+
+    # Ten simulated minutes.  The old loop reloaded once per SOURCE_IDLE_TIMEOUT
+    # for as long as both stayed ready; this one runs out of reasons.
+    assert len(applied) <= 8, applied
+    assert set(applied) == {"streamer", "gadget"}
+
+
 if __name__ == "__main__":
     unittest.main()
