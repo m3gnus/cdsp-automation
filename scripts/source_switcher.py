@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 try:
@@ -65,9 +66,37 @@ def env_bool(name: str, default: bool = False) -> bool:
 CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 CHECK_INTERVAL = float(os.environ.get("SOURCE_CHECK_INTERVAL", "1.0"))
+# How long a source whose playback has been *confirmed* is held through
+# silence before the switcher looks elsewhere.  This is the track-gap grace
+# period and its meaning is unchanged.
 IDLE_TIMEOUT = float(os.environ.get("SOURCE_IDLE_TIMEOUT", "60"))
+# How far into that grace period a lower-priority source with confirmed audio
+# may cut the hold short.  Meaning unchanged.
 LOWER_PRIORITY_ACTIVE_TIMEOUT = float(
     os.environ.get("SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT", "0")
+)
+# How long an *unconfirmed* source is listened to after the switcher probes it
+# by selecting it.  Hardware readiness (an open ALSA Loopback stream, a USB
+# gadget with a non-zero capture rate, a meter above its floor) says a stream
+# exists, not that anything is playing through it, and the only way to find
+# out is to select the source and read the capture levels.  A probe that hears
+# nothing must give up quickly - IDLE_TIMEOUT is the wrong yardstick here,
+# because nothing was ever playing to leave a gap in.
+PROBE_SILENCE_TIMEOUT = float(os.environ.get("SOURCE_PROBE_SILENCE_TIMEOUT", "5"))
+# A source probed and found silent is not re-probed until this backoff expires,
+# growing by PROBE_BACKOFF_FACTOR per consecutive silent probe up to
+# PROBE_BACKOFF_MAX.  Without it, hardware readiness alone makes a silent
+# source eligible again on the very next pass, and two ready-but-silent inputs
+# alternate forever - one config reload plus a mute/restore per cycle.
+PROBE_BACKOFF_SECONDS = max(
+    float(os.environ.get("SOURCE_PROBE_BACKOFF_SECONDS", "30")), 0.0
+)
+PROBE_BACKOFF_FACTOR = max(
+    float(os.environ.get("SOURCE_PROBE_BACKOFF_FACTOR", "4")), 1.0
+)
+PROBE_BACKOFF_MAX = max(
+    float(os.environ.get("SOURCE_PROBE_BACKOFF_MAX", "900")),
+    PROBE_BACKOFF_SECONDS,
 )
 SETTLE_TIME = float(os.environ.get("SOURCE_SETTLE_TIME", "2.0"))
 # SetConfig/Reload acknowledge that a change was queued, not that the
@@ -1285,9 +1314,275 @@ def apply_config(
             audio_guard.__exit__(None, None, None)
 
 
-def log_idle(source: str, seconds: float) -> None:
+def log_idle(source: str, seconds: float, limit: float = IDLE_TIMEOUT) -> None:
     if DEBUG_MODE and int(seconds) > 0 and int(seconds) % 5 == 0:
-        print(f"-> {source}: idle {seconds:g}/{IDLE_TIMEOUT:g}s", flush=True)
+        print(f"-> {source}: idle {seconds:g}/{limit:g}s", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Source arbitration
+#
+# Three states, not two.  Readiness and playback are different facts and the
+# switcher used to conflate them:
+#
+#   ready    - the input exists: an ALSA Loopback PCM is RUNNING, the USB
+#              gadget reports a capture rate, a MOTU meter pair is above its
+#              floor.  An AirPlay session that is connected and paused is
+#              ready.  So is a console left switched on.
+#   playing  - capture levels confirm audio is actually flowing.  For the
+#              streamer and the gadget this is only observable while that
+#              source is the selected one, so off-source it is *unknown*
+#              (None), not False.
+#   silent   - the source was selected, listened to, and heard nothing.  This
+#              is a durable fact about a probe, and it is the state the old
+#              code had no room for: it reset the silence timer on every
+#              switch and then re-selected the source purely because the
+#              hardware was still ready.
+# ---------------------------------------------------------------------------
+
+SOURCE_PRIORITY = ("streamer", "gadget", "toslink", "analog")
+
+
+@dataclass(frozen=True)
+class SourceSnapshot:
+    """What a single pass of the loop can observe about one source.
+
+    ``playing`` is deliberately tri-state: ``None`` means "cannot be known
+    without selecting this source", which is exactly the case that needs a
+    rate-limited probe rather than an immediate switch.
+    """
+
+    ready: bool = False
+    playing: bool | None = None
+
+
+@dataclass(frozen=True)
+class ProbeRecord:
+    """Persistent memory of what selecting a source actually produced."""
+
+    #: Seconds of continuous silence while this source was selected.
+    silence: float = 0.0
+    #: Audio was confirmed at least once since this source was selected, so
+    #: its silence is a track gap (IDLE_TIMEOUT) rather than a failed probe.
+    confirmed: bool = False
+    #: Readiness on the previous pass, for rising-edge detection.
+    was_ready: bool = False
+    #: Seconds the source has been continuously not ready.
+    unready_for: float = 0.0
+    #: Consecutive silent probes; drives the backoff delay.
+    backoff_level: int = 0
+    #: Monotonic deadline before which this source must not be re-probed.
+    backoff_until: float = 0.0
+
+
+@dataclass(frozen=True)
+class ArbitrationDecision:
+    """The source the switcher should be on, and why."""
+
+    #: Source to select, or ``None`` for the idle path (keep-last / idle mode).
+    source: str | None
+    reason: str
+    probes: dict[str, ProbeRecord]
+    last_active: str | None = None
+    #: The decision came from a manual override, whose config failures are
+    #: reported to the operator rather than raised.
+    manual: bool = False
+
+
+def probe_backoff_delay(
+    level: int,
+    *,
+    base: float = PROBE_BACKOFF_SECONDS,
+    factor: float = PROBE_BACKOFF_FACTOR,
+    maximum: float = PROBE_BACKOFF_MAX,
+) -> float:
+    """Delay before the ``level``-th consecutive silent probe may repeat."""
+    if base <= 0:
+        return 0.0
+    return min(base * (factor ** max(level, 0)), maximum)
+
+
+def _selected(record: ProbeRecord) -> ProbeRecord:
+    """Reset the listening state of a source the switcher is about to select.
+
+    The backoff *level* survives, so a source that keeps disappointing keeps
+    escalating; the deadline does not, because the probe is starting now.
+    """
+    return replace(record, silence=0.0, confirmed=False, backoff_until=0.0)
+
+
+def _cleared(record: ProbeRecord) -> ProbeRecord:
+    """Forget a source's silent history: it has proved itself, or was forced."""
+    return replace(
+        record, silence=0.0, confirmed=True, backoff_level=0, backoff_until=0.0
+    )
+
+
+def arbitrate(
+    *,
+    now: float,
+    elapsed: float,
+    current_source: str | None,
+    last_active: str | None = None,
+    manual_source: str | None = None,
+    sources: dict[str, SourceSnapshot],
+    probes: dict[str, ProbeRecord] | None = None,
+    priority: tuple[str, ...] = SOURCE_PRIORITY,
+    idle_timeout: float = IDLE_TIMEOUT,
+    probe_silence_timeout: float = PROBE_SILENCE_TIMEOUT,
+    lower_priority_timeout: float = LOWER_PRIORITY_ACTIVE_TIMEOUT,
+    backoff_base: float = PROBE_BACKOFF_SECONDS,
+    backoff_factor: float = PROBE_BACKOFF_FACTOR,
+    backoff_max: float = PROBE_BACKOFF_MAX,
+    log: bool = False,
+) -> ArbitrationDecision:
+    """Decide which source to be on from one snapshot of observable state.
+
+    Pure: ``probes`` is never mutated, the updated memory is returned on the
+    decision.  ``now`` is a monotonic timestamp used only for backoff
+    deadlines; ``elapsed`` is the wall time this pass covers and is what the
+    silence counters accumulate, so a slow pass is not mistaken for silence
+    that never happened.
+    """
+    records = dict(probes or {})
+    for name in sources:
+        records.setdefault(name, ProbeRecord())
+
+    # A source that just came back after really being gone is a new session,
+    # not the one we already gave up on: forgive its backoff.  The
+    # not-ready dwell requirement keeps flapping hardware from doing the same.
+    for name, state in sources.items():
+        record = records[name]
+        if state.ready:
+            if not record.was_ready and record.unready_for >= probe_silence_timeout:
+                record = replace(record, backoff_level=0, backoff_until=0.0)
+            record = replace(record, was_ready=True, unready_for=0.0)
+        else:
+            record = replace(
+                record, was_ready=False, unready_for=record.unready_for + elapsed
+            )
+        records[name] = record
+
+    # Priority 0: a manual override wins outright and clears any backoff, so
+    # an operator can always reach a source the switcher has written off.
+    if manual_source:
+        records[manual_source] = _cleared(
+            records.get(manual_source, ProbeRecord())
+        )
+        return ArbitrationDecision(
+            source=manual_source,
+            reason="manual override",
+            probes=records,
+            last_active=f"manual:{manual_source}",
+            manual=True,
+        )
+
+    def rank(name: str | None) -> int:
+        return priority.index(name) if name in priority else len(priority)
+
+    def lower_priority_playing(name: str | None) -> bool:
+        threshold = rank(name)
+        return any(
+            sources[other].playing is True
+            for other in priority[threshold + 1 :]
+            if other in sources
+        )
+
+    # Priority 1: keep the current source while it still deserves it.  An
+    # actually-playing source is never pre-empted by a higher-priority one.
+    current = sources.get(current_source) if current_source else None
+    if current_source and current is not None:
+        record = records[current_source]
+        if current.playing:
+            records[current_source] = _cleared(record)
+            return ArbitrationDecision(
+                source=current_source,
+                reason="current source playing",
+                probes=records,
+                last_active=current_source,
+            )
+        # Silent.  The grace that follows a source whose hardware went away is
+        # only extended to the source that was last actually selected.  A
+        # source already written off keeps its config loaded when nothing else
+        # qualifies (idle keep-last); listening to it again before its backoff
+        # expires would re-run the give-up every probe window and escalate the
+        # backoff without a single new observation.
+        if now < record.backoff_until:
+            last_active = None
+        elif current.ready or last_active == current_source:
+            record = replace(record, silence=record.silence + elapsed)
+            records[current_source] = record
+            # This is the distinction the old code was missing: a source that
+            # had confirmed audio gets the full track-gap grace, a source that
+            # only ever proved ready gets the much shorter probe window.
+            limit = idle_timeout if record.confirmed else probe_silence_timeout
+            if log:
+                label = current_source.capitalize()
+                log_idle(
+                    label if current.ready else f"{label} grace", record.silence, limit
+                )
+            if record.silence < limit and (
+                not lower_priority_playing(current_source)
+                or record.silence < lower_priority_timeout
+            ):
+                return ArbitrationDecision(
+                    source=current_source,
+                    reason="current source silent, within grace",
+                    probes=records,
+                    last_active=current_source if current.ready else last_active,
+                )
+            # Probed and found silent.  Remember that, and back off.
+            delay = probe_backoff_delay(
+                record.backoff_level,
+                base=backoff_base,
+                factor=backoff_factor,
+                maximum=backoff_max,
+            )
+            records[current_source] = replace(
+                record,
+                silence=0.0,
+                confirmed=False,
+                backoff_level=record.backoff_level + 1,
+                backoff_until=now + delay,
+            )
+            if log and DEBUG_MODE:
+                print(
+                    f"{current_source.capitalize()} silent - not re-probing for "
+                    f"{delay:g}s",
+                    flush=True,
+                )
+        last_active = None
+
+    # Priority 2..n: walk the priority order for something better.
+    for name in priority:
+        state = sources.get(name)
+        if state is None or not state.ready or name == current_source:
+            continue
+        if state.playing:
+            # Confirmed audio is never rate-limited.
+            records[name] = _cleared(records[name])
+            return ArbitrationDecision(
+                source=name,
+                reason="confirmed playing",
+                probes=records,
+                last_active=name,
+            )
+        if state.playing is False:
+            # Observed and heard nothing; readiness alone does not requalify it.
+            continue
+        if now < records[name].backoff_until:
+            continue
+        records[name] = _selected(records[name])
+        return ArbitrationDecision(
+            source=name,
+            reason="probing a ready source",
+            probes=records,
+            last_active=name,
+        )
+
+    return ArbitrationDecision(
+        source=None, reason="no source qualified", probes=records, last_active=None
+    )
 
 
 def mute_for_startup_validation(cdsp: CamillaClient) -> bool:
@@ -1331,8 +1626,7 @@ def main() -> int:
         if TOSLINK_MOTU_METERS or ANALOG_MOTU_METERS
         else None
     )
-    streamer_silence_timer = 0.0
-    gadget_silence_timer = 0.0
+    probes: dict[str, ProbeRecord] = {}
     toslink_active_timer = 0.0
     toslink_idle_timer = TOSLINK_IDLE_SECONDS
     analog_active_timer = 0.0
@@ -1530,40 +1824,11 @@ def main() -> int:
                     print(f"Audio EQ ensure failed: {exc}", flush=True)
 
             manual_source = read_manual_source()
-            if manual_source:
-                if manual_source not in CONFIGS:
-                    error = f"Unknown manual source override: {manual_source}"
-                    if error != last_manual_error:
-                        print(error, flush=True)
-                        last_manual_error = error
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                try:
-                    target = resolve_config_target(
-                        manual_source,
-                        selected_speaker,
-                        selection_revision=selection["revision"],
-                    )
-                except Exception as exc:
-                    error = f"Manual source/speaker config unavailable: {exc}"
-                    if error != last_manual_error:
-                        print(error, flush=True)
-                        last_manual_error = error
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-
-                last_manual_error = None
-                if not same_config(current_config, target["path"]):
-                    startup_restore_mute = apply_arbitrated_config(
-                        cdsp, target, startup_restore_mute
-                    )
-                    streamer_silence_timer = 0.0
-                    gadget_silence_timer = 0.0
-                    toslink_active_timer = 0.0
-                    toslink_idle_timer = TOSLINK_IDLE_SECONDS
-                    analog_active_timer = 0.0
-                    analog_idle_timer = ANALOG_IDLE_SECONDS
-                    last_active_source = f"manual:{manual_source}"
+            if manual_source and manual_source not in CONFIGS:
+                error = f"Unknown manual source override: {manual_source}"
+                if error != last_manual_error:
+                    print(error, flush=True)
+                    last_manual_error = error
                 time.sleep(CHECK_INTERVAL)
                 continue
 
@@ -1619,275 +1884,141 @@ def main() -> int:
             gadget_hw_available = (
                 "gadget" in supported_sources and is_gadget_available()
             )
+
+            # Capture levels belong to whichever config is loaded, so a single
+            # read per pass is all the confirmed-playback evidence there is -
+            # and it says nothing at all about the sources that are not
+            # selected.  A manual override is decided before any of it is
+            # consulted, so do not spend the round-trip in that case.
+            observing = None if manual_source else current_source
+            level_probe: list[bool] = []
+
+            def selected_source_playing() -> bool:
+                if not level_probe:
+                    level_probe.append(audio_active(cdsp.levels.capture_rms()))
+                return level_probe[0]
+
+            def stream_snapshot(name: str, ready: bool) -> SourceSnapshot:
+                """A source whose readiness is only 'the stream is open'."""
+                return SourceSnapshot(
+                    ready=ready,
+                    playing=selected_source_playing() if observing == name else None,
+                )
+
+            def meter_snapshot(name: str, available: bool) -> SourceSnapshot:
+                """A meter source: readiness *is* a signal-presence measure."""
+                active = available or (
+                    observing == name and selected_source_playing()
+                )
+                return SourceSnapshot(ready=active, playing=active)
+
+            snapshot = {
+                "streamer": stream_snapshot("streamer", streamer_hw_active),
+                "gadget": stream_snapshot("gadget", gadget_hw_available),
+                "toslink": meter_snapshot("toslink", toslink_available),
+                "analog": meter_snapshot("analog", analog_available),
+            }
+
             if DEBUG_MODE:
+                probe_debug = " ".join(
+                    f"{name}={record.silence:g}s/L{record.backoff_level}"
+                    for name, record in sorted(probes.items())
+                )
                 print(
                     "DEBUG: "
                     f"Streamer HW={streamer_hw_active}, "
                     f"Gadget HW={gadget_hw_available}, "
                     f"TOSLINK meter={toslink_meter_active}/{toslink_active_timer:g}/{toslink_idle_timer:g}, "
                     f"Analog meter={analog_meter_active}/{analog_active_timer:g}/{analog_idle_timer:g}, "
+                    f"Lower-priority meter={lower_priority_meter_available}, "
                     f"Last={last_active_source}, "
                     f"Current={current_source}, "
-                    f"ST={streamer_silence_timer:g}, "
-                    f"GT={gadget_silence_timer:g}, "
+                    f"Probes=[{probe_debug}], "
                     f"Config={os.path.basename(current_config or '')}",
                     flush=True,
                 )
 
-            # Keep the current source while it still has confirmed audio.
-            if current_source == "streamer" and streamer_hw_active:
-                last_active_source = "streamer"
-                if audio_active(cdsp.levels.capture_rms()):
-                    streamer_silence_timer = 0.0
-                    if DEBUG_MODE:
-                        print("-> Streamer: current source active", flush=True)
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+            decision = arbitrate(
+                now=time.monotonic(),
+                elapsed=CHECK_INTERVAL,
+                current_source=current_source,
+                last_active=last_active_source,
+                manual_source=manual_source,
+                sources=snapshot,
+                probes=probes,
+                log=True,
+            )
+            probes = decision.probes
+            last_active_source = decision.last_active
+
+            if decision.source is None:
+                # Nothing qualified.  Keep the last config unless the operator
+                # asked for the older always-fall-back-to-TOSLINK behaviour.
+                if SOURCE_IDLE_MODE == "toslink" and "toslink" in supported_sources:
+                    target = resolve_config_target(
+                        "toslink",
+                        selected_speaker,
+                        selection_revision=selection["revision"],
+                    )
                 else:
-                    streamer_silence_timer += CHECK_INTERVAL
-                    log_idle("Streamer", streamer_silence_timer)
-
-                if streamer_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Streamer silent while lower-priority meter source is active",
-                            flush=True,
-                        )
-
-                if DEBUG_MODE:
-                    print("Streamer idle timeout - checking other sources", flush=True)
-                last_active_source = None
-
-            elif current_source == "streamer" and last_active_source == "streamer":
-                streamer_silence_timer += CHECK_INTERVAL
-                log_idle("Streamer grace", streamer_silence_timer)
-                if streamer_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Streamer grace ended early for lower-priority meter source",
-                            flush=True,
-                        )
-                last_active_source = None
-
-            if current_source == "gadget" and gadget_hw_available:
-                last_active_source = "gadget"
-                if audio_active(cdsp.levels.capture_rms()):
-                    gadget_silence_timer = 0.0
-                    if DEBUG_MODE:
-                        print("-> Gadget: current source active", flush=True)
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                else:
-                    gadget_silence_timer += CHECK_INTERVAL
-                    log_idle("Gadget", gadget_silence_timer)
-
-                if gadget_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Gadget silent while lower-priority meter source is active",
-                            flush=True,
-                        )
-
-                if DEBUG_MODE:
-                    print("Gadget idle timeout - checking other sources", flush=True)
-                last_active_source = None
-
-            elif current_source == "gadget" and last_active_source == "gadget":
-                gadget_silence_timer += CHECK_INTERVAL
-                log_idle("Gadget grace", gadget_silence_timer)
-                if gadget_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Gadget grace ended early for lower-priority meter source",
-                            flush=True,
-                        )
-                last_active_source = None
-
-            if current_source == "toslink" and (
-                toslink_available or audio_active(cdsp.levels.capture_rms())
-            ):
-                last_active_source = "toslink"
-                if DEBUG_MODE:
-                    print("-> TOSLINK: current source active", flush=True)
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            if current_source == "analog" and (
-                analog_available or audio_active(cdsp.levels.capture_rms())
-            ):
-                last_active_source = "analog"
-                if DEBUG_MODE:
-                    print("-> Analog: current source active", flush=True)
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            # Priority 1: Streamer (AirPlay via ALSA Loopback), only when changing sources.
-            if current_source != "streamer" and streamer_hw_active:
-                last_active_source = "streamer"
-                target = resolve_config_target(
-                    "streamer", selected_speaker,
-                    selection_revision=selection["revision"],
-                )
-                if not same_config(current_config, target["path"]):
+                    target = None
+                if target is not None and not same_config(
+                    current_config, target["path"]
+                ):
                     startup_restore_mute = apply_arbitrated_config(
                         cdsp, target, startup_restore_mute
                     )
-                    streamer_silence_timer = 0.0
-                    gadget_silence_timer = 0.0
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-
-                if audio_active(cdsp.levels.capture_rms()):
-                    streamer_silence_timer = 0.0
-                    if DEBUG_MODE:
-                        print("-> Streamer: audio active", flush=True)
-                else:
-                    streamer_silence_timer += CHECK_INTERVAL
-                    log_idle("Streamer", streamer_silence_timer)
-
-                if streamer_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or streamer_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Streamer silent while lower-priority meter source is active",
-                            flush=True,
-                        )
-
-                if DEBUG_MODE:
-                    print("Streamer idle timeout - checking other sources", flush=True)
-                last_active_source = None
-
-            # Priority 2: USB Gadget, only when changing sources.
-            if current_source != "gadget" and gadget_hw_available:
-                last_active_source = "gadget"
-                target = resolve_config_target(
-                    "gadget", selected_speaker,
-                    selection_revision=selection["revision"],
-                )
-                if not same_config(current_config, target["path"]):
-                    startup_restore_mute = apply_arbitrated_config(
-                        cdsp, target, startup_restore_mute, settle_time=1.5
+                elif DEBUG_MODE:
+                    print(
+                        f"-> Idle: keeping {os.path.basename(current_config or '')}",
+                        flush=True,
                     )
-                    gadget_silence_timer = 0.0
-                    streamer_silence_timer = 0.0
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-
-                if audio_active(cdsp.levels.capture_rms()):
-                    gadget_silence_timer = 0.0
-                    if DEBUG_MODE:
-                        print("-> Gadget: audio active", flush=True)
-                else:
-                    gadget_silence_timer += CHECK_INTERVAL
-                    log_idle("Gadget", gadget_silence_timer)
-
-                if gadget_silence_timer < IDLE_TIMEOUT:
-                    if (
-                        not lower_priority_meter_available
-                        or gadget_silence_timer < LOWER_PRIORITY_ACTIVE_TIMEOUT
-                    ):
-                        time.sleep(CHECK_INTERVAL)
-                        continue
-                    if DEBUG_MODE:
-                        print(
-                            "Gadget silent while lower-priority meter source is active",
-                            flush=True,
-                        )
-
-                if DEBUG_MODE:
-                    print("Gadget idle timeout - checking other sources", flush=True)
-                last_active_source = None
-
-            # Priority 3: TOSLINK via MOTU input meters.
-            if current_source != "toslink" and toslink_available:
-                last_active_source = "toslink"
-                target = resolve_config_target(
-                    "toslink", selected_speaker,
-                    selection_revision=selection["revision"],
-                )
-                if not same_config(current_config, target["path"]):
-                    startup_restore_mute = apply_arbitrated_config(
-                        cdsp, target, startup_restore_mute
-                    )
-                    streamer_silence_timer = 0.0
-                    gadget_silence_timer = 0.0
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                if DEBUG_MODE:
-                    print("-> TOSLINK: meter active", flush=True)
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # Priority 4: Analog via MOTU input meters, disabled by default.
-            if current_source != "analog" and analog_available:
-                last_active_source = "analog"
-                target = resolve_config_target(
-                    "analog", selected_speaker,
-                    selection_revision=selection["revision"],
-                )
-                if not same_config(current_config, target["path"]):
-                    startup_restore_mute = apply_arbitrated_config(
-                        cdsp, target, startup_restore_mute
-                    )
-                    streamer_silence_timer = 0.0
-                    gadget_silence_timer = 0.0
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+            if decision.source == current_source and not decision.manual:
                 if DEBUG_MODE:
-                    print("-> Analog: meter active", flush=True)
+                    print(f"-> {decision.source}: {decision.reason}", flush=True)
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if SOURCE_IDLE_MODE == "toslink" and "toslink" in supported_sources:
+            try:
                 target = resolve_config_target(
-                    "toslink", selected_speaker,
+                    decision.source,
+                    selected_speaker,
                     selection_revision=selection["revision"],
                 )
-            else:
-                target = None
-            if target is not None and not same_config(
-                current_config, target["path"]
-            ):
+            except Exception as exc:
+                if not decision.manual:
+                    raise
+                # A manual override naming a config this speaker cannot serve
+                # is an operator mistake, not a fault: report it and keep going.
+                error = f"Manual source/speaker config unavailable: {exc}"
+                if error != last_manual_error:
+                    print(error, flush=True)
+                    last_manual_error = error
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            if decision.manual:
+                last_manual_error = None
+
+            if not same_config(current_config, target["path"]):
                 startup_restore_mute = apply_arbitrated_config(
-                    cdsp, target, startup_restore_mute
+                    cdsp,
+                    target,
+                    startup_restore_mute,
+                    settle_time=1.5 if decision.source == "gadget" else SETTLE_TIME,
                 )
-                streamer_silence_timer = 0.0
-                gadget_silence_timer = 0.0
-                last_active_source = None
+                if decision.manual:
+                    # The meters describe an input the operator has taken out
+                    # of the running; do not carry their history forward.
+                    toslink_active_timer = 0.0
+                    toslink_idle_timer = TOSLINK_IDLE_SECONDS
+                    analog_active_timer = 0.0
+                    analog_idle_timer = ANALOG_IDLE_SECONDS
             elif DEBUG_MODE:
-                print(
-                    f"-> Idle: keeping {os.path.basename(current_config or '')}",
-                    flush=True,
-                )
+                print(f"-> {decision.source}: {decision.reason}", flush=True)
 
         except Exception as exc:
             # An unhandled fault leaves the engine unverified from here on:

@@ -422,14 +422,25 @@ The source name, not a sample-rate heuristic, controls clock ownership.
 2. Switches to that source's config
 3. Monitors actual audio playback via RMS levels
 4. Keeps the current source while it is still playing
-5. Waits 60 seconds of silence before abandoning a higher-priority hardware source unless another meter-confirmed source is already active
-6. Uses passive MOTU meter frames to detect TOSLINK activity
-7. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
+5. Waits 60 seconds of silence before abandoning a source whose playback it has *confirmed*, unless another meter-confirmed source is already active
+6. Remembers a source it selected and heard nothing from, and re-probes it on a growing backoff instead of every minute
+7. Uses passive MOTU meter frames to detect TOSLINK activity
+8. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
 
 If a lower-priority MOTU meter source is already active, the switcher uses
 `SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` to leave a silent higher-priority source
 faster than the normal track-gap timeout. The default is immediate handoff after
 the lower source has passed its own activity debounce.
+
+Hardware readiness only says a stream is open - a connected-but-paused AirPlay
+session or an idle console looks exactly like a playing one until the switcher
+selects it and reads the capture levels. A source selected this way is listened
+to for `SOURCE_PROBE_SILENCE_TIMEOUT` seconds; if it stays silent the switcher
+records that and will not select it again for `SOURCE_PROBE_BACKOFF_SECONDS`,
+growing by `SOURCE_PROBE_BACKOFF_FACTOR` per consecutive silent probe up to
+`SOURCE_PROBE_BACKOFF_MAX`. Confirmed audio, a manual override, and the source
+disappearing and coming back all clear the backoff immediately. Setting
+`SOURCE_PROBE_BACKOFF_SECONDS=0` disables the rate limit.
 
 ### Configuration
 
@@ -438,6 +449,10 @@ Edit `~/camilladsp/cdsp-automation.env`:
 ```text
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
+SOURCE_PROBE_SILENCE_TIMEOUT=5
+SOURCE_PROBE_BACKOFF_SECONDS=30
+SOURCE_PROBE_BACKOFF_FACTOR=4
+SOURCE_PROBE_BACKOFF_MAX=900
 SOURCE_AUDIO_THRESHOLD_DB=-80
 SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
 SOURCE_TOSLINK_MOTU_METERS=true
