@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -159,6 +160,144 @@ default_env
         self.assertIn(
             'if [[ ! "$INSTALL_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then', installer
         )
+
+    def test_default_env_publishes_the_control_ui_exposure_keys(self) -> None:
+        """0.0.0.0 stays the default so an upgrade cannot take the UI away."""
+        with tempfile.TemporaryDirectory() as directory:
+            command = f"""
+set -euo pipefail
+export HOME={directory!s}
+export CDSP_AUTOMATION_BASE_DIR={directory!s}/site
+source {INSTALLER!s}
+default_env
+"""
+            result = subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy(),
+            )
+            rendered = result.stdout.splitlines()
+            self.assertIn("INSTALLATION_UI_HOST=0.0.0.0", rendered)
+            self.assertIn("INSTALLATION_UI_PORT=8088", rendered)
+            # Empty means "unauthenticated", i.e. exactly the old behaviour.
+            self.assertIn("INSTALLATION_UI_TOKEN=", rendered)
+
+    def test_control_ui_bind_address_reads_the_env_and_falls_back_to_any(self) -> None:
+        """An env file written before these keys existed still yields 0.0.0.0."""
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory) / "site"
+            site.mkdir()
+            env_file = site / "cdsp-automation.env"
+            env_file.write_text("CDSP_HOST=127.0.0.1\n", encoding="utf-8")
+            command = f"""
+set -euo pipefail
+export HOME={directory!s}
+export CDSP_AUTOMATION_BASE_DIR={site!s}
+source {INSTALLER!s}
+echo "fallback=$(control_ui_bind_host):$(control_ui_bind_port)"
+printf 'INSTALLATION_UI_HOST=127.0.0.1\\nINSTALLATION_UI_PORT=9000\\n' >> {env_file!s}
+echo "configured=$(control_ui_bind_host):$(control_ui_bind_port)"
+"""
+            result = subprocess.run(
+                ["bash", "-c", command],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy(),
+            )
+            self.assertIn("fallback=0.0.0.0:8088", result.stdout)
+            self.assertIn("configured=127.0.0.1:9000", result.stdout)
+
+    def test_control_ui_unit_leaves_the_bind_address_to_the_env_file(self) -> None:
+        """An Environment= line would shadow the operator's INSTALLATION_UI_HOST."""
+        installer = INSTALLER.read_text(encoding="utf-8")
+        heredoc = installer.split("install_control_ui()", 1)[1].split(
+            "install_iso226_engine()", 1
+        )[0]
+        self.assertIn("EnvironmentFile=-$ENV_FILE", heredoc)
+        self.assertNotIn("Environment=INSTALLATION_UI_HOST=", heredoc)
+        self.assertNotIn("Environment=INSTALLATION_UI_PORT=", heredoc)
+        self.assertNotIn("Environment=INSTALLATION_UI_TOKEN=", heredoc)
+
+    # `read -p` prints nothing when stdin is a pipe, so the rendered prompts are
+    # captured by standing in for confirm_action and echoing what it was asked.
+    _GATE_HARNESS = """
+set -euo pipefail
+export HOME={home}
+export CDSP_AUTOMATION_BASE_DIR={site}
+source {installer}
+GATE_ANSWERS=({answers})
+GATE_ASKED=0
+confirm_action() {{
+  echo "ASK: $1"
+  local answer="${{GATE_ANSWERS[$GATE_ASKED]}}"
+  GATE_ASKED=$((GATE_ASKED + 1))
+  [[ "$answer" == y ]]
+}}
+if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; fi
+"""
+
+    def _run_control_ui_gate(
+        self, env_contents: str, answers: str
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
+        directory = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, directory, True)
+        site = Path(directory) / "site"
+        site.mkdir()
+        env_file = site / "cdsp-automation.env"
+        env_file.write_text(env_contents, encoding="utf-8")
+        command = self._GATE_HARNESS.format(
+            home=directory, site=str(site), installer=str(INSTALLER), answers=answers
+        )
+        result = subprocess.run(
+            ["bash", "-c", command],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result, env_file
+
+    def test_control_ui_gate_names_the_bind_address_and_offers_loopback(self) -> None:
+        """Menu option 12 states the exposure, and Yes to the first ask moves
+        the UI onto loopback before the install question is even put."""
+        result, env_file = self._run_control_ui_gate(
+            "INSTALLATION_UI_HOST=0.0.0.0\n", "y y"
+        )
+        self.assertIn("It will bind to 0.0.0.0:8088", result.stdout)
+        self.assertIn("has no authentication", result.stdout)
+        self.assertIn(
+            "ASK: Bind it to 127.0.0.1 instead (loopback only, reach it over an"
+            " SSH tunnel)?",
+            result.stdout,
+        )
+        self.assertIn(
+            "ASK: Install a root web server on 127.0.0.1:8088 (loopback only,"
+            " unauthenticated)?",
+            result.stdout,
+        )
+        self.assertIn("GATE=ACTED", result.stdout)
+        self.assertIn(
+            "INSTALLATION_UI_HOST=127.0.0.1",
+            env_file.read_text(encoding="utf-8").splitlines(),
+        )
+
+    def test_control_ui_gate_keeps_the_lan_default_when_loopback_is_declined(
+        self,
+    ) -> None:
+        """Declining both questions changes nothing about an existing install."""
+        contents = "INSTALLATION_UI_HOST=0.0.0.0\nINSTALLATION_UI_TOKEN=s3cret\n"
+        result, env_file = self._run_control_ui_gate(contents, "n n")
+        self.assertIn(
+            "ASK: Install a root web server on 0.0.0.0:8088 (every interface,"
+            " a shared secret is required)?",
+            result.stdout,
+        )
+        self.assertIn("GATE=CANCELLED", result.stdout)
+        self.assertEqual(contents, env_file.read_text(encoding="utf-8"))
 
     def test_state_storage_claims_the_three_shared_locks(self) -> None:
         """Lazy creation never chowns, so a fresh install claims these up front."""
@@ -877,6 +1016,29 @@ ensure_audio_state_storage
             )
             self.assertEqual(list(destination.glob("*.json")), [])
 
+    def test_docs_describe_the_control_ui_security_posture_the_code_has(self) -> None:
+        """The documented posture drifting from the code is how an operator
+        ends up believing a setting exists that does not."""
+        readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
+        technical = (REPOSITORY / "TECHNICAL.md").read_text(encoding="utf-8")
+        web_ui = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
+        for name in (
+            "INSTALLATION_UI_HOST",
+            "INSTALLATION_UI_PORT",
+            "INSTALLATION_UI_TOKEN",
+        ):
+            self.assertIn(name, readme, name)
+            self.assertIn(name, technical, name)
+            self.assertIn(name, web_ui, name)
+        # Still root, still the documented default exposure.
+        self.assertIn("runs as **root** by design", readme)
+        self.assertIn("0.0.0.0", readme)
+        # The always-on guards.
+        for phrase in ("Origin", "hmac.compare_digest"):
+            self.assertIn(phrase, technical, phrase)
+        # The split that was deliberately not attempted in this pass.
+        self.assertIn("narrowly scoped privileged", technical)
+
     def test_menu_lists_uninstall_at_eleven_and_the_ui_at_twelve(self) -> None:
         output = self._run("print_menu")
         self.assertIn("11) Uninstall All Utilities", output)
@@ -914,9 +1076,15 @@ ensure_audio_state_storage
             dispatch,
         )
         self.assertIn(
-            '12) if confirm_action "Install an unauthenticated root web server on 0.0.0.0:8088?"; then prepare_install; install_control_ui;',
+            "12) if confirm_control_ui_exposure; then prepare_install; install_control_ui;",
             dispatch,
         )
+        # The gate is still an explicit y/N, it just names the exposure first.
+        gate = installer.split("confirm_control_ui_exposure() {", 1)[1].split(
+            "\nprint_menu()", 1
+        )[0]
+        self.assertIn("confirm_action", gate)
+        self.assertIn("Install a root web server on ${ui_host}:${ui_port}", gate)
 
     def test_shairport_failure_explains_before_restoring_and_names_the_backup(
         self,

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import html
 import json
 import math
@@ -53,8 +54,41 @@ from speaker_profiles import (
 )
 
 
-HOST = os.environ.get("INSTALLATION_UI_HOST", "0.0.0.0")
-PORT = int(os.environ.get("INSTALLATION_UI_PORT", "8088"))
+# The historical bind address.  Kept as the fallback so an existing install
+# that has never heard of INSTALLATION_UI_HOST does not silently lose its UI
+# on upgrade; operators who want loopback-only set the env value to 127.0.0.1
+# (reachable over an SSH tunnel) and restart cdsp-control-ui.service.
+DEFAULT_UI_HOST = "0.0.0.0"
+DEFAULT_UI_PORT = 8088
+# Every state-changing request body is read only after Content-Length has been
+# checked against this, so a hostile or malformed request cannot make the
+# handler buffer an arbitrary amount of memory.  The largest legitimate body is
+# an EQ state document, which is a few kilobytes.
+MAX_REQUEST_BODY_BYTES = 262_144
+# A client that opens a socket and then stalls must not hold a handler thread
+# forever; socketserver applies this to the connection in setup().
+REQUEST_TIMEOUT_SECONDS = 20.0
+
+
+def ui_bind_host() -> str:
+    """The configured bind address, falling back to the historical 0.0.0.0."""
+    return os.environ.get("INSTALLATION_UI_HOST", "").strip() or DEFAULT_UI_HOST
+
+
+def ui_bind_port() -> int:
+    raw = os.environ.get("INSTALLATION_UI_PORT", "").strip()
+    if not raw:
+        return DEFAULT_UI_PORT
+    return int(raw)
+
+
+def configured_ui_token() -> str:
+    """The optional shared secret.  Empty means "behave exactly as before"."""
+    return os.environ.get("INSTALLATION_UI_TOKEN", "").strip()
+
+
+HOST = ui_bind_host()
+PORT = ui_bind_port()
 CDSP_ENV = Path(
     os.environ.get("CDSP_AUTOMATION_ENV", "/home/magnus/camilladsp/cdsp-automation.env")
 )
@@ -672,10 +706,41 @@ HTML = r"""<!doctype html>
       if (s.load === "not-found") return "not found";
       return s.active || "unknown";
     }
-    async function api(path, options = {}) {
-      const res = await fetch(path, { headers: { "Content-Type": "application/json" }, ...options });
+    /* The server only demands a token when INSTALLATION_UI_TOKEN is set.  The
+       page is handed one through #token=... (so it never lands in a URL the
+       server logs), keeps it in localStorage for later visits, and asks for it
+       once if a state change comes back 401. */
+    const TOKEN_KEY = "cdspControlToken";
+    let controlToken = "";
+    function storeToken(value) {
+      controlToken = value;
+      try { window.localStorage.setItem(TOKEN_KEY, value); } catch (e) { /* private mode */ }
+    }
+    (function loadToken() {
+      let fromHash = "";
+      try {
+        fromHash = (new URLSearchParams((location.hash || "").replace(/^#/, "")).get("token") || "").trim();
+      } catch (e) { fromHash = ""; }
+      if (fromHash) {
+        storeToken(fromHash);
+        history.replaceState(null, "", location.pathname + location.search);
+        return;
+      }
+      try { controlToken = window.localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { controlToken = ""; }
+    })();
+    async function api(path, options = {}, retried = false) {
+      const headers = Object.assign({ "Content-Type": "application/json" }, options.headers || {});
+      if (controlToken) headers["Authorization"] = `Bearer ${controlToken}`;
+      const res = await fetch(path, { ...options, headers });
       const text = await res.text();
       const data = text ? JSON.parse(text) : {};
+      if (res.status === 401 && !retried) {
+        const entered = (window.prompt("This control UI requires its shared secret (INSTALLATION_UI_TOKEN):") || "").trim();
+        if (entered) {
+          storeToken(entered);
+          return api(path, options, true);
+        }
+      }
       if (!res.ok) throw new Error(data.error || text || res.statusText);
       return data;
     }
@@ -2195,8 +2260,113 @@ def turn_amps_off() -> str:
     )
 
 
+class RequestRefused(Exception):
+    """A request rejected by a transport guard, with the status to report."""
+
+    def __init__(self, status: HTTPStatus, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+DEFAULT_SCHEME_PORTS = {"http": "80", "https": "443"}
+
+
+def normalize_authority(authority: str, scheme: str = "http") -> str:
+    """Lower-cased host[:port] with the scheme's default port dropped."""
+    authority = (authority or "").strip().lower()
+    if not authority:
+        return ""
+    host, _, port = authority.rpartition(":")
+    if not host or "]" in port or not port.isdigit():
+        # No port, or an unbracketed IPv6 literal: the whole value is the host.
+        host, port = authority, ""
+    if port and port == DEFAULT_SCHEME_PORTS.get(scheme.lower()):
+        port = ""
+    return f"{host}:{port}" if port else host
+
+
+def origin_is_same_site(origin: str, host_header: str) -> bool:
+    """True when Origin is absent or names this very server.
+
+    A browser attaches Origin to every cross-site POST, so a foreign value is
+    the confused-deputy case and is refused.  A missing Origin is a non-browser
+    client (curl, the installer's own checks) and stays allowed, which keeps
+    this guard free for existing scripted callers.
+    """
+    origin = (origin or "").strip()
+    if not origin:
+        return True
+    if origin.lower() == "null":
+        return False
+    parsed = urllib.parse.urlsplit(origin)
+    if parsed.scheme.lower() not in DEFAULT_SCHEME_PORTS or not parsed.netloc:
+        return False
+    if not (host_header or "").strip():
+        return False
+    return normalize_authority(parsed.netloc, parsed.scheme) == normalize_authority(
+        host_header, "http"
+    )
+
+
+def presented_token(headers: Any) -> str:
+    """The bearer token on a request, from Authorization or X-Control-Token."""
+    raw = (headers.get("Authorization") or "").strip()
+    if raw.lower().startswith("bearer "):
+        return raw[7:].strip()
+    return (headers.get("X-Control-Token") or "").strip()
+
+
+def authorize_state_change(headers: Any) -> None:
+    """Raise unless the request may change state.
+
+    Origin is checked unconditionally; the shared secret only when one is
+    configured, so an install that never sets INSTALLATION_UI_TOKEN behaves
+    exactly as it did before.
+    """
+    if not origin_is_same_site(headers.get("Origin"), headers.get("Host")):
+        raise RequestRefused(HTTPStatus.FORBIDDEN, "cross-origin request refused")
+    expected = configured_ui_token()
+    if not expected:
+        return
+    supplied = presented_token(headers)
+    # compare_digest, not ==: a plain comparison leaks the matching prefix
+    # length through its timing, which is enough to recover a secret.
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise RequestRefused(HTTPStatus.UNAUTHORIZED, "control token required")
+
+
+def request_body_length(headers: Any) -> int:
+    """Validate Content-Length before a single byte of the body is read."""
+    if (headers.get("Transfer-Encoding") or "").strip():
+        # Chunked bodies have no declared length, so they cannot be bounded
+        # up front; nothing in this UI sends one.
+        raise RequestRefused(
+            HTTPStatus.LENGTH_REQUIRED, "a declared Content-Length is required"
+        )
+    raw = headers.get("Content-Length")
+    if raw is None:
+        return 0
+    try:
+        length = int(str(raw).strip())
+    except ValueError:
+        raise RequestRefused(
+            HTTPStatus.BAD_REQUEST, "Content-Length is not a number"
+        ) from None
+    if length < 0:
+        raise RequestRefused(HTTPStatus.BAD_REQUEST, "Content-Length is negative")
+    if length > MAX_REQUEST_BODY_BYTES:
+        raise RequestRefused(
+            HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            f"request body exceeds {MAX_REQUEST_BODY_BYTES} bytes",
+        )
+    return length
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "InstallationControl/0.3"
+    # socketserver hands this to connection.settimeout(), so a client that
+    # opens a socket and never finishes its request cannot pin a thread.
+    timeout = REQUEST_TIMEOUT_SECONDS
 
     def send_json(self, payload: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(payload).encode("utf-8")
@@ -2206,11 +2376,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def refuse(self, refusal: RequestRefused) -> None:
+        """Answer a guard rejection without draining the unread body."""
+        # The body was never read, so this connection cannot be reused: the
+        # unread bytes would be parsed as the next request line.
+        self.close_connection = True
+        if refusal.status == HTTPStatus.UNAUTHORIZED:
+            body = json.dumps({"ok": False, "error": str(refusal)}).encode("utf-8")
+            self.send_response(refusal.status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("WWW-Authenticate", 'Bearer realm="control-ui"')
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        self.send_json({"ok": False, "error": str(refusal)}, refusal.status)
+
     def read_json(self) -> dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0"))
+        length = request_body_length(self.headers)
         if length <= 0:
             return {}
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        body = self.rfile.read(length)
+        if len(body) != length:
+            raise RequestRefused(HTTPStatus.BAD_REQUEST, "truncated request body")
+        return json.loads(body.decode("utf-8"))
 
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
@@ -2274,7 +2464,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            # Guarded before the body is touched: an unauthorized or oversized
+            # request is refused without buffering anything it sent.
+            authorize_state_change(self.headers)
             payload = self.read_json()
+        except RequestRefused as refusal:
+            self.refuse(refusal)
+            return
+        except Exception as exc:
+            self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/api/service":
                 service = payload.get("service")
@@ -2360,8 +2560,18 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> int:
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print(f"installation UI listening on http://{HOST}:{PORT}", flush=True)
+    host = ui_bind_host()
+    port = ui_bind_port()
+    server = ThreadingHTTPServer((host, port), Handler)
+    guard = (
+        "shared secret required"
+        if configured_ui_token()
+        else "no authentication (INSTALLATION_UI_TOKEN unset)"
+    )
+    print(
+        f"installation UI listening on http://{host}:{port} - {guard}",
+        flush=True,
+    )
     server.serve_forever()
     return 0
 
