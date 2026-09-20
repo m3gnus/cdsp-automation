@@ -187,7 +187,7 @@ def test_web_audio_save_holds_speaker_selection_lock_through_commit(
 def test_web_speaker_selection_mutes_and_removes_ready_token(tmp_path: Path) -> None:
     selection_path = tmp_path / "selection.json"
     ready_path = tmp_path / "ready.json"
-    speaker_profiles.clear_audio_inhibit(ready_path)
+    speaker_profiles.clear_audio_inhibit(ready_path, generation="c" * 32)
 
     class Volume:
         muted = False
@@ -250,7 +250,7 @@ def test_stale_web_speaker_selection_does_not_mute_or_remove_ready(
 ) -> None:
     selection_path = tmp_path / "selection.json"
     ready_path = tmp_path / "ready.json"
-    speaker_profiles.clear_audio_inhibit(ready_path)
+    speaker_profiles.clear_audio_inhibit(ready_path, generation="c" * 32)
     muted: list[bool] = []
 
     class Client:

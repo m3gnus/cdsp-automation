@@ -36,6 +36,21 @@ switcher = source_switcher
 
 
 class ConfigRecoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._runtime = tempfile.TemporaryDirectory()
+        runtime = Path(self._runtime.name)
+        self.ready_path = runtime / "ready.json"
+        patches = (
+            patch.object(source_switcher, "AUDIO_READY_PATH", self.ready_path),
+            patch.object(
+                source_switcher, "AUDIO_CONTROL_LOCK_PATH", runtime / "audio.lock"
+            ),
+        )
+        for guard in patches:
+            guard.start()
+            self.addCleanup(guard.stop)
+        self.addCleanup(self._runtime.cleanup)
+
     def client(self, state_name: str, active_config: object, path: str = "") -> mock.Mock:
         client = mock.Mock()
         client.general.state.return_value = types.SimpleNamespace(name=state_name)
@@ -62,6 +77,23 @@ class ConfigRecoveryTests(unittest.TestCase):
             client.config.active.assert_not_called()
             self.assertEqual(output.getvalue().count("CamillaDSP recovery:"), 1)
 
+    def test_recovery_reload_is_latched_muted_and_never_stays_ready(self) -> None:
+        """Recovery is an unverified config change, so it must inhibit first."""
+        speaker_profiles.clear_audio_inhibit(
+            self.ready_path, generation="a" * 32
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "streamer.yml")
+            config_path.touch()
+            client = self.client("INACTIVE", None, str(config_path))
+            recovery = source_switcher.ConfigRecoveryGuard()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertFalse(recovery.ready(client, 0.0))
+
+        client.volume.set_main_mute.assert_called_once_with(True)
+        self.assertFalse(self.ready_path.exists())
+
     def test_missing_active_config_recovers_even_when_state_says_paused(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory, "streamer.yml")
@@ -75,12 +107,17 @@ class ConfigRecoveryTests(unittest.TestCase):
             client.general.reload.assert_called_once_with()
 
     def test_healthy_paused_and_running_configs_are_never_reloaded(self) -> None:
+        speaker_profiles.clear_audio_inhibit(
+            self.ready_path, generation="b" * 32
+        )
         recovery = source_switcher.ConfigRecoveryGuard()
         for state_name in ("PAUSED", "RUNNING"):
             client = self.client(state_name, {"devices": {"samplerate": 48000}})
             self.assertTrue(recovery.ready(client, 0.0))
             client.general.reload.assert_not_called()
             client.config.file_path.assert_not_called()
+            client.volume.set_main_mute.assert_not_called()
+        self.assertTrue(self.ready_path.is_file())
 
     def test_invalid_remembered_path_is_not_reloaded(self) -> None:
         client = self.client("INACTIVE", None, "/does/not/exist.yml")
@@ -94,8 +131,14 @@ class ConfigRecoveryTests(unittest.TestCase):
 
 
 class FakeSwitcherConfig:
-    def __init__(self, path: str) -> None:
+    """A live CamillaDSP config, including the fields readiness is stamped in."""
+
+    def __init__(self, path: str, description: str | None = None) -> None:
         self.path = path
+        self.file_description = description
+        self.live: dict = {"devices": {}}
+        if description is not None:
+            self.live["description"] = description
 
     def file_path(self) -> str:
         return self.path
@@ -104,7 +147,23 @@ class FakeSwitcherConfig:
         self.path = path
 
     def active(self) -> dict:
-        return {"devices": {}}
+        return self.live
+
+    def set_active(self, value: dict) -> None:
+        self.live = value
+
+    def description(self) -> str | None:
+        return self.live.get("description")
+
+    def set_value(self, pointer: str, value: object) -> None:
+        assert pointer == "/description"
+        self.live["description"] = value
+
+    def restart_engine(self) -> None:
+        """Model a CamillaDSP restart: the live graph reverts to the file."""
+        self.live = {"devices": {}}
+        if self.file_description is not None:
+            self.live["description"] = self.file_description
 
 
 class FakeSwitcherVolume:
@@ -716,6 +775,223 @@ def test_apply_config_publishes_selection_revision(tmp_path: Path) -> None:
         switcher.apply_config(client, str(target_path), target=target)
     assert statuses[-1]["ok"] is True
     assert statuses[-1]["selection_revision"] == 7
+
+
+class LoopStop(BaseException):
+    """Leave the switcher's endless loop without tripping its error handler."""
+
+
+def run_switcher_iterations(client: object, sleeps: int) -> None:
+    """Drive source_switcher.main() for a bounded number of sleeps."""
+    remaining = [sleeps]
+
+    def sleep(_seconds: float) -> None:
+        remaining[0] -= 1
+        if remaining[0] <= 0:
+            raise LoopStop
+    with (
+        patch.object(switcher, "CamillaClient", lambda *_args: client),
+        patch.object(switcher, "TOSLINK_MOTU_METERS", False),
+        patch.object(switcher, "ANALOG_MOTU_METERS", False),
+        patch.object(switcher.time, "sleep", side_effect=sleep),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        try:
+            switcher.main()
+        except LoopStop:
+            pass
+
+
+def switcher_client(
+    config_path: str, *, connected: bool = False, description: str | None = None
+) -> SimpleNamespace:
+    config = FakeSwitcherConfig(config_path, description=description)
+    client = SimpleNamespace(
+        config=config,
+        volume=FakeSwitcherVolume(mute=False),
+        general=FakeSwitcherGeneral(["running"] * 64),
+        connected=connected,
+    )
+    client.is_connected = lambda: client.connected
+    def connect() -> None:
+        client.connected = True
+    client.connect = connect
+    return client
+
+
+def test_engine_restart_revokes_unmute_until_the_new_instance_is_verified(
+    tmp_path: Path,
+) -> None:
+    """The switcher, UI and remote all keep running; only CamillaDSP restarts."""
+    ready = tmp_path / "ready.json"
+    previous = tmp_path / "streamer.yml"
+    target_path = tmp_path / "streamer--partymeh.yml"
+    previous.write_text("devices: {}\n")
+    target_path.write_text("devices: {}\n")
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(
+            str(previous), description="Generated source=streamer speaker=partymeh"
+        ),
+        volume=FakeSwitcherVolume(mute=False),
+        general=FakeSwitcherGeneral(["running", "running"]),
+    )
+    target = {
+        "speaker": "partymeh",
+        "source": "streamer",
+        "digest": switcher.config_digest({"devices": {}}),
+        "max_volume_db": 0.0,
+        "selection_revision": 4,
+    }
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "SPEAKER_TRANSITION_PATH", tmp_path / "transition.json"),
+        patch.object(switcher, "SPEAKER_GENERATED_DIR", tmp_path / "generated"),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "speaker_selection_lock", return_value=nullcontext()),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": "partymeh", "revision": 4},
+        ),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher, "_write_speaker_status"),
+        patch.object(switcher.time, "sleep"),
+    ):
+        switcher.rotate_engine_generation()
+        switcher.apply_config(client, str(target_path), target=target)
+
+        # A verified transition authorizes every control.
+        speaker_profiles.require_audio_unmute_allowed(ready, client)
+        first_token = json.loads(ready.read_text())
+        assert first_token["version"] == speaker_profiles.AUDIO_READY_VERSION
+        assert first_token["speaker"] == "partymeh"
+        assert first_token["selection_revision"] == 4
+        assert first_token["config_digest"] == target["digest"]
+
+        # CamillaDSP restarts underneath everyone.  /run is tmpfs but the boot
+        # did not change, so the token file is still sitting there.
+        client.config.restart_engine()
+        assert ready.is_file()
+        for consumer in ("remote", "web UI", "AirPlay bridge"):
+            try:
+                speaker_profiles.require_audio_unmute_allowed(ready, client)
+            except RuntimeError as exc:
+                assert "inhibited" in str(exc)
+            else:
+                raise AssertionError(f"{consumer} unmuted a restarted engine")
+        assert switcher.audio_inhibit_active(
+            ready, client, generation=switcher.engine_generation()
+        )
+
+        # Only a fresh verified transition restores it, under a new generation.
+        second_generation = switcher.rotate_engine_generation()
+        switcher.apply_config(client, str(target_path), target=target)
+        speaker_profiles.require_audio_unmute_allowed(ready, client)
+        second_token = json.loads(ready.read_text())
+        assert second_token["engine_generation"] == second_generation
+        assert second_token["engine_generation"] != first_token["engine_generation"]
+
+        # The previous instance's token is worthless against the new engine.
+        audio_eq.atomic_write_json(ready, first_token)
+        try:
+            speaker_profiles.require_audio_unmute_allowed(ready, client)
+        except RuntimeError as exc:
+            assert "inhibited" in str(exc)
+        else:
+            raise AssertionError("a previous engine instance's token authorized unmute")
+
+
+def test_reconnect_drops_a_token_minted_for_the_previous_connection(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    config_path = tmp_path / "streamer.yml"
+    config_path.write_text("devices: {}\n")
+    stale_generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=stale_generation)
+    client = switcher_client(
+        str(config_path),
+        description=speaker_profiles.engine_generation_marker(stale_generation),
+    )
+    applied: list[dict] = []
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        # This switcher run had already verified that generation, and the live
+        # engine still carries it: only the websocket went away.  Even then the
+        # reconnection may be a different engine process, so nothing survives it.
+        patch.object(switcher, "_engine_generation", stale_generation),
+        patch.dict(switcher.CONFIGS, {"streamer": str(config_path)}, clear=True),
+        patch.object(switcher, "validate_configs"),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(
+            switcher,
+            "managed_config_identity",
+            return_value=("streamer", switcher.DEFAULT_SPEAKER_ID),
+        ),
+        patch.object(
+            switcher, "resolve_config_target", return_value={"path": str(config_path)}
+        ),
+        patch.object(switcher, "apply_config", side_effect=lambda *a, **k: applied.append(k)),
+    ):
+        run_switcher_iterations(client, sleeps=1)
+        # Connecting rotates the generation, so the token that matched the
+        # engine a moment ago no longer belongs to this switcher run.
+        assert switcher._engine_generation != stale_generation
+
+    # The stale token was dropped and the config re-applied through the
+    # verified path rather than trusted.
+    assert not ready.exists()
+    assert applied and applied[0]["audio_lock_held"] is True
+    assert client.volume.mute is True
+
+
+def test_loop_errors_drop_readiness_and_rerun_startup_validation(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    config_path = tmp_path / "streamer.yml"
+    config_path.write_text("devices: {}\n")
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+    client = switcher_client(
+        str(config_path),
+        connected=True,
+        description=speaker_profiles.engine_generation_marker(generation),
+    )
+    validations: list[str] = []
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.dict(switcher.CONFIGS, {"streamer": str(config_path)}, clear=True),
+        patch.object(switcher, "validate_configs", side_effect=validations.append),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(
+            switcher,
+            "require_selected_profile_available",
+            side_effect=RuntimeError("engine went away mid-pass"),
+        ),
+    ):
+        # The first pass starts ready: an already-connected client and a token
+        # this run minted for the generation the live engine still carries.
+        assert not switcher.audio_inhibit_active(
+            ready, client, generation=generation
+        )
+        run_switcher_iterations(client, sleeps=4)
+
+    assert not ready.exists()
+    # Startup validation state was reset, so it ran again on the next pass.
+    assert len(validations) >= 2
 
 
 def test_catalog_default_speaker_uses_the_plain_source_configs(tmp_path: Path) -> None:

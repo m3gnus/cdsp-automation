@@ -34,8 +34,21 @@ Generated files live under
 `SPEAKER_GENERATED_DIR/<sha256>/<source>--<speaker>.yml`. Both the digest and
 managed-path provenance are checked before use. The ready-token and shared
 audio-control lock make reload a fail-closed transaction: inhibit → mute →
-validate/reload/verify → overlay → restore requested mute → publish ready.
+validate/reload/verify → overlay → stamp the engine generation → restore
+requested mute → publish ready.
 Rollback always re-inhibits and asserts mute before loading the previous graph.
+
+Readiness is scoped to one CamillaDSP *instance*, not to the boot. CamillaDSP
+4.1.3 exposes no process id over its websocket, so the switcher synthesizes an
+engine generation, rotates it on every (re)connection, and writes it into the
+live config's `description` with `SetConfigValue` (falling back to a whole
+config write). The ready token records the same generation next to the applied
+config path, digest, source, speaker and selection revision; consumers compare
+the two with one `GetConfigDescription` on the client they already hold. An
+engine restart, an external reload, a recovery reload, a websocket reconnect,
+or any unhandled error in the switcher loop all invalidate readiness, and the
+loop re-applies the selected config through the same muted, verified path
+before audio can return.
 
 I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. They're designed to work together or independently, depending on your needs.
 
