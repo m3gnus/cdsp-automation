@@ -820,3 +820,101 @@ def prune_generated_configs(
         except OSError:
             continue
     return removed
+
+
+def audit_operator_config_volume_limits(
+    *, profile_dir: Path, config_dir: Path
+) -> list[dict[str, str]]:
+    """Report operator configs the volume-limit contract would now refuse.
+
+    A profile's cap only protects the speaker if the operator's own config
+    declares a native ``devices.volume_limit``, because every control surface
+    reads that ceiling back rather than the profile.  Upgrades tighten this
+    from a one-time clamp into a hard requirement, so a deployment needs to
+    learn which files to edit here -- at update time, by name -- rather than
+    from a speaker that has gone silent mid-transition.
+    """
+    findings: list[dict[str, str]] = []
+    for speaker_id in sorted(OPERATOR_CONFIG_SPEAKERS):
+        try:
+            profile = load_profile(profile_dir, speaker_id)
+        except (OSError, ValueError) as exc:
+            findings.append(
+                {
+                    "speaker": speaker_id,
+                    "source": "",
+                    "path": str(profile_dir / f"{speaker_id}.yml"),
+                    "problem": f"speaker profile could not be read: {exc}",
+                }
+            )
+            continue
+        for source, filename in sorted(
+            operator_configs_for_speaker(speaker_id).items()
+        ):
+            path = Path(config_dir) / filename
+            if not path.is_file():
+                # A catalog entry with no file is a louder, pre-existing
+                # failure the switcher already raises on. Reporting it here
+                # would bury the one thing this audit exists to surface.
+                continue
+            try:
+                config = load_yaml_mapping(path, f"operator config {speaker_id}")
+            except (OSError, ValueError) as exc:
+                findings.append(
+                    {
+                        "speaker": speaker_id,
+                        "source": source,
+                        "path": str(path),
+                        "problem": f"config could not be read: {exc}",
+                    }
+                )
+                continue
+            try:
+                require_config_volume_limit(config, profile, label=filename)
+            except ValueError as exc:
+                findings.append(
+                    {
+                        "speaker": speaker_id,
+                        "source": source,
+                        "path": str(path),
+                        "problem": str(exc),
+                    }
+                )
+    return findings
+
+
+def _audit_main() -> int:
+    """Print the audit for the installer.  Advisory: never blocks an update."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Report operator configs missing a profile volume cap."
+    )
+    parser.add_argument("--profile-dir", required=True)
+    parser.add_argument("--config-dir", required=True)
+    args = parser.parse_args()
+
+    try:
+        findings = audit_operator_config_volume_limits(
+            profile_dir=Path(args.profile_dir), config_dir=Path(args.config_dir)
+        )
+    except Exception as exc:  # noqa: BLE001 - an audit must not break an update
+        print(f"Volume-limit audit could not run: {exc}")
+        return 0
+    if not findings:
+        return 0
+    print("")
+    print("Operator configs that need a volume limit before they will load:")
+    for finding in findings:
+        print(f"  - {finding['path']}")
+        print(f"      {finding['problem']}")
+    print("")
+    print(
+        "Until each is fixed, selecting that speaker/source is refused and it "
+        "will not play. Generated profiles are unaffected."
+    )
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_audit_main())

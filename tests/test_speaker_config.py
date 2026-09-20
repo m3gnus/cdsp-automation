@@ -446,3 +446,43 @@ def test_operator_config_must_declare_the_profile_volume_cap() -> None:
         stricter, profile, label="operator config partymeh-streamer.yml"
     ) == -35.0
     assert stricter == {"devices": {"volume_limit": -35}}
+
+
+def test_audit_names_operator_configs_missing_the_profile_volume_cap(
+    tmp_path: Path,
+) -> None:
+    """The upgrade advisory must name the file, not just fail at transition."""
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    profile_dir = tmp_path / "profiles"
+    profile_dir.mkdir()
+    document = partymeh_document()
+    document["max_volume_db"] = -20
+    (profile_dir / "partymeh.yml").write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    filename = speaker_profiles.operator_configs_for_speaker("partymeh")["streamer"]
+    uncapped = config_dir / filename
+    uncapped.write_text(
+        yaml.safe_dump({"devices": {"samplerate": 48000}}), encoding="utf-8"
+    )
+
+    findings = speaker_config.audit_operator_config_volume_limits(
+        profile_dir=profile_dir, config_dir=config_dir
+    )
+    reported = {finding["path"]: finding["problem"] for finding in findings}
+    assert str(uncapped) in reported
+    assert "no devices.volume_limit" in reported[str(uncapped)]
+
+    # A config that declares the cap is not reported, and a catalog entry with
+    # no file on disk is left to the switcher's own louder failure.
+    uncapped.write_text(
+        yaml.safe_dump({"devices": {"samplerate": 48000, "volume_limit": -20}}),
+        encoding="utf-8",
+    )
+    assert (
+        speaker_config.audit_operator_config_volume_limits(
+            profile_dir=profile_dir, config_dir=config_dir
+        )
+        == []
+    )

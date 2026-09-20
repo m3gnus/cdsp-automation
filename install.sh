@@ -881,10 +881,33 @@ update_utilities() {
     echo "An ISO 226 engine is installed and was left running untouched."
     echo "Run menu option 10 to rebuild it against the downloaded pinned patch."
   fi
+  audit_operator_volume_limits
   refresh_installed_units
   restart_all
   echo "Update complete. User settings remain in $ENV_FILE."
   print_install_summary
+}
+
+# The profile volume cap is now enforced through the config's own native
+# devices.volume_limit rather than a one-time clamp, so an operator-owned
+# config without one is refused instead of silently left unprotected.  Name
+# the files that need a line added here, while the operator is still at the
+# keyboard, rather than letting a speaker go silent at its next transition.
+audit_operator_volume_limits() {
+  local profile_dir config_dir output
+  profile_dir="$(get_env_value SPEAKER_PROFILE_DIR)"
+  : "${profile_dir:=/etc/cdsp-automation/speaker-profiles}"
+  config_dir="$(get_env_value CDSP_CONFIG_DIR)"
+  : "${config_dir:=$CONFIGS_DIR}"
+  [[ -x "$VENV_DIR/bin/python3" ]] || return 0
+  [[ -d "$config_dir" ]] || return 0
+  if output="$("$VENV_DIR/bin/python3" "$SCRIPTS_DIR/speaker_config.py" \
+      --profile-dir "$profile_dir" --config-dir "$config_dir" 2>&1)"; then
+    return 0
+  fi
+  [[ -n "$output" ]] || return 0
+  printf '%s\n' "$output" >&2
+  note_skip "Operator configs need a devices.volume_limit (listed above)"
 }
 
 pair_bluetooth_remote() {

@@ -1018,6 +1018,19 @@ ensure_audio_state_storage
         )
         self.assertIn("$SYSTEMCTL_BIN poweroff", installer)
 
+    def test_update_audits_operator_volume_limits_before_restarting(self) -> None:
+        """The operator learns which configs need a cap before services bounce."""
+        source = INSTALLER.read_text(encoding="utf-8")
+        body = source.split("update_utilities()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("audit_operator_volume_limits", body)
+        self.assertLess(
+            body.index("audit_operator_volume_limits"), body.index("restart_all")
+        )
+        # The audit is advisory: a finding must not abort the update.
+        audit = source.split("audit_operator_volume_limits() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("note_skip", audit)
+
 
 if __name__ == "__main__":
     unittest.main()
+
