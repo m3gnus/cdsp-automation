@@ -125,6 +125,14 @@ but is not used to infer ownership. It sends binary WebSocket commands directly
 to the MOTU web interface. The hex payloads (`000b0000000103` for internal,
 `000b0000000102` for optical) are reverse-engineered commands from MOTU's web UI.
 
+The config path is named by `speaker_config.identify_managed_config()`, the
+same lookup the source switcher and the control UI use, so the speaker
+catalog's source-to-filename mapping - not a filename convention - decides
+which source owns the clock. Only the two names this project generates itself
+(`<source>.yml` and `<source>--<speaker>.yml`) are still recognized by shape,
+as a fallback for configs the catalog does not describe; anything else the
+catalog cannot name leaves the clock untouched rather than being guessed at.
+
 **Why this approach:**
 
 - **WebSocket communication** - MOTU interfaces expose a WebSocket API that their web UI uses. By capturing and replaying these commands, we can control the device programmatically without any official API
@@ -132,9 +140,28 @@ to the MOTU web interface. The hex payloads (`000b0000000103` for internal,
   input, so equal-rate sources still select the correct owner
 - **Binary payloads** - The MOTU protocol uses binary WebSocket frames, not JSON/text, which is why we need `binascii.unhexlify()`
 
+- **Read-back over HTTP** - a binary WebSocket send that does not raise proves
+  only that the frame left this host. The device publishes its current
+  settings as a plain HTTP datastore document, so the applied clock source is
+  read back there: the persisted `MOTU_CLOCK_STATE_PATH` value is treated as a
+  cache of the last *request*, and the device's own answer overrides it. A
+  confirmed value is re-checked every `MOTU_CLOCK_VERIFY_INTERVAL` seconds,
+  which also notices a clock changed from the MOTU's web UI; an interface that
+  serves no datastore never confirms and is driven from the cache exactly as
+  before. Verification is skipped on any pass where a clock change is already
+  due, so a stalled read can never delay the change itself.
+
 **Practical use:** Switching between TOSLINK and USB changes the MOTU clock
 owner even when both graphs run at 48 kHz. Failed WebSocket sends are retried
-instead of being recorded as applied.
+instead of being recorded as applied, and so is a send the device accepted but
+never applied.
+
+**Known gap:** the clock change is not yet coordinated with the source
+switcher's muted transition. The daemon notices the new config after the
+switcher has already reloaded it, so a clock re-lock can land just after the
+mute interval ends. Closing that gap means the switcher owning the clock
+change inside its own mute window (see `scripts/source_switcher.py`), which is
+a larger change than the read-back verification above.
 
 **Note:** The hex payloads are for MOTU UltraLite. Other MOTU models may use different commands - you'd need to capture them from the web UI using browser developer tools.
 

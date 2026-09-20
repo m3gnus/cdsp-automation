@@ -342,11 +342,14 @@ managed source identity.
 
 ### How It Works
 
-- Reads the source name from CamillaDSP's managed config path
+- Reads the source name from CamillaDSP's managed config path, through the
+  same speaker-catalog lookup the source switcher uses
 - Sends WebSocket commands to MOTU to change clock source
 - **TOSLINK** → switches to **optical** clock
 - **Streamer, USB gadget, or analog** → switches to **internal** clock
 - Retries a failed MOTU command until it is confirmed sent
+- Reads the clock source back from the MOTU and retries a command the device
+  did not actually apply
 
 ### Requirements
 
@@ -369,9 +372,25 @@ MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 ```
 
 Clock ownership is independent of sample rate. Sources may all run at 48 kHz;
-the config identity still selects the correct clock. The last successful clock
-choice is persisted at `MOTU_CLOCK_STATE_PATH` so service restarts do not send
-a redundant command that makes the interface re-lock and briefly mute.
+the config identity still selects the correct clock. The config's identity
+comes from the speaker catalog, so an operator config mapped to any filename
+(not only `<speaker>-<source>.yml`) still selects the right clock.
+
+The last requested clock choice is persisted at `MOTU_CLOCK_STATE_PATH` so
+service restarts do not send a redundant command that makes the interface
+re-lock and briefly mute. That file is a cache of what was asked for, not
+proof of what the device did: the daemon reads the clock source back from the
+MOTU's HTTP datastore, corrects the cache when the device disagrees (someone
+changed it in the MOTU web UI), and re-sends a command the device never
+applied. An interface that serves no datastore simply never confirms, and the
+daemon falls back to the cached value. Optional keys:
+
+```text
+MOTU_DATASTORE_URL=http://YOUR_MOTU_IP/datastore   # derived from MOTU_WS_URL
+MOTU_CLOCK_READBACK_TIMEOUT=3
+MOTU_CLOCK_VERIFY_INTERVAL=60
+MOTU_CLOCK_READBACK_RETRY_INTERVAL=300
+```
 
 
 ---

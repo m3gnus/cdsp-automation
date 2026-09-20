@@ -15,6 +15,7 @@ from typing import Any
 
 import yaml
 
+import speaker_profiles
 from audio_eq import apply_audio_overlay, audio_state_lock
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
@@ -618,6 +619,29 @@ def require_config_volume_limit(
 def config_digest(config: dict[str, Any]) -> str:
     payload = json.dumps(config, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def env_managed_config_dirs() -> tuple[Path, Path, str]:
+    """Resolve the inputs :func:`identify_managed_config` needs, from the env.
+
+    Every daemon that has to name the live config - the source switcher, the
+    control UI, the MOTU clock daemon - must agree on the same answer, and
+    they all read the one environment file the units share.  Resolving the
+    directories here instead of in each caller keeps a daemon that only needs
+    the identity (the clock daemon) from re-deriving it from filename
+    conventions the speaker catalog is free to contradict.
+    """
+    config_dir = Path(
+        os.environ.get("CDSP_CONFIG_DIR")
+        or os.path.join(os.path.expanduser("~"), "camilladsp/configs")
+    )
+    generated_dir = Path(
+        os.environ.get("SPEAKER_GENERATED_DIR")
+        or "/var/lib/cdsp-automation/generated-configs"
+    )
+    # Read through the module: the site catalog can rebind the default
+    # speaker, and callers must not capture a stale from-import of it.
+    return config_dir, generated_dir, speaker_profiles.DEFAULT_SPEAKER_ID
 
 
 def identify_managed_config(
