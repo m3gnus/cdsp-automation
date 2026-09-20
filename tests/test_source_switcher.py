@@ -1568,8 +1568,45 @@ def stream_source(ready: bool, playing: bool | None = None) -> switcher.SourceSn
 
 
 def meter_source(active: bool) -> switcher.SourceSnapshot:
-    """A meter source, whose readiness is itself a signal-presence measure."""
-    return switcher.SourceSnapshot(ready=active, playing=active)
+    """A meter source, whose readiness is itself a signal-presence measure.
+
+    Mirrors what main()'s meter_snapshot() builds, self_metering flag and all.
+    """
+    return switcher.SourceSnapshot(
+        ready=active, playing=active, self_metering=True
+    )
+
+
+def passes_until_handover(
+    current: str,
+    sources: dict[str, switcher.SourceSnapshot],
+    *,
+    probes: dict[str, switcher.ProbeRecord] | None = None,
+    limit: int = 400,
+    **options: object,
+) -> tuple[int, str | None]:
+    """Hold one snapshot steady until arbitration gives up on ``current``.
+
+    Returns the number of passes it took and the source chosen instead, or
+    ``(limit + 1, current)`` if the hold never broke.
+    """
+    records = dict(probes or {})
+    now = 1000.0
+    for step in range(1, limit + 1):
+        decision = switcher.arbitrate(
+            now=now,
+            elapsed=1.0,
+            current_source=current,
+            last_active=current,
+            sources=sources,
+            probes=records,
+            **options,
+        )
+        records = decision.probes
+        if decision.source != current:
+            return step, decision.source
+        now += 1.0
+    return limit + 1, current
 
 
 class ArbitrationRig:
@@ -1843,41 +1880,178 @@ def test_confirmed_playback_gets_the_track_gap_grace_not_the_probe_window() -> N
 
 def test_lower_priority_meter_source_cuts_a_silent_hold_short() -> None:
     """SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT keeps working for a played source."""
-    probes = {
-        "streamer": switcher.ProbeRecord(was_ready=True, confirmed=True, silence=1.0)
+    silent_streamer = {
+        "streamer": stream_source(True, playing=False),
+        "gadget": stream_source(False),
+        "toslink": meter_source(True),
+        "analog": meter_source(False),
     }
+    probes = {
+        "streamer": switcher.ProbeRecord(was_ready=True, confirmed=True)
+    }
+
+    # Default: handed over as soon as TOSLINK's playback has dwelled.
+    passes, chosen = passes_until_handover(
+        "streamer", silent_streamer, probes=probes, lower_priority_timeout=0.0
+    )
+    assert chosen == "toslink"
+    assert passes == switcher.PREEMPT_DWELL_SECONDS
+
+    # Raise the timeout and the streamer keeps its track gap instead, right up
+    # to the point the operator asked for.
+    delayed, chosen = passes_until_handover(
+        "streamer", silent_streamer, probes=probes, lower_priority_timeout=30.0
+    )
+    assert chosen == "toslink"
+    assert delayed == 30.0
+
+
+def test_confirmed_higher_priority_source_cuts_a_silent_source_grace_short() -> None:
+    """Real audio must not wait out somebody else's track gap.
+
+    TOSLINK stops, and a moment later the streamer is confirmed playing.  The
+    grace exists to protect a source between tracks, not to make a
+    higher-priority input that is demonstrably playing sit in silence for
+    IDLE_TIMEOUT before anyone looks at it.
+    """
+    stopped_toslink = {
+        # A plain silent source, not self-metering: this is purely about the
+        # grace, so the grace has to be there to be cut.
+        "toslink": stream_source(True, playing=False),
+        "streamer": stream_source(True, playing=True),
+        "gadget": stream_source(False),
+        "analog": meter_source(False),
+    }
+    probes = {"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)}
+    passes, chosen = passes_until_handover("toslink", stopped_toslink, probes=probes)
+
+    assert chosen == "streamer"
+    assert passes == switcher.PREEMPT_DWELL_SECONDS
+    assert passes < switcher.IDLE_TIMEOUT
+
+
+def test_merely_ready_higher_priority_source_does_not_cut_the_grace() -> None:
+    """Only confirmed playback pre-empts; readiness alone is what the grace is for.
+
+    An AirPlay session that is connected and paused is 'ready' for as long as
+    it stays connected.  If that were enough, every track gap would cost a
+    config reload - which is the thrash the probe backoff exists to stop.
+    """
+    paused_rival = {
+        "toslink": stream_source(True, playing=False),
+        # Ready, but playback unknown because it is not the selected source.
+        "streamer": stream_source(True, playing=None),
+        "gadget": stream_source(False),
+        "analog": meter_source(False),
+    }
+    probes = {"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)}
+    passes, chosen = passes_until_handover("toslink", paused_rival, probes=probes)
+
+    # Held for the whole track-gap grace, then released on its own terms.
+    assert passes == switcher.IDLE_TIMEOUT
+    assert chosen == "streamer"
+
+
+def test_a_single_pass_of_confirmed_playback_does_not_preempt() -> None:
+    """One noisy meter frame must not yank the config away mid-track."""
+    probes = {"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)}
+    now = 1000.0
+    for blip in range(12):
+        decision = switcher.arbitrate(
+            now=now,
+            elapsed=1.0,
+            current_source="toslink",
+            last_active="toslink",
+            sources={
+                "toslink": stream_source(True, playing=False),
+                # Flickers True for one pass at a time and never sustains it.
+                "streamer": stream_source(True, playing=blip % 2 == 0),
+                "gadget": stream_source(False),
+                "analog": meter_source(False),
+            },
+            probes=probes,
+        )
+        probes = decision.probes
+        assert decision.source == "toslink", now
+        now += 1.0
+
+
+def test_higher_priority_preemption_ignores_the_lower_priority_timeout() -> None:
+    """LOWER_PRIORITY_ACTIVE_TIMEOUT governs only the lower-priority direction.
+
+    An operator raising it is saying "do not let the TV steal my AirPlay track
+    gap".  Reading that as "do not let AirPlay interrupt a TV that has
+    stopped" would be the opposite of what they asked for.
+    """
+    sources = {
+        "toslink": stream_source(True, playing=False),
+        "streamer": stream_source(True, playing=True),
+        "gadget": stream_source(False),
+        "analog": meter_source(False),
+    }
+    probes = {"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)}
+    passes, chosen = passes_until_handover(
+        "toslink", sources, probes=probes, lower_priority_timeout=300.0
+    )
+    assert chosen == "streamer"
+    assert passes == switcher.PREEMPT_DWELL_SECONDS
+
+
+def test_a_stopped_meter_source_does_not_hold_the_output_through_a_track_gap() -> None:
+    """A meter source has already served its grace by the time it reads silent.
+
+    ``toslink_available`` only goes false after SOURCE_TOSLINK_IDLE_SECONDS of
+    quiet meters.  Layering IDLE_TIMEOUT on top of that counts the same wait
+    twice, and leaves a ready streamer unprobed for a minute after the TV goes
+    off.  A stream source, whose readiness says nothing about signal, still
+    gets the full grace.
+    """
+    ready_streamer = stream_source(True, playing=None)
+    metered, chosen = passes_until_handover(
+        "toslink",
+        {
+            "toslink": meter_source(False),
+            "streamer": ready_streamer,
+            "gadget": stream_source(False),
+            "analog": meter_source(False),
+        },
+        probes={"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)},
+    )
+    assert chosen == "streamer"
+    assert metered == 1
+
+    streamed, chosen = passes_until_handover(
+        "gadget",
+        {
+            "toslink": meter_source(False),
+            "streamer": ready_streamer,
+            "gadget": stream_source(True, playing=False),
+            "analog": meter_source(False),
+        },
+        probes={"gadget": switcher.ProbeRecord(was_ready=True, confirmed=True)},
+    )
+    assert chosen == "streamer"
+    assert streamed == switcher.IDLE_TIMEOUT
+
+
+def test_a_stopped_meter_source_is_not_backed_off_like_a_failed_probe() -> None:
+    """Its meter requalifies it the instant signal returns."""
     decision = switcher.arbitrate(
         now=1000.0,
         elapsed=1.0,
-        current_source="streamer",
-        last_active="streamer",
+        current_source="toslink",
+        last_active="toslink",
         sources={
-            "streamer": stream_source(True, playing=False),
+            "toslink": meter_source(False),
+            "streamer": stream_source(False),
             "gadget": stream_source(False),
-            "toslink": meter_source(True),
             "analog": meter_source(False),
         },
-        probes=probes,
-        lower_priority_timeout=0.0,
+        probes={"toslink": switcher.ProbeRecord(was_ready=True, confirmed=True)},
     )
-    assert decision.source == "toslink"
-
-    # Raise the timeout and the streamer keeps its grace instead.
-    held = switcher.arbitrate(
-        now=1000.0,
-        elapsed=1.0,
-        current_source="streamer",
-        last_active="streamer",
-        sources={
-            "streamer": stream_source(True, playing=False),
-            "gadget": stream_source(False),
-            "toslink": meter_source(True),
-            "analog": meter_source(False),
-        },
-        probes=probes,
-        lower_priority_timeout=30.0,
-    )
-    assert held.source == "streamer"
+    assert decision.source is None
+    assert decision.probes["toslink"].backoff_level == 0
+    assert decision.probes["toslink"].backoff_until == 0.0
 
 
 def test_manual_override_overrides_a_backed_off_source() -> None:
@@ -2035,6 +2209,113 @@ def test_switcher_loop_stops_reloading_two_ready_but_silent_sources(
     # for as long as both stayed ready; this one runs out of reasons.
     assert len(applied) <= 8, applied
     assert set(applied) == {"streamer", "gadget"}
+
+
+def test_switcher_loop_leaves_a_stopped_toslink_for_a_ready_streamer(
+    tmp_path: Path,
+) -> None:
+    """The rig symptom, end to end: TV off, AirPlay already connected.
+
+    TOSLINK is playing through the MOTU meters; the TV is switched off; an
+    AirPlay session is connected and silent.  The meters take their own
+    SOURCE_TOSLINK_IDLE_SECONDS to call it quiet, and that is the whole of the
+    wait the operator should see - not that debounce plus a full IDLE_TIMEOUT
+    track gap on top.
+    """
+    ready = tmp_path / "ready.json"
+    configs = {}
+    for name in ("streamer", "toslink"):
+        path = tmp_path / f"{name}.yml"
+        path.write_text("devices: {}\n")
+        configs[name] = str(path)
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+
+    config = FakeSwitcherConfig(
+        configs["toslink"],
+        description=speaker_profiles.engine_generation_marker(generation),
+    )
+    client = SimpleNamespace(
+        config=config,
+        volume=FakeSwitcherVolume(mute=False),
+        general=SimpleNamespace(reload=lambda: None, state=lambda: "running"),
+        # The streamer is connected but not playing a note.
+        levels=SimpleNamespace(capture_rms=lambda: [-120.0, -120.0]),
+        is_connected=lambda: True,
+        connect=lambda: None,
+    )
+    clock = SwitcherLoopClock(budget=300.0)
+    tv_off_at = clock.now + 30.0
+
+    class FakeMotu:
+        """TOSLINK meter pair 12 reads hot until the TV is switched off."""
+
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def read(self) -> dict[int, tuple[int, int]]:
+            return {} if clock.now >= tv_off_at else {12: (0, 0)}
+
+    applied: list[tuple[float, str]] = []
+
+    def fake_apply(_cdsp, path, **_kwargs) -> None:
+        applied.append((clock.now, Path(path).stem))
+        config.path = path
+        config.applied_path = path
+        speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+
+    def identity(current: str | None) -> tuple[str, str] | None:
+        if not current:
+            return None
+        return Path(current).stem, switcher.DEFAULT_SPEAKER_ID
+
+    # Deep enough that nesting these as a single with-statement trips
+    # CPython's static block limit, so enter them off a stack instead.
+    guards = [
+        patch.object(switcher, "CamillaClient", lambda *_args: client),
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.object(switcher, "TOSLINK_MOTU_METERS", True),
+        patch.object(switcher, "ANALOG_MOTU_METERS", False),
+        patch.object(switcher, "MotuMeterReader", FakeMotu),
+        patch.dict(switcher.CONFIGS, configs, clear=True),
+        patch.object(switcher, "validate_configs"),
+        patch.object(switcher, "require_selected_profile_available"),
+        patch.object(switcher, "ensure_current_speaker_audio_eq"),
+        patch.object(switcher, "read_manual_source", return_value=None),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(switcher, "managed_config_identity", side_effect=identity),
+        patch.object(switcher, "is_alsa_active", return_value=True),
+        patch.object(switcher, "is_gadget_available", return_value=False),
+        patch.object(
+            switcher,
+            "resolve_config_target",
+            side_effect=lambda source, *_a, **_k: {"path": configs[source]},
+        ),
+        patch.object(switcher, "apply_config", side_effect=fake_apply),
+        patch.object(switcher, "time", clock),
+        contextlib.redirect_stdout(io.StringIO()),
+    ]
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        try:
+            switcher.main()
+        except LoopStop:
+            pass
+
+    handovers = [entry for entry in applied if entry[1] == "streamer"]
+    assert handovers, applied
+    waited = handovers[0][0] - tv_off_at
+    # The meter debounce, and little else.  Before the fix this was the
+    # debounce plus SOURCE_IDLE_TIMEOUT.
+    assert waited <= switcher.TOSLINK_IDLE_SECONDS + 3, waited
+    assert waited < switcher.IDLE_TIMEOUT
 
 
 if __name__ == "__main__":

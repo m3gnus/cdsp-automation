@@ -70,10 +70,20 @@ CHECK_INTERVAL = float(os.environ.get("SOURCE_CHECK_INTERVAL", "1.0"))
 # silence before the switcher looks elsewhere.  This is the track-gap grace
 # period and its meaning is unchanged.
 IDLE_TIMEOUT = float(os.environ.get("SOURCE_IDLE_TIMEOUT", "60"))
-# How far into that grace period a lower-priority source with confirmed audio
-# may cut the hold short.  Meaning unchanged.
+# How far into that grace period a *lower*-priority source with confirmed
+# audio may cut the hold short.  Meaning unchanged, and it governs only the
+# lower-priority direction: an operator who raises it is saying "do not let
+# the TV steal my AirPlay track gap", which must not be read as "do not let
+# AirPlay interrupt a TV that has stopped".
 LOWER_PRIORITY_ACTIVE_TIMEOUT = float(
     os.environ.get("SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT", "0")
+)
+# How long a rival must have been *continuously confirmed playing* before it
+# may cut a silent source's grace short.  Real audio should not wait, but one
+# noisy meter frame should not yank the config away mid-track either, so a
+# rival has to hold the observation for a couple of passes first.
+PREEMPT_DWELL_SECONDS = max(
+    float(os.environ.get("SOURCE_PREEMPT_DWELL_SECONDS", "2")), 0.0
 )
 # How long an *unconfirmed* source is listened to after the switcher probes it
 # by selecting it.  Hardware readiness (an open ALSA Loopback stream, a USB
@@ -1354,6 +1364,12 @@ class SourceSnapshot:
 
     ready: bool = False
     playing: bool | None = None
+    #: Readiness is itself a debounced signal-presence measurement, as it is
+    #: for the MOTU meter sources: ``ready`` only went false after the meter
+    #: had been quiet for SOURCE_TOSLINK_IDLE_SECONDS / _ANALOG_IDLE_SECONDS.
+    #: Such a source has already served its own track-gap grace by the time it
+    #: reads silent, so it is not given a second one on top.
+    self_metering: bool = False
 
 
 @dataclass(frozen=True)
@@ -1369,6 +1385,9 @@ class ProbeRecord:
     was_ready: bool = False
     #: Seconds the source has been continuously not ready.
     unready_for: float = 0.0
+    #: Seconds this source has been continuously *confirmed playing*.  Only a
+    #: rival that has sustained it may cut another source's grace short.
+    playing_for: float = 0.0
     #: Consecutive silent probes; drives the backoff delay.
     backoff_level: int = 0
     #: Monotonic deadline before which this source must not be re-probed.
@@ -1434,6 +1453,7 @@ def arbitrate(
     backoff_base: float = PROBE_BACKOFF_SECONDS,
     backoff_factor: float = PROBE_BACKOFF_FACTOR,
     backoff_max: float = PROBE_BACKOFF_MAX,
+    preempt_dwell: float = PREEMPT_DWELL_SECONDS,
     log: bool = False,
 ) -> ArbitrationDecision:
     """Decide which source to be on from one snapshot of observable state.
@@ -1451,6 +1471,8 @@ def arbitrate(
     # A source that just came back after really being gone is a new session,
     # not the one we already gave up on: forgive its backoff.  The
     # not-ready dwell requirement keeps flapping hardware from doing the same.
+    # This loop is the only writer of the purely observational counters, so
+    # every later branch reads them already including this pass.
     for name, state in sources.items():
         record = records[name]
         if state.ready:
@@ -1461,6 +1483,12 @@ def arbitrate(
             record = replace(
                 record, was_ready=False, unready_for=record.unready_for + elapsed
             )
+        record = replace(
+            record,
+            playing_for=(
+                record.playing_for + elapsed if state.playing is True else 0.0
+            ),
+        )
         records[name] = record
 
     # Priority 0: a manual override wins outright and clears any backoff, so
@@ -1480,13 +1508,30 @@ def arbitrate(
     def rank(name: str | None) -> int:
         return priority.index(name) if name in priority else len(priority)
 
-    def lower_priority_playing(name: str | None) -> bool:
+    def preempted_by(name: str, silence: float) -> str | None:
+        """A rival with *confirmed* audio that may cut ``name``'s grace short.
+
+        Only confirmed playback qualifies.  A rival that is merely ready - or
+        whose playback is unknown because it is not the selected source - is
+        exactly what the grace exists to protect against, and never counts.
+
+        Priority decides how patient the grace is allowed to be.  A rival
+        *above* the current source is the reason the priority order exists at
+        all, so it waits for nothing but the dwell: real audio on a
+        higher-priority input must not sit in silence for the length of
+        somebody else's track gap.  A rival *below* keeps its documented
+        LOWER_PRIORITY_ACTIVE_TIMEOUT gate, which defaults to immediate.
+        """
         threshold = rank(name)
-        return any(
-            sources[other].playing is True
-            for other in priority[threshold + 1 :]
-            if other in sources
-        )
+        for other in priority:
+            state = sources.get(other)
+            if other == name or state is None or state.playing is not True:
+                continue
+            if records[other].playing_for < preempt_dwell:
+                continue
+            if rank(other) < threshold or silence >= lower_priority_timeout:
+                return other
+        return None
 
     # Priority 1: keep the current source while it still deserves it.  An
     # actually-playing source is never pre-empted by a higher-priority one.
@@ -1514,24 +1559,38 @@ def arbitrate(
             records[current_source] = record
             # This is the distinction the old code was missing: a source that
             # had confirmed audio gets the full track-gap grace, a source that
-            # only ever proved ready gets the much shorter probe window.
-            limit = idle_timeout if record.confirmed else probe_silence_timeout
+            # only ever proved ready gets the much shorter probe window.  A
+            # self-metering source gets neither: its readiness dropping is
+            # already a debounced "the signal stopped", so a further grace on
+            # top would just be the meter's idle timer counted twice.
+            if current.self_metering:
+                limit = 0.0
+            elif record.confirmed:
+                limit = idle_timeout
+            else:
+                limit = probe_silence_timeout
             if log:
                 label = current_source.capitalize()
                 log_idle(
                     label if current.ready else f"{label} grace", record.silence, limit
                 )
-            if record.silence < limit and (
-                not lower_priority_playing(current_source)
-                or record.silence < lower_priority_timeout
-            ):
+            rival = preempted_by(current_source, record.silence)
+            if record.silence < limit and rival is None:
                 return ArbitrationDecision(
                     source=current_source,
                     reason="current source silent, within grace",
                     probes=records,
                     last_active=current_source if current.ready else last_active,
                 )
-            # Probed and found silent.  Remember that, and back off.
+            if log and DEBUG_MODE and rival is not None:
+                print(
+                    f"{current_source.capitalize()} silent and {rival} is playing"
+                    " - handing over",
+                    flush=True,
+                )
+            # Probed and found silent.  Remember that, and back off.  A
+            # self-metering source is never probed, so it has nothing to back
+            # off from: its meter requalifies it the instant signal returns.
             delay = probe_backoff_delay(
                 record.backoff_level,
                 base=backoff_base,
@@ -1542,10 +1601,14 @@ def arbitrate(
                 record,
                 silence=0.0,
                 confirmed=False,
-                backoff_level=record.backoff_level + 1,
-                backoff_until=now + delay,
+                backoff_level=(
+                    record.backoff_level
+                    if current.self_metering
+                    else record.backoff_level + 1
+                ),
+                backoff_until=0.0 if current.self_metering else now + delay,
             )
-            if log and DEBUG_MODE:
+            if log and DEBUG_MODE and not current.self_metering:
                 print(
                     f"{current_source.capitalize()} silent - not re-probing for "
                     f"{delay:g}s",
@@ -1910,7 +1973,9 @@ def main() -> int:
                 active = available or (
                     observing == name and selected_source_playing()
                 )
-                return SourceSnapshot(ready=active, playing=active)
+                return SourceSnapshot(
+                    ready=active, playing=active, self_metering=True
+                )
 
             snapshot = {
                 "streamer": stream_snapshot("streamer", streamer_hw_active),
