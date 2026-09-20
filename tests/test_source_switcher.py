@@ -902,6 +902,67 @@ def test_config_that_never_becomes_active_fails_closed_at_the_deadline(
     assert not (tmp_path / "ready.json").exists()
 
 
+def test_legacy_target_does_not_let_a_swapped_file_verify_itself(
+    tmp_path: Path,
+) -> None:
+    """A config swapped after resolve time must not become its own reference.
+
+    Legacy targets carry a raw-byte ``_file_digest`` while the integrity gate
+    compares a structural ``config_digest``, so that gate skips them.  Asking
+    the engine to parse the file would then compare on-disk content against
+    itself and verify a config nobody vetted.
+    """
+    resolved = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    swapped = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    swapped["devices"]["playback"]["channels"] = 8
+
+    previous = tmp_path / "prev.yml"
+    previous.write_text("devices: {}\n")
+    target_path = tmp_path / "streamer.yml"
+    # What is on disk at apply time is not what the target was resolved from.
+    target_path.write_text(
+        yaml.safe_dump(swapped, sort_keys=False), encoding="utf-8"
+    )
+
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(str(previous)),
+        volume=FakeSwitcherVolume(),
+        general=FakeSwitcherGeneral(["running", "running"]),
+    )
+    target = {
+        "speaker": switcher.DEFAULT_SPEAKER_ID,
+        "source": "streamer",
+        "digest": "raw-byte-digest-the-gate-never-compares",
+        "max_volume_db": 0.0,
+        "legacy": True,
+        "expected_config": resolved,
+    }
+    statuses: list[dict] = []
+    error: Exception | None = None
+    with (
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "CONFIG_DIR", str(tmp_path)),
+        patch.object(
+            switcher, "SPEAKER_TRANSITION_PATH", tmp_path / "transition.json"
+        ),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher, "_write_speaker_status", side_effect=statuses.append),
+        patch.object(switcher, "time", FakeClock()),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", 1.0),
+        patch.object(switcher, "CONFIG_APPLY_POLL_INTERVAL", 0.25),
+    ):
+        try:
+            switcher.apply_config(client, str(target_path), target=target)
+        except Exception as exc:  # noqa: BLE001 - the assertion is the message
+            error = exc
+    assert isinstance(error, RuntimeError)
+    assert "differs from requested config" in str(error)
+    assert client.volume.mute is True
+    assert statuses[-1]["ok"] is False
+
+
 def test_startup_captures_prior_mute_then_mutes_before_validation(
     tmp_path: Path,
 ) -> None:

@@ -846,12 +846,28 @@ def _engine_parsed_config(cdsp: CamillaClient, file_path: str) -> dict | None:
 
 
 def _accepted_config_matches(
-    cdsp: CamillaClient, file_path: str, accepted: object, expected: dict
+    cdsp: CamillaClient,
+    file_path: str,
+    accepted: object,
+    expected: dict,
+    *,
+    trust_file: bool = True,
 ) -> bool:
-    """Compare an accepted read-back against the requested configuration."""
+    """Compare an accepted read-back against the requested configuration.
+
+    Asking the engine to parse ``file_path`` yields the better reference, but
+    it re-reads the file from disk.  That is only sound where the on-disk
+    bytes were proven to be the ones this target was resolved from.  Legacy
+    targets carry a raw-byte ``_file_digest`` while the integrity gate
+    compares a structural ``config_digest``, so the two cannot be checked
+    against each other and that gate skips them -- for those, compare against
+    the mapping read at resolve time instead of trusting the file, so a config
+    swapped underneath us cannot verify itself.  Null-stripping applies to
+    both sides either way, so the materialization fix holds in both modes.
+    """
     if not isinstance(accepted, dict) or not accepted:
         return False
-    reference = _engine_parsed_config(cdsp, file_path)
+    reference = _engine_parsed_config(cdsp, file_path) if trust_file else None
     if reference is None:
         reference = expected
     return _configs_equivalent(accepted, reference)
@@ -864,6 +880,7 @@ def _await_active_config(
     *,
     timeout: float | None = None,
     poll_interval: float | None = None,
+    trust_file: bool = True,
 ) -> None:
     """Poll until the engine reports the requested config, or fail closed.
 
@@ -879,7 +896,7 @@ def _await_active_config(
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
         if _accepted_config_matches(
-            cdsp, file_path, cdsp.config.active(), expected
+            cdsp, file_path, cdsp.config.active(), expected, trust_file=trust_file
         ):
             return
         if time.monotonic() >= deadline:
@@ -1046,7 +1063,12 @@ def apply_config(
         if target:
             expected = target.get("expected_config")
             if expected is not None:
-                _await_active_config(cdsp, file_path, expected)
+                _await_active_config(
+                    cdsp,
+                    file_path,
+                    expected,
+                    trust_file=not target.get("legacy", False),
+                )
 
         if target and target.get("selection_revision") is not None:
             current_selection = current_speaker_selection()
