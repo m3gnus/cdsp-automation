@@ -159,6 +159,21 @@ class ConfigRecoveryTests(unittest.TestCase):
                     self._assert_no_reload_without_confirmed_mute(client)
                 client.volume.set_main_mute.assert_not_called()
 
+    def test_recovery_keeps_the_mute_state_it_found_for_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "streamer.yml")
+            config_path.touch()
+            client = self.client("INACTIVE", None, str(config_path))
+            volume = FakeSwitcherVolume(mute=False)
+            client.volume = volume
+            recovery = source_switcher.ConfigRecoveryGuard(retry_seconds=1)
+            with contextlib.redirect_stdout(io.StringIO()):
+                recovery.ready(client, 0.0)
+                recovery.ready(client, 5.0)  # already muted by now
+        self.assertTrue(volume.mute)
+        self.assertIs(recovery.take_restore_mute(), False)
+        self.assertIsNone(recovery.take_restore_mute())
+
     def test_invalid_remembered_path_is_not_reloaded(self) -> None:
         client = self.client("INACTIVE", None, "/does/not/exist.yml")
         recovery = source_switcher.ConfigRecoveryGuard()
@@ -1357,6 +1372,33 @@ def test_a_clock_is_not_written_into_output_that_never_went_silent(
         assert not switcher._set_motu_clock_muted(cdsp, "optical")
     assert events == []
     assert motu.cached == "internal"
+
+
+def test_an_idle_engine_counts_as_silent_but_a_running_one_must_meter_it(
+    tmp_path: Path,
+) -> None:
+    """The real meter returns [] while paused: no chunk reached the MOTU."""
+    events: list[str] = []
+    state = {"name": "PAUSED"}
+    cdsp = SimpleNamespace(
+        config=SimpleNamespace(active=lambda: {"devices": {"samplerate": 192000}}),
+        levels=SimpleNamespace(playback_peak_since=lambda _interval: []),
+        general=SimpleNamespace(
+            state=lambda: types.SimpleNamespace(name=state["name"])
+        ),
+    )
+    motu = MotuClockRecorder("internal", events)
+    with (
+        patch.object(switcher, "clock_sync", motu),
+        patch.object(switcher, "time", FakeClock()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        assert switcher._set_motu_clock_muted(cdsp, "optical")
+        assert events == ["clock:optical"]
+        # Running yet reporting no chunks is not evidence of silence.
+        state["name"] = "RUNNING"
+        assert not switcher._set_motu_clock_muted(cdsp, "internal")
+    assert events == ["clock:optical"]
 
 
 def reconciler_client(
@@ -2986,6 +3028,95 @@ def test_switcher_loop_feeds_arbitration_the_measured_interval(
     assert elapsed[0] == switcher.CHECK_INTERVAL
     assert elapsed[1] == pytest.approx(step)
     assert elapsed[2] == pytest.approx(switcher.MAX_ARBITRATION_STEP)
+
+
+def test_a_boot_that_needed_recovery_restores_the_listeners_mute_state(
+    tmp_path: Path,
+) -> None:
+    """Reboot, engine starts before its device, recovery mutes and reloads.
+
+    Startup validation must restore the mute state from *before* recovery's
+    own mute; reading it afterwards left every such boot muted.
+    """
+    ready = tmp_path / "ready.json"
+    path = tmp_path / "streamer.yml"
+    path.write_text("devices: {}\n")
+    generation = speaker_profiles.new_engine_generation()
+    config = FakeSwitcherConfig(str(path))
+    reloaded: list[bool] = []
+
+    class BootConfig:
+        def __getattr__(self, name: str):
+            return getattr(config, name)
+
+        def active(self):
+            return config.active() if reloaded else None
+
+    client = SimpleNamespace(
+        config=BootConfig(),
+        volume=FakeSwitcherVolume(mute=False),
+        general=SimpleNamespace(
+            reload=lambda: reloaded.append(True),
+            state=lambda: "running" if reloaded else "inactive",
+        ),
+        levels=SimpleNamespace(capture_rms=lambda: [-120.0, -120.0]),
+        is_connected=lambda: True,
+        connect=lambda: None,
+    )
+    restores: list[object] = []
+
+    def fake_apply(_cdsp, _path, **kwargs) -> None:
+        restores.append(kwargs.get("restore_mute"))
+        client.volume.set_main_mute(bool(kwargs.get("restore_mute")))
+        speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+        config.live_description = speaker_profiles.engine_generation_marker(generation)
+
+    guards = [
+        patch.object(switcher, "CamillaClient", lambda *_args: client),
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.object(switcher, "TOSLINK_MOTU_METERS", False),
+        patch.object(switcher, "ANALOG_MOTU_METERS", False),
+        patch.dict(switcher.CONFIGS, {"streamer": str(path)}, clear=True),
+        patch.object(switcher, "validate_configs"),
+        patch.object(switcher, "require_selected_profile_available"),
+        patch.object(switcher, "ensure_current_speaker_audio_eq"),
+        patch.object(switcher, "read_manual_source", return_value=None),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(
+            switcher,
+            "managed_config_identity",
+            side_effect=lambda current: (
+                (Path(current).stem, switcher.DEFAULT_SPEAKER_ID) if current else None
+            ),
+        ),
+        patch.object(switcher, "is_alsa_active", return_value=True),
+        patch.object(switcher, "is_gadget_available", return_value=False),
+        patch.object(
+            switcher,
+            "resolve_config_target",
+            side_effect=lambda source, *_a, **_k: {"path": str(path)},
+        ),
+        patch.object(switcher, "apply_config", side_effect=fake_apply),
+        patch.object(switcher, "time", SwitcherLoopClock(budget=10.0)),
+        contextlib.redirect_stdout(io.StringIO()),
+    ]
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        try:
+            switcher.main()
+        except LoopStop:
+            pass
+
+    assert reloaded, "recovery never reloaded"
+    assert restores and restores[0] is False, restores
+    assert client.volume.mute is False
 
 
 if __name__ == "__main__":

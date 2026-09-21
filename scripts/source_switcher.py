@@ -693,6 +693,16 @@ class ConfigRecoveryGuard:
         self.next_attempt = 0.0
         self.next_log = 0.0
         self.last_message: str | None = None
+        # The listener's mute state from before recovery first muted, for
+        # startup validation to restore.  Read back after our own mute it
+        # would always say "muted", and a boot that needed recovery would
+        # come back silent for good.
+        self.restore_mute: bool | None = None
+
+    def take_restore_mute(self) -> bool | None:
+        """Hand over (once) the mute state recovery found, if it muted."""
+        value, self.restore_mute = self.restore_mute, None
+        return value
 
     def _log(self, message: str, now: float) -> None:
         if message != self.last_message or now >= self.next_log:
@@ -716,6 +726,8 @@ class ConfigRecoveryGuard:
         try:
             with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
                 set_audio_inhibit(AUDIO_READY_PATH)
+                if self.restore_mute is None:
+                    self.restore_mute = bool(cdsp.volume.main_mute())
                 cdsp.volume.set_main_mute(True)
                 if not bool(cdsp.volume.main_mute()):
                     raise RuntimeError("engine did not report mute after the request")
@@ -1305,6 +1317,13 @@ def _output_drain_times(config: object) -> tuple[float, float]:
     return ramp, queued / samplerate
 
 
+def _not_processing(cdsp: CamillaClient) -> bool:
+    try:
+        return _processing_state(cdsp) != "running"
+    except Exception:
+        return False
+
+
 def _await_output_silence(cdsp: CamillaClient) -> bool:
     """Wait until the MOTU is being fed silence, not merely asked for it.
 
@@ -1337,6 +1356,12 @@ def _await_output_silence(cdsp: CamillaClient) -> bool:
             # The meter sees the chunk as it is handed over; what the device
             # still holds plays out within one more queued-audio span.
             time.sleep(queued)
+            return True
+        if not peaks and _not_processing(cdsp):
+            # No chunk was handed to the device in the whole window: a paused
+            # (idle) or stopped engine feeds the MOTU nothing at all.  The
+            # meter only reports chunks that were played, so its silence is
+            # an empty list, not a list of -1000s.
             return True
         if time.monotonic() >= deadline:
             return False
@@ -2084,6 +2109,9 @@ def main() -> int:
                 with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
                     set_audio_inhibit(AUDIO_READY_PATH)
 
+            recovered_mute = recovery.take_restore_mute()
+            if startup_restore_mute is None and recovered_mute is not None:
+                startup_restore_mute = recovered_mute
             if startup_restore_mute is None and inhibited:
                 startup_restore_mute = mute_for_startup_validation(cdsp)
             current_config = cdsp.config.file_path()
