@@ -8,6 +8,7 @@ import types
 import unittest
 import contextlib
 import io
+import itertools
 from pathlib import Path
 from unittest import mock
 
@@ -39,15 +40,39 @@ def config_dir(path: Path):
         yield path
 
 
-def datastore_response(payload: object):
-    """A urlopen stand-in serving one MOTU datastore document."""
-    body = json.dumps(payload).encode("utf-8")
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-    @contextlib.contextmanager
-    def urlopen(_request: object, timeout: float | None = None):
-        yield types.SimpleNamespace(read=lambda _limit=None: body)
 
-    return urlopen
+def connect_dump() -> list[bytes]:
+    """The frames a real UltraLite mk5 pushed to a fresh WebSocket client."""
+    document = json.loads((FIXTURES / "motu_ultralite_mk5_connect_dump.json").read_text())
+    return [bytes.fromhex(frame) for frame in document["frames_hex"]]
+
+
+class ReplaySocket:
+    """A WebSocket stand-in replaying captured device frames, recording sends."""
+
+    def __init__(self, frames: list[bytes]) -> None:
+        self.frames = list(frames)
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def connect(self, *_args: object, **_kwargs: object) -> None:
+        pass
+
+    def settimeout(self, _timeout: float) -> None:
+        pass
+
+    def recv_data(self, *_args: object, **_kwargs: object) -> tuple[int, bytes]:
+        if not self.frames:
+            raise TimeoutError("timed out")
+        return clock_sync.websocket.ABNF.OPCODE_BINARY, self.frames.pop(0)
+
+    def send(self, payload: bytes, *_args: object, **_kwargs: object) -> None:
+        self.sent.append(payload)
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class ClockSyncTests(unittest.TestCase):
@@ -156,59 +181,91 @@ class ClockSyncTests(unittest.TestCase):
                 clock_sync.persist_clock("internal")
             self.assertIn("cannot persist clock state", out.getvalue())
 
-    def test_datastore_document_names_the_device_clock_source(self) -> None:
-        self.assertEqual(
-            clock_sync.clock_from_datastore({"ext/clockSource": "Internal"}), "internal"
-        )
-        self.assertEqual(
-            clock_sync.clock_from_datastore({"ext/clockSource": "Optical In A"}), "optical"
-        )
-        self.assertEqual(
-            clock_sync.clock_from_datastore(
-                {
-                    "ext/clockSource": 2,
-                    "ext/clockSourceStrings": "Internal:Word Clock In:ADAT",
-                }
-            ),
-            "optical",
-        )
-        # Anything the daemon cannot name is unknown, never a clock choice.
-        self.assertIsNone(clock_sync.clock_from_datastore({"ext/clockSource": "Word Clock In"}))
+    def test_real_connect_dump_carries_exactly_one_clock_frame(self) -> None:
+        """Parse what an UltraLite mk5 actually pushed, not a guessed format."""
+        frames = connect_dump()
+        values = [clock_sync.clock_source_value(frame) for frame in frames]
+        found = [value for value in values if value is not None]
+        # Captured while the rig ran the streamer source on the internal clock.
+        self.assertEqual(found, [3])
+        self.assertEqual(clock_sync.MOTU_CLOCK_SOURCE_VALUES[3], "internal")
+        # Neighbouring parameters in the same dump are not the clock:
+        # sample rate (10), clock lock flags (15, 16), meters (6000).
+        self.assertIsNone(clock_sync.clock_source_value(bytes.fromhex("000a00000002ee00")))
+        self.assertIsNone(clock_sync.clock_source_value(bytes.fromhex("000f000001")))
+        self.assertIsNone(clock_sync.clock_source_value(frames[-1]))
+        # A client-style write frame carries a length field and is not a report.
         self.assertIsNone(
-            clock_sync.clock_from_datastore(
-                {"ext/clockSource": 9, "ext/clockSourceStrings": "Internal"}
-            )
+            clock_sync.clock_source_value(bytes.fromhex(clock_sync.CLOCK_PAYLOADS["optical"]))
         )
-        self.assertIsNone(clock_sync.clock_from_datastore({"ext/samplerate": 48000}))
-        self.assertIsNone(clock_sync.clock_from_datastore("not a document"))
 
-    def test_read_back_reports_unknown_when_the_device_cannot_be_read(self) -> None:
+    def test_write_payloads_are_the_encoding_of_the_values_read_back(self) -> None:
+        """Writes and read-back must agree on one parameter and one value set."""
+        by_name = {name: value for value, name in clock_sync.MOTU_CLOCK_SOURCE_VALUES.items()}
+        self.assertEqual(set(by_name), set(clock_sync.CLOCK_PAYLOADS))
+        for name, value in by_name.items():
+            expected = bytes([0, clock_sync.MOTU_CLOCK_SOURCE_PARAM, 0, 0, 0, 1, value])
+            self.assertEqual(bytes.fromhex(clock_sync.CLOCK_PAYLOADS[name]), expected)
+
+    def test_read_back_takes_the_clock_from_the_state_pushed_on_connect(self) -> None:
+        sock = ReplaySocket(connect_dump())
+        with mock.patch.object(clock_sync.websocket, "WebSocket", return_value=sock):
+            self.assertEqual(clock_sync.read_motu_clock(), "internal")
+        # Read-only: nothing was sent, the socket was closed, and reading
+        # stopped at the clock frame instead of draining the meter stream.
+        self.assertEqual(sock.sent, [])
+        self.assertTrue(sock.closed)
+        frames = connect_dump()
+        clock_at = frames.index(bytes.fromhex("000b000003"))
+        self.assertEqual(sock.frames, frames[clock_at + 1 :])
+
+    def test_read_back_maps_optical_and_leaves_other_sources_unknown(self) -> None:
+        def dump_with_clock(value: int) -> list[bytes]:
+            return [
+                frame[:4] + bytes([value])
+                if clock_sync.clock_source_value(frame) is not None
+                else frame
+                for frame in connect_dump()
+            ]
+
+        with mock.patch.object(
+            clock_sync.websocket, "WebSocket", return_value=ReplaySocket(dump_with_clock(2))
+        ):
+            self.assertEqual(clock_sync.read_motu_clock(), "optical")
+
+        # 0 is the device's S/PDIF input: a real source, but not one we drive.
         with (
             mock.patch.object(
-                clock_sync.urllib.request, "urlopen", side_effect=OSError("no route")
+                clock_sync.websocket, "WebSocket", return_value=ReplaySocket(dump_with_clock(0))
             ),
             mock.patch.object(clock_sync, "_next_motu_error_log", 0.0),
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
             self.assertIsNone(clock_sync.read_motu_clock())
-        self.assertIn("read-back unavailable", out.getvalue())
+        self.assertIn("neither internal nor optical", out.getvalue())
 
-        with mock.patch.object(
-            clock_sync.urllib.request,
-            "urlopen",
-            datastore_response({"ext/clockSource": "Optical"}),
+    def test_read_back_reports_unknown_when_the_device_cannot_be_read(self) -> None:
+        offline = mock.Mock()
+        offline.connect.side_effect = OSError("no route")
+        with (
+            mock.patch.object(clock_sync.websocket, "WebSocket", return_value=offline),
+            mock.patch.object(clock_sync, "_next_motu_error_log", 0.0),
+            contextlib.redirect_stdout(io.StringIO()) as out,
         ):
-            self.assertEqual(clock_sync.read_motu_clock(), "optical")
+            self.assertIsNone(clock_sync.read_motu_clock())
+        self.assertIn("read-back unavailable", out.getvalue())
+        offline.close.assert_called_once()
 
-    def test_read_back_url_is_derived_from_the_websocket_host(self) -> None:
-        self.assertEqual(
-            clock_sync._datastore_url("ws://169.254.51.193:1280"),
-            "http://169.254.51.193/datastore",
-        )
-        self.assertEqual(
-            clock_sync._datastore_url("wss://motu.local:1280"), "https://motu.local/datastore"
-        )
-        self.assertEqual(clock_sync._datastore_url("not a url"), "")
+        # Only meters, then silence: no clock frame is "unknown", not a guess.
+        meters_only = ReplaySocket([connect_dump()[-1]])
+        with (
+            mock.patch.object(clock_sync.websocket, "WebSocket", return_value=meters_only),
+            mock.patch.object(clock_sync, "_next_motu_error_log", 0.0),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            self.assertIsNone(clock_sync.read_motu_clock())
+        self.assertIn("read-back unavailable", out.getvalue())
+        self.assertEqual(meters_only.sent, [])
 
     def test_main_skips_redundant_clock_write_after_restart(self) -> None:
         client = mock.Mock()
@@ -319,12 +376,51 @@ class ClockSyncTests(unittest.TestCase):
                 mock.patch.object(
                     clock_sync.time, "sleep", side_effect=stop_after_second_iteration
                 ),
+                # Passes far enough apart for the re-write back-off to expire.
+                mock.patch.object(
+                    clock_sync.time, "monotonic", side_effect=itertools.count(0, 100)
+                ),
                 contextlib.redirect_stdout(io.StringIO()),
                 self.assertRaises(KeyboardInterrupt),
             ):
                 clock_sync.main()
 
         self.assertEqual(set_clock.call_args_list, [mock.call("optical"), mock.call("optical")])
+
+    def test_main_does_not_rewrite_a_refused_clock_every_pass(self) -> None:
+        """Each write re-locks the MOTU audibly; a refusal must not loop it."""
+        client = mock.Mock()
+        client.is_connected.return_value = True
+        client.config.active.return_value = {"devices": {"samplerate": 48000}}
+        client.config.file_path.return_value = "/tmp/toslink.yml"
+        sleeps = 0
+
+        def stop_after_fifth_iteration(_seconds: float) -> None:
+            nonlocal sleeps
+            sleeps += 1
+            if sleeps == 5:
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as tmp, (
+            mock.patch.object(clock_sync, "STATE_PATH", Path(tmp) / "motu-clock-source")
+        ):
+            with (
+                mock.patch.object(clock_sync, "CamillaClient", return_value=client),
+                mock.patch.object(clock_sync, "read_motu_clock", return_value="internal"),
+                mock.patch.object(clock_sync, "set_motu_clock", return_value=True) as set_clock,
+                mock.patch.object(
+                    clock_sync.time, "sleep", side_effect=stop_after_fifth_iteration
+                ),
+                # One pass per second, well inside the re-write back-off.
+                mock.patch.object(
+                    clock_sync.time, "monotonic", side_effect=itertools.count(0, 1)
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaises(KeyboardInterrupt),
+            ):
+                clock_sync.main()
+
+        self.assertEqual(set_clock.call_args_list, [mock.call("optical")])
 
     def test_main_retries_a_failed_clock_command_without_a_rate_change(self) -> None:
         client = mock.Mock()
@@ -392,48 +488,3 @@ def test_clock_send_failure_is_not_latched_and_equal_rates_use_source_identity()
 
 if __name__ == "__main__":
     unittest.main()
-
-
-def _reload_clock_sync(env: dict):
-    """Re-import clock_sync with a patched environment."""
-    import importlib, os, sys
-    saved = {k: os.environ.get(k) for k in env}
-    os.environ.update({k: v for k, v in env.items()})
-    for k, v in env.items():
-        if v is None:
-            os.environ.pop(k, None)
-    try:
-        import clock_sync
-        return importlib.reload(clock_sync)
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-def test_datastore_read_back_can_be_switched_off_explicitly() -> None:
-    """An interface that serves no datastore must be able to stop being asked.
-
-    Unset means "derive it from the WebSocket host"; set-but-empty means
-    "this device has none". Conflating the two left a USB-only interface
-    logging a failed read-back forever with no way to silence it.
-    """
-    import importlib
-
-    derived = _reload_clock_sync({"MOTU_WS_URL": "ws://10.0.0.5:1280"})
-    assert derived.MOTU_DATASTORE_URL == "http://10.0.0.5/datastore"
-
-    disabled = _reload_clock_sync(
-        {"MOTU_WS_URL": "ws://10.0.0.5:1280", "MOTU_DATASTORE_URL": ""}
-    )
-    assert disabled.MOTU_DATASTORE_URL == ""
-    # And it must not even attempt a request, so nothing is logged.
-    assert disabled.read_motu_clock() is None
-
-    explicit = _reload_clock_sync(
-        {"MOTU_WS_URL": "ws://10.0.0.5:1280",
-         "MOTU_DATASTORE_URL": "http://elsewhere/ds"}
-    )
-    assert explicit.MOTU_DATASTORE_URL == "http://elsewhere/ds"
