@@ -320,14 +320,16 @@ class EngineUninstallTests(unittest.TestCase):
 
 
 class EngineInstallRollbackTests(unittest.TestCase):
-    """A failed install must put back what was running a moment ago.
+    """Every failure after the live engine is replaced must put back what was
+    running a moment ago - binary and receipt together.
 
-    The toolchain and service are shimmed; the health check fails because the
-    restarted unit never reports as active, which is the rollback path."""
+    The toolchain and the service are shimmed.  ``failpoint`` picks the one
+    post-swap step that fails; the rest behave like a healthy Pi."""
 
     STOCK = b"stock camilladsp from the distribution\n"
     PREVIOUS = b"ISO 226 camilladsp from an earlier successful install\n"
-    CANDIDATE = b"ISO 226 camilladsp candidate that fails its health check\n"
+    CANDIDATE = b"ISO 226 camilladsp candidate being installed\n"
+    FAILPOINTS = ("restart", "health", "show", "receipt")
 
     def _receipt(self, payload: bytes) -> str:
         digest = hashlib.sha256(payload).hexdigest()
@@ -336,15 +338,30 @@ class EngineInstallRollbackTests(unittest.TestCase):
             f'"binary_sha256":"{digest}","installed_at":1758326400}}\n'
         )
 
-    def _install(self, root: Path) -> subprocess.CompletedProcess[str]:
+    def _install(self, root: Path, failpoint: str = "") -> subprocess.CompletedProcess[str]:
         binaries = root / "bin"
         binaries.mkdir(exist_ok=True)
         target = root / "camilladsp"
         candidate = root / "candidate"
         candidate.write_bytes(self.CANDIDATE)
-        _shim(binaries, "sudo", 'exec "$@"')
+        restarts = root / "restarts"
+        # The receipt publish is the only 0644 install whose source is the
+        # freshly written marker; rollback's copy is previous-iso226-engine.json.
+        _shim(
+            binaries,
+            "sudo",
+            'if [[ "$FAILPOINT" == receipt && "$1" == install '
+            '&& "$(basename "${@: -2:1}")" == iso226-engine.json ]]; then exit 1; fi\n'
+            'exec "$@"',
+        )
         _shim(binaries, "sleep", "exit 0")
         _shim(binaries, "rustc", 'echo "rustc 1.90.0 (shim)"')
+        _shim(
+            binaries,
+            "readlink",
+            f'if [[ "${{@: -1}}" == /proc/* ]]; then echo {target}; '
+            'else exec /usr/bin/readlink "$@"; fi',
+        )
         _shim(
             binaries,
             "git",
@@ -364,14 +381,19 @@ class EngineInstallRollbackTests(unittest.TestCase):
             f'printf "%s\\n" "$*" >> {root / "systemctl.log"}\n'
             'case "$1" in\n'
             f'  cat) echo "ExecStart={target} -p 1234 config.yml" ;;\n'
-            "  show) echo '' ;;\n"
-            "  is-active) exit 3 ;;\n"
+            # Preflight tolerates a failing show; the post-swap one must not.
+            '  show) [[ "$FAILPOINT" == show && -e ' + str(restarts) + ' ]] && exit 1\n'
+            "        echo 1234 ;;\n"
+            f'  restart) echo x >> {restarts}\n'
+            f'           [[ "$FAILPOINT" == restart && $(wc -l < {restarts}) -eq 1 ]] && exit 1 ;;\n'
+            '  is-active) [[ "$FAILPOINT" == health ]] && exit 3 ;;\n'
             "esac\nexit 0",
         )
         environment = os.environ.copy()
         environment.update(
             PATH=f"{binaries}:{environment['PATH']}",
             HOME=str(root),
+            FAILPOINT=failpoint,
             CDSP_CONFIG_DIR=str(root / "configs"),
             CDSP_AUTOMATION_CAMILLADSP_TARGET=str(target),
             CDSP_AUTOMATION_CAMILLADSP_BACKUP=str(root / "camilladsp.pre-iso226"),
@@ -385,42 +407,67 @@ class EngineInstallRollbackTests(unittest.TestCase):
             check=False,
         )
 
-    def test_failed_upgrade_restores_the_previous_build_and_its_receipt(self) -> None:
+    def _upgrade_fixture(self, root: Path) -> str:
+        target = root / "camilladsp"
+        target.write_bytes(self.PREVIOUS)
+        target.chmod(0o755)
+        (root / "camilladsp.pre-iso226").write_bytes(self.STOCK)
+        receipt = self._receipt(self.PREVIOUS)
+        (root / "iso226-engine.json").write_text(receipt, encoding="utf-8")
+        return receipt
+
+    def test_a_healthy_upgrade_publishes_the_new_build_and_its_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "camilladsp"
-            target.write_bytes(self.PREVIOUS)
-            target.chmod(0o755)
-            backup = root / "camilladsp.pre-iso226"
-            backup.write_bytes(self.STOCK)
-            capability = root / "iso226-engine.json"
-            receipt = self._receipt(self.PREVIOUS)
-            capability.write_text(receipt, encoding="utf-8")
+            root = Path(directory).resolve()
+            self._upgrade_fixture(root)
 
             result = self._install(root)
 
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertIn("rolling back", result.stderr)
-            self.assertEqual(target.read_bytes(), self.PREVIOUS)
-            self.assertEqual(capability.read_text(encoding="utf-8"), receipt)
-            # The uninstall copy still names the stock engine.
-            self.assertEqual(backup.read_bytes(), self.STOCK)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual((root / "camilladsp").read_bytes(), self.CANDIDATE)
+            receipt = (root / "iso226-engine.json").read_text(encoding="utf-8")
+            self.assertIn(hashlib.sha256(self.CANDIDATE).hexdigest(), receipt)
+            self.assertEqual((root / "camilladsp.pre-iso226").read_bytes(), self.STOCK)
+
+    def test_every_post_swap_failure_restores_the_previous_build_and_receipt(
+        self,
+    ) -> None:
+        for failpoint in self.FAILPOINTS:
+            with self.subTest(failpoint=failpoint), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                receipt = self._upgrade_fixture(root)
+
+                result = self._install(root, failpoint)
+
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("restoring the previous engine", result.stderr)
+                self.assertNotIn("ROLLBACK INCOMPLETE", result.stderr)
+                self.assertEqual((root / "camilladsp").read_bytes(), self.PREVIOUS)
+                self.assertFalse((root / "camilladsp.new").exists())
+                self.assertEqual(
+                    (root / "iso226-engine.json").read_text(encoding="utf-8"), receipt
+                )
+                # The uninstall copy still names the stock engine.
+                self.assertEqual(
+                    (root / "camilladsp.pre-iso226").read_bytes(), self.STOCK
+                )
 
     def test_failed_first_install_leaves_the_stock_engine_and_no_bookkeeping(
         self,
     ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "camilladsp"
-            target.write_bytes(self.STOCK)
-            target.chmod(0o755)
+        for failpoint in self.FAILPOINTS:
+            with self.subTest(failpoint=failpoint), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                target = root / "camilladsp"
+                target.write_bytes(self.STOCK)
+                target.chmod(0o755)
 
-            result = self._install(root)
+                result = self._install(root, failpoint)
 
-            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
-            self.assertEqual(target.read_bytes(), self.STOCK)
-            self.assertFalse((root / "iso226-engine.json").exists())
-            self.assertFalse((root / "camilladsp.pre-iso226").exists())
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(target.read_bytes(), self.STOCK)
+                self.assertFalse((root / "iso226-engine.json").exists())
+                self.assertFalse((root / "camilladsp.pre-iso226").exists())
 
 
 if __name__ == "__main__":

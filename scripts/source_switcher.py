@@ -18,6 +18,7 @@ try:
 except ImportError:
     websocket = None
 
+import yaml
 from camilladsp import CamillaClient
 from audio_eq import (
     FILTER_PREFIX,
@@ -922,10 +923,24 @@ def _comparable_filter(value: object) -> object:
     return result
 
 
-def _audio_overlay_matches(actual: dict, expected: dict) -> bool:
+def _audio_overlay_matches(actual: object, expected: dict) -> bool:
+    """True once the engine holds everything an overlay write changed.
 
-    actual_filters = actual.get("filters", {})
-    expected_filters = expected.get("filters", {})
+    The overlay does more than add owned filters: it also removes legacy
+    Bass/Treble/Loudness stages and older owned names, and rewrites the
+    pipeline around them.  So the whole filter *set* and the whole pipeline
+    must match, not just the owned parts -- otherwise a bypass that never
+    applied reads as done because both sides have no owned overlay.  Owned
+    filter bodies compare through ``_comparable_filter``; other filters were
+    copied untouched from the live graph and need only be present.  An absent
+    or empty read-back never matches.
+    """
+    if not isinstance(actual, dict) or not actual:
+        return False
+    actual_filters = actual.get("filters") or {}
+    expected_filters = expected.get("filters") or {}
+    if set(actual_filters) != set(expected_filters):
+        return False
     expected_owned = {
         name: _comparable_filter(value)
         for name, value in expected_filters.items()
@@ -938,17 +953,9 @@ def _audio_overlay_matches(actual: dict, expected: dict) -> bool:
     }
     if actual_owned != expected_owned:
         return False
-    actual_steps = [
-        step
-        for step in actual.get("pipeline", [])
-        if step.get("description") == PIPELINE_DESCRIPTION
-    ]
-    expected_steps = [
-        step
-        for step in expected.get("pipeline", [])
-        if step.get("description") == PIPELINE_DESCRIPTION
-    ]
-    return actual_steps == expected_steps
+    return _without_null_fields(actual.get("pipeline") or []) == _without_null_fields(
+        expected.get("pipeline") or []
+    )
 
 
 def _without_null_fields(value: object) -> object:
@@ -982,28 +989,28 @@ def _configs_equivalent(actual: dict, expected: dict) -> bool:
     return _without_null_fields(actual) == _without_null_fields(expected)
 
 
-def _engine_parsed_config(cdsp: CamillaClient, file_path: str) -> dict | None:
-    """Return the engine's own parse of ``file_path``, or None if unavailable.
+def _engine_parsed_config(cdsp: CamillaClient, captured: dict) -> dict | None:
+    """Return the engine's own parse of the captured config, or None.
 
-    Normalization approach: let the engine define it. Asking the engine to
-    read the file yields its own deserialization, defaults filled in, so the
-    read-back comparison needs no allowlist of optional fields that would
-    drift with every upstream release.  ReadConfigFile does *not* run the
-    filename-aware validation a reload does (token substitution, relative
-    coefficient paths); ``_engine_load_view`` adds that step on top.
+    Normalization approach: let the engine define it.  Handing the engine the
+    *captured* mapping (ReadConfig) yields its deserialization with defaults
+    filled in, so the read-back comparison needs no allowlist of optional
+    fields that would drift with every upstream release.
 
-    The file we ask the engine to parse is the file we just handed it, and
-    ``apply_config`` has already checked its digest against the target, so
-    this does not widen what counts as an acceptable config.
+    It must be the captured mapping, never a fresh read of the file: an
+    operator file edited between the integrity check and the reload would
+    otherwise be parsed, loaded and then verified against itself.  ReadConfig
+    does not run the filename-aware validation a reload does (token
+    substitution, relative coefficient paths); ``_engine_load_view`` adds that.
 
     Older pycamilladsp clients (and engines that reject the request) have no
     such call; the caller then falls back to structural null-stripping.
     """
-    reader = getattr(getattr(cdsp, "config", None), "read_and_parse_file", None)
-    if reader is None:
+    parser = getattr(getattr(cdsp, "config", None), "parse_yaml", None)
+    if parser is None:
         return None
     try:
-        parsed = reader(file_path)
+        parsed = parser(yaml.safe_dump(captured, sort_keys=False))
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -1079,32 +1086,34 @@ def _engine_load_view(config: dict, config_path: str) -> dict:
     return result
 
 
+def _reference_config(cdsp: CamillaClient, file_path: str, expected: dict) -> dict:
+    """What the engine should report after loading ``file_path``.
+
+    Built only from ``expected`` -- the mapping captured (and, for managed
+    targets, digest-checked) at resolve time -- so whatever is on disk now
+    has no say in what counts as correct.  ``file_path`` only supplies the
+    directory relative coefficient paths resolve against.
+    """
+    reference = _engine_parsed_config(cdsp, expected)
+    if reference is None:
+        reference = expected
+    return _engine_load_view(reference, file_path)
+
+
+def _matches_reference(accepted: object, reference: dict) -> bool:
+    if not isinstance(accepted, dict) or not accepted:
+        return False
+    return _configs_equivalent(accepted, reference)
+
+
 def _accepted_config_matches(
     cdsp: CamillaClient,
     file_path: str,
     accepted: object,
     expected: dict,
-    *,
-    trust_file: bool = True,
 ) -> bool:
-    """Compare an accepted read-back against the requested configuration.
-
-    Asking the engine to parse ``file_path`` yields the better reference, but
-    it re-reads the file from disk.  That is only sound where the on-disk
-    bytes were proven to be the ones this target was resolved from.  Legacy
-    targets carry a raw-byte ``_file_digest`` while the integrity gate
-    compares a structural ``config_digest``, so the two cannot be checked
-    against each other and that gate skips them -- for those, compare against
-    the mapping read at resolve time instead of trusting the file, so a config
-    swapped underneath us cannot verify itself.  Null-stripping applies to
-    both sides either way, so the materialization fix holds in both modes.
-    """
-    if not isinstance(accepted, dict) or not accepted:
-        return False
-    reference = _engine_parsed_config(cdsp, file_path) if trust_file else None
-    if reference is None:
-        reference = expected
-    return _configs_equivalent(accepted, _engine_load_view(reference, file_path))
+    """Compare an accepted read-back against the captured configuration."""
+    return _matches_reference(accepted, _reference_config(cdsp, file_path, expected))
 
 
 def _await_active_config(
@@ -1114,7 +1123,6 @@ def _await_active_config(
     *,
     timeout: float | None = None,
     poll_interval: float | None = None,
-    trust_file: bool = True,
 ) -> None:
     """Poll until the engine reports the requested config, or fail closed.
 
@@ -1127,11 +1135,10 @@ def _await_active_config(
     if poll_interval is None:
         poll_interval = CONFIG_APPLY_POLL_INTERVAL
     poll_interval = max(poll_interval, 0.01)
+    reference = _reference_config(cdsp, file_path, expected)
     deadline = time.monotonic() + max(timeout, 0.0)
     while True:
-        if _accepted_config_matches(
-            cdsp, file_path, cdsp.config.active(), expected, trust_file=trust_file
-        ):
+        if _matches_reference(cdsp.config.active(), reference):
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(
@@ -1152,7 +1159,7 @@ def _submit_audio_overlay(cdsp: CamillaClient, updated: dict) -> None:
     poll_interval = max(CONFIG_APPLY_POLL_INTERVAL, 0.01)
     deadline = time.monotonic() + max(CONFIG_APPLY_TIMEOUT, 0.0)
     while True:
-        if _audio_overlay_matches(cdsp.config.active() or {}, updated):
+        if _audio_overlay_matches(cdsp.config.active(), updated):
             return
         if time.monotonic() >= deadline:
             raise RuntimeError("CamillaDSP did not confirm the requested audio overlay")
@@ -1313,12 +1320,7 @@ def apply_config(
         if target:
             expected = target.get("expected_config")
             if expected is not None:
-                _await_active_config(
-                    cdsp,
-                    file_path,
-                    expected,
-                    trust_file=not target.get("legacy", False),
-                )
+                _await_active_config(cdsp, file_path, expected)
 
         if target and target.get("selection_revision") is not None:
             current_selection = current_speaker_selection()

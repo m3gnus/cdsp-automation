@@ -11,6 +11,7 @@ import types
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
+from typing import Callable
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
@@ -217,7 +218,7 @@ class FakeSwitcherConfig:
         *,
         apply_after: int = 0,
         active_config: dict | None = None,
-        parses_files: bool = True,
+        parses_yaml: bool = True,
     ) -> None:
         self.path = path
         self.applied_path = path
@@ -227,8 +228,11 @@ class FakeSwitcherConfig:
         self.file_description = description
         self.live_description = description
         self.pinned: dict | None = None
-        if parses_files:
+        if parses_yaml:
             # Newer pycamilladsp clients expose the engine's own parser.
+            self.parse_yaml = self._parse_yaml
+            # Real clients also offer ReadConfigFile; verification must not
+            # use it, since it re-reads a file that may have changed.
             self.read_and_parse_file = self._read_and_parse_file
 
     @staticmethod
@@ -240,6 +244,9 @@ class FakeSwitcherConfig:
 
     def _read_and_parse_file(self, path: str) -> dict:
         return engine_materialized(self._load(path))
+
+    def _parse_yaml(self, text: str) -> dict:
+        return engine_materialized(yaml.safe_load(text) or {})
 
     def file_path(self) -> str:
         return self.path
@@ -590,6 +597,79 @@ def test_measurement_bypass_is_not_reported_flat_until_the_engine_is() -> None:
     assert statuses == []
 
 
+def _legacy_tone_config() -> dict:
+    """An older config with its own Bass shelf wired into the pipeline."""
+    return {
+        "devices": {"capture": {"channels": 2}},
+        "filters": {
+            "bass": {
+                "type": "Biquad",
+                "parameters": {"type": "Lowshelf", "freq": 100, "gain": 6, "q": 0.7},
+            },
+            "hp": {
+                "type": "Biquad",
+                "parameters": {"type": "Highpass", "freq": 20, "q": 0.7},
+            },
+        },
+        "pipeline": [
+            {"type": "Filter", "channels": [0, 1], "names": ["hp", "bass"]},
+        ],
+    }
+
+
+def test_bypass_is_not_confirmed_while_a_legacy_stage_is_still_live() -> None:
+    """No owned overlay on either side must not read as 'removal applied'."""
+    state = audio_eq.default_audio_state()
+    live = QueuedLiveConfig(_legacy_tone_config(), apply_after=10**6)
+    client = SimpleNamespace(config=live)
+    statuses: list[dict] = []
+    with (
+        patch.object(switcher, "time", FakeClock()),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", 2.0),
+        patch.object(switcher, "load_profile", return_value={"bypass_user_eq": True}),
+        patch.object(switcher, "_write_audio_eq_status", side_effect=statuses.append),
+    ):
+        with pytest.raises(RuntimeError, match="did not confirm"):
+            switcher.ensure_audio_eq(client, speaker_id="measurement", state=state)
+    assert "bass" in live.value["filters"]
+    assert statuses == []
+
+
+def test_bypass_waits_through_a_missing_active_config() -> None:
+    state = audio_eq.default_audio_state()
+
+    class Flaky(QueuedLiveConfig):
+        """Applies on time, but reads back nothing for a few polls first."""
+
+        def __init__(self, value: dict) -> None:
+            super().__init__(value, apply_after=0)
+            self.gaps = 3
+
+        def active(self):  # type: ignore[override]
+            if self.pending is not None and self.gaps > 0:
+                self.gaps -= 1
+                return None
+            return super().active()
+
+    live = Flaky(_legacy_tone_config())
+    client = SimpleNamespace(config=live)
+    clock = FakeClock()
+    with (
+        patch.object(switcher, "time", clock),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", 5.0),
+        patch.object(switcher, "load_profile", return_value={"bypass_user_eq": True}),
+        patch.object(switcher, "_write_audio_eq_status"),
+    ):
+        switcher.ensure_audio_eq(client, speaker_id="measurement", state=state)
+    assert live.gaps == 0 and len(clock.slept) == 3
+    assert "bass" not in live.value["filters"]
+    assert live.value["pipeline"][0]["names"] == ["hp"]
+
+    # And an engine that never reports a config is never confirmed.
+    assert not switcher._audio_overlay_matches(None, {"filters": {}, "pipeline": []})
+    assert not switcher._audio_overlay_matches({}, {"filters": {}, "pipeline": []})
+
+
 def test_read_back_accepts_relative_and_tokenized_coefficient_paths(
     tmp_path: Path,
 ) -> None:
@@ -617,15 +697,13 @@ def test_read_back_accepts_relative_and_tokenized_coefficient_paths(
     active["filters"]["lf"]["parameters"]["filename"] = os.path.join(
         resolved_dir, "coeffs/lf.txt"
     )
-    for parses_files in (True, False):
+    for parses_yaml in (True, False):
         client = SimpleNamespace(
-            config=FakeSwitcherConfig(str(config_path), parses_files=parses_files)
+            config=FakeSwitcherConfig(str(config_path), parses_yaml=parses_yaml)
         )
-        for trust_file in (True, False):
-            assert switcher._accepted_config_matches(
-                client, str(config_path), engine_materialized(active), on_disk,
-                trust_file=trust_file,
-            )
+        assert switcher._accepted_config_matches(
+            client, str(config_path), engine_materialized(active), on_disk
+        )
 
     # Spelling is forgiven; a different coefficient file is not.
     other = copy.deepcopy(active)
@@ -985,6 +1063,7 @@ def run_verified_switch(
     clock: FakeClock | None = None,
     timeout: float = 1.0,
     poll_interval: float = 0.25,
+    before_reload: Callable[[Path], None] | None = None,
     **config_kwargs: object,
 ) -> tuple[SimpleNamespace, Exception | None]:
     """Apply a config whose target carries expected_config, capturing failure."""
@@ -999,6 +1078,14 @@ def run_verified_switch(
         volume=FakeSwitcherVolume(),
         general=FakeSwitcherGeneral(["running", "running"]),
     )
+    if before_reload is not None:
+        reload = client.general.reload
+
+        def hooked_reload() -> None:
+            before_reload(target_path)
+            reload()
+
+        client.general.reload = hooked_reload
     target = {
         "speaker": "partymeh",
         "source": "streamer",
@@ -1048,15 +1135,42 @@ def test_omitted_optional_device_fields_round_trip_through_verification(
 def test_verification_tolerates_materialized_nulls_without_engine_parsing(
     tmp_path: Path,
 ) -> None:
-    """Older clients without ReadConfigFile fall back to null-stripping."""
+    """Older clients without ReadConfig fall back to null-stripping."""
     statuses: list[dict] = []
     client, error = run_verified_switch(
-        tmp_path, MINIMAL_ALSA_CONFIG, statuses=statuses, parses_files=False
+        tmp_path, MINIMAL_ALSA_CONFIG, statuses=statuses, parses_yaml=False
     )
-    assert not hasattr(client.config, "read_and_parse_file")
+    assert not hasattr(client.config, "parse_yaml")
     assert error is None
     assert client.volume.mute is False
     assert statuses[-1]["ok"] is True
+
+
+def test_operator_file_swapped_after_the_integrity_check_cannot_verify_itself(
+    tmp_path: Path,
+) -> None:
+    """The engine loads what is on disk at reload; verify the captured config."""
+    captured = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    captured["devices"]["playback"]["volume_limit"] = -20.0
+    swapped = copy.deepcopy(captured)
+    swapped["devices"]["playback"]["volume_limit"] = 0.0
+
+    def swap(path: Path) -> None:
+        path.write_text(yaml.safe_dump(swapped, sort_keys=False), encoding="utf-8")
+
+    for parses_yaml in (True, False):
+        statuses: list[dict] = []
+        client, error = run_verified_switch(
+            tmp_path,
+            captured,
+            statuses=statuses,
+            before_reload=swap,
+            parses_yaml=parses_yaml,
+        )
+        assert isinstance(error, RuntimeError), error
+        assert "differs" in str(error)
+        assert client.volume.mute is True
+        assert statuses[-1]["ok"] is False
 
 
 def test_verification_still_rejects_a_genuinely_different_active_config(

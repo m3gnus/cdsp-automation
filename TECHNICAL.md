@@ -62,10 +62,21 @@ CamillaDSP answers `SetConfig` and `SetConfigValue` once the change is
 (including the measurement bypass), readiness stamp - therefore polls for its
 own expected state against `SOURCE_CONFIG_APPLY_TIMEOUT` instead of reading back
 once. The stamp falls back to a whole-config write only when `SetConfigValue`
-was rejected or never took within that deadline. The reload read-back compares
-against the file with the preprocessing a reload applies (`$samplerate$` /
-`$channels$` tokens, relative Conv coefficient paths resolved against the
-canonical config directory), because `ReadConfigFile` skips that step.
+was rejected or never took within that deadline. An EQ write is confirmed only
+when the whole filter set and pipeline match, so a bypass that has not yet
+removed a legacy Bass/Treble/Loudness stage, or an engine reporting no config,
+never reads as done.
+
+The reload read-back compares against the config *captured* at resolve time
+(digest-checked for managed targets), never a fresh read of the file: an
+operator file edited between the integrity check and the reload is what the
+engine loads, and must not be able to verify itself. The engine normalizes the
+captured mapping (`ReadConfig`), and the preprocessing a reload applies is
+added on top (`$samplerate$`/`$channels$` tokens, relative Conv coefficient
+paths resolved against the canonical config directory), because `ReadConfig`
+skips that step. A swapped file therefore fails verification and rolls back
+muted; the engine is not handed an immutable snapshot, so the edit is rejected
+rather than prevented.
 
 ### Volume limits
 

@@ -124,8 +124,9 @@ re-verifies it.
 The all-utilities install also:
 
 - builds the pinned CamillaDSP 4.1.3 ISO 226 patch, runs the full Rust library
-  suite plus deployed-config checks, and rolls back automatically if the new
-  process is not healthy;
+  suite plus deployed-config checks, and rolls back automatically if anything
+  fails between replacing the engine and publishing its receipt - restoring
+  the engine and receipt that were in place just before the attempt;
 - installs a persistent network-volume daemon and a non-blocking Shairport
   callback, backs up/validates its configuration, and restores the original
   volume settings on uninstall;

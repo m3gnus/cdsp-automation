@@ -10,7 +10,32 @@ BUILD_DIR="$(mktemp -d)"
 TARGET="${CDSP_AUTOMATION_CAMILLADSP_TARGET:-/usr/local/bin/camilladsp}"
 BACKUP="${CDSP_AUTOMATION_CAMILLADSP_BACKUP:-$TARGET.pre-iso226}"
 CAPABILITY="${ISO226_CAPABILITY_PATH:-/var/lib/cdsp-automation/iso226-engine.json}"
-trap 'rm -rf "$BUILD_DIR"' EXIT
+# Armed from the moment the live engine is touched until its receipt is
+# published; any exit in between - a failed check, a failing command under
+# set -e, INT/TERM - restores the pre-attempt snapshot before cleaning up.
+rollback_armed=false
+on_exit() {
+  local status=$?
+  trap - EXIT INT TERM
+  local keep_build_dir=false
+  if [[ "$rollback_armed" == true ]]; then
+    rollback_armed=false
+    set +e
+    [[ $status -eq 0 ]] && status=1
+    echo "ISO 226 install did not complete (exit $status); restoring the previous engine." >&2
+    if ! rollback; then
+      keep_build_dir=true
+      echo "ROLLBACK INCOMPLETE: restore $TARGET and $CAPABILITY by hand from $BUILD_DIR" >&2
+    fi
+  fi
+  if [[ "$keep_build_dir" == false ]]; then
+    rm -rf "$BUILD_DIR"
+  fi
+  exit "$status"
+}
+trap on_exit EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # The Pi only ever has sha256sum; the test-suite also runs on machines that
 # ship shasum instead, and both must agree with the digest in the receipt.
@@ -167,39 +192,47 @@ if [[ -f "$CAPABILITY" ]]; then
   had_receipt=true
   cp "$CAPABILITY" "$SNAPSHOT_RECEIPT"
 fi
+# Runs from on_exit with errexit off; every step is attempted and any failure
+# is reported, so a half-restored engine is never silent.
 rollback() {
+  local ok=0
+  sudo rm -f "$TARGET.new" || ok=1
   if [[ "$had_target" == true ]]; then
-    sudo install -m 0755 "$SNAPSHOT" "$TARGET"
+    sudo install -m 0755 "$SNAPSHOT" "$TARGET" || ok=1
   else
-    sudo rm -f "$TARGET"
+    sudo rm -f "$TARGET" || ok=1
   fi
   if [[ "$had_receipt" == true ]]; then
-    sudo install -m 0644 "$SNAPSHOT_RECEIPT" "$CAPABILITY"
+    sudo install -m 0644 "$SNAPSHOT_RECEIPT" "$CAPABILITY" || ok=1
   else
-    sudo rm -f "$CAPABILITY"
+    sudo rm -f "$CAPABILITY" || ok=1
   fi
   # Nothing of ours was ever installed, so there is nothing to uninstall back
   # to; a leftover copy would only go stale behind a later stock upgrade.
   if [[ "$created_backup" == true ]]; then
-    sudo rm -f "$BACKUP"
+    sudo rm -f "$BACKUP" || ok=1
   fi
-  sudo systemctl restart camilladsp.service || true
+  if ! sudo systemctl restart camilladsp.service; then
+    echo "camilladsp.service did not restart after rollback" >&2
+    ok=1
+  fi
+  return "$ok"
 }
 
+rollback_armed=true
 sudo install -m 0755 "$CANDIDATE" "$TARGET.new"
 sudo mv "$TARGET.new" "$TARGET"
-if ! sudo systemctl restart camilladsp.service; then rollback; exit 1; fi
+sudo systemctl restart camilladsp.service
 sleep 3
 pid="$(systemctl show -p MainPID --value camilladsp.service)"
 if ! systemctl is-active --quiet camilladsp.service || [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] || [[ "$(sudo readlink -f "/proc/$pid/exe")" != "$TARGET" ]]; then
   echo "CamillaDSP did not start from the tested candidate; rolling back." >&2
-  rollback
   exit 1
 fi
-install_user="$(id -un)"
-sudo install -d -m 0750 -o "$install_user" -g "$install_user" /var/lib/cdsp-automation
+sudo install -d -m 0750 -o "$(id -un)" -g "$(id -gn)" "$(dirname "$CAPABILITY")"
 marker="$BUILD_DIR/iso226-engine.json"
 binary_sha256="$(sha256_of "$CANDIDATE")"
 printf '{"engine":"Iso226","upstream_commit":"%s","binary_sha256":"%s","installed_at":%s}\n' "$UPSTREAM_COMMIT" "$binary_sha256" "$(date +%s)" > "$marker"
 sudo install -m 0644 "$marker" "$CAPABILITY"
+rollback_armed=false
 echo "Installed ISO 226-enabled CamillaDSP at /usr/local/bin/camilladsp"
