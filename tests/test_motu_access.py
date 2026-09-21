@@ -46,15 +46,16 @@ def test_deferrable_accesses_keep_the_window_from_any_recorded_access() -> None:
     clock = FakeClock()
     access = access_at(clock)
 
+    window = motu_access.DEFAULT_WINDOW_SECONDS
     access.claim("clock-readback", deferrable=True)
-    clock.now += 4
+    clock.now += window - 1
     with pytest.raises(motu_access.AccessDeferred) as deferred:
         access.claim("ui-volume", deferrable=True)
-    assert deferred.value.retry_after == pytest.approx(11.0)
+    assert deferred.value.retry_after == pytest.approx(1.0)
     assert deferred.value.last_kind == "clock-readback"
-    assert access.retry_after() == pytest.approx(11.0)
+    assert access.retry_after() == pytest.approx(1.0)
 
-    clock.now += 11
+    clock.now += 1
     access.claim("ui-volume", deferrable=True)
     assert access.last_access() == (clock.now, "ui-volume")
 
@@ -63,16 +64,149 @@ def test_a_clock_write_is_never_deferred_but_is_respected() -> None:
     clock = FakeClock()
     access = access_at(clock)
 
+    window = motu_access.DEFAULT_WINDOW_SECONDS
     access.claim("ui-volume", deferrable=True)
     clock.now += 1
     # A source change's clock write goes straight through the window...
     assert access.claim("clock-write", deferrable=False) == clock.now
-    # ...and restarts it for everything deferrable.
-    clock.now += 14
+    # ...and restarts it for everything deferrable: measured from the write,
+    # one second is still left, where from the earlier access none would be.
+    clock.now += window - 1
     with pytest.raises(motu_access.AccessDeferred) as deferred:
         access.claim("clock-readback", deferrable=True)
     assert deferred.value.last_kind == "clock-write"
     assert deferred.value.retry_after == pytest.approx(1.0)
+
+
+
+# ------------------------------------------- is the window safe for TOSLINK?
+#
+# Runs the real meter reader, meter parsing, TOSLINK timers and access record
+# through minutes of playback in simulated time. Only the MOTU socket and the
+# clock are fakes: the socket sends the device's ~0.12 s settings dump and then
+# genuine 104-byte meter frames with TOSLINK present, and -- like the real
+# one-client device -- drops the reader mid-read whenever an extra access lands.
+
+def _toslink_passes_lost(window, pass_seconds, phase, *, minutes=2.0):
+    """Passes on which TOSLINK was unavailable, accesses ``window`` s apart."""
+    import pathlib
+    import tempfile
+    import types
+    from unittest import mock
+
+    class Clock:
+        now = 1000.0
+
+    clock = Clock()
+    body = bytearray([255] * 100)
+    for pair in source_switcher.TOSLINK_METER_PAIRS:
+        body[pair * 2] = body[pair * 2 + 1] = 0  # present: below the threshold
+    frame = bytes.fromhex("17700000") + bytes(body)
+    record = pathlib.Path(tempfile.mkdtemp()) / "motu-access.lock"
+
+    def access():
+        return motu_access.MotuAccess(
+            clock=lambda: clock.now, path=record, boot_id=lambda: "sim"
+        )
+
+    other = access()
+    # Worst case the window allows: deferrable accesses exactly ``window`` s
+    # apart, each chased by a clock write (which the window never delays).
+    due = []
+    t = clock.now + phase
+    while t < clock.now + minutes * 60 + window:
+        due += [t, t + 0.3]
+        t += window
+    live = {"socket": None}
+
+    def land(until):
+        while due and due[0] <= until:
+            due.pop(0)
+            other.claim("ui-volume", deferrable=False)
+            if live["socket"] is not None:
+                live["socket"].dropped = True
+
+    class Socket:
+        dropped, opened = False, 0.0
+
+        def settimeout(self, _timeout):
+            pass
+
+        def connect(self, _url, timeout=1):
+            self.opened, self.dropped = clock.now, False
+            live["socket"] = self
+
+        def recv_data(self, control_frame=True):
+            clock.now += 0.03
+            land(clock.now)
+            if self.dropped:
+                raise ConnectionResetError("[Errno 104] Connection reset by peer")
+            if clock.now < self.opened + 0.12:
+                return 2, bytes.fromhex("000b000003")  # settings dump
+            return 2, frame
+
+        def close(self):
+            pass
+
+    fake_websocket = types.SimpleNamespace(
+        WebSocket=Socket,
+        WebSocketTimeoutException=TimeoutError,
+        ABNF=types.SimpleNamespace(OPCODE_BINARY=2),
+    )
+    lost = 0
+    with mock.patch.object(source_switcher, "websocket", fake_websocket), \
+            mock.patch("time.monotonic", lambda: clock.now), \
+            contextlib.redirect_stdout(io.StringIO()):
+        reader = source_switcher.MotuMeterReader("ws://motu:1280", access=access())
+        active, idle = 0.0, source_switcher.TOSLINK_IDLE_SECONDS
+        settled, end = clock.now + 10, clock.now + minutes * 60
+        while clock.now < end:
+            started = clock.now
+            land(clock.now)
+            present = source_switcher.meter_pairs_active(
+                reader.read(), source_switcher.TOSLINK_METER_PAIRS
+            )
+            active, idle = source_switcher.update_meter_timers(
+                present, active, idle, source_switcher.TOSLINK_IDLE_SECONDS
+            )
+            available = (
+                active >= source_switcher.TOSLINK_ACTIVE_SECONDS
+                and idle < source_switcher.TOSLINK_IDLE_SECONDS
+            )
+            if clock.now > settled and not available:
+                lost += 1
+            land(started + pass_seconds)
+            clock.now = max(clock.now, started + pass_seconds)
+    return lost
+
+
+def test_default_window_keeps_toslink_through_back_to_back_accesses() -> None:
+    """At the default window TOSLINK never loses a pass during normal playback.
+
+    A normal switcher pass is a 1 s sleep plus a 0.2 s meter read, and runs a
+    little longer under load. Every landing moment across a pass is tried.
+    """
+    window = motu_access.DEFAULT_WINDOW_SECONDS
+    for pass_seconds in (1.0, 1.2, 1.5, 2.0):
+        for phase in (0.0, 0.3, 0.6, 0.9, 1.2, 1.5, 1.8):
+            lost = _toslink_passes_lost(window, pass_seconds, phase)
+            assert lost == 0, (
+                f"TOSLINK lost {lost} passes: window {window} s, "
+                f"pass {pass_seconds} s, phase {phase} s"
+            )
+
+
+def test_toslink_simulation_detects_accesses_landing_once_per_pass() -> None:
+    """The harness above must be able to fail, or its passing proves nothing.
+
+    Accesses landing about once per switcher pass leave the reader no pass in
+    which to read a fresh frame, so TOSLINK drops. This is also the real limit
+    on the window: it must stay comfortably wider than a switcher pass. The
+    failure needs the accesses to line up with the reads, so it appears at only
+    a few landing moments -- sweep them all rather than pick one.
+    """
+    worst = max(_toslink_passes_lost(2.0, 2.0, i * 0.1) for i in range(20))
+    assert worst > 0
 
 
 def test_records_from_another_boot_or_the_future_or_garbage_are_ignored() -> None:

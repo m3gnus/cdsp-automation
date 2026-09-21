@@ -1435,7 +1435,10 @@ def test_motu_volume_burst_is_answered_429_with_retry_after() -> None:
         )
         second.do_POST()
     assert second.status == HTTPStatus.TOO_MANY_REQUESTS
-    assert second.response_body()["retry_after"] == 14.0
+    import motu_access
+
+    # One second into the window, the rest of it remains.
+    assert second.response_body()["retry_after"] == motu_access.DEFAULT_WINDOW_SECONDS - 1
     assert len(device.sockets) == 1
 
 
@@ -1526,5 +1529,5 @@ def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
     assert "motu_access.py motu_volume.py web_ui.py" in installer
     assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
-    assert "\nMOTU_ACCESS_WINDOW_SECONDS=15\n" in installer
+    assert "\nMOTU_ACCESS_WINDOW_SECONDS=5\n" in installer
     assert "\nMOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock\n" in installer

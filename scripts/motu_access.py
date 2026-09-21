@@ -45,7 +45,16 @@ DEFAULT_ACCESS_PATH = "/var/lib/cdsp-automation/motu-access.lock"
 # to notice a drop and reconnect (a switcher pass or two), so that even a
 # reader that did back off is connectable again before the next deferrable
 # access.
-DEFAULT_WINDOW_SECONDS = 15.0
+# Deferrable accesses are kept at least this far apart. Each one drops the
+# source switcher's meters, and the reader reconnects on its next pass because
+# the drop is recorded here (forgive_coordinated_kick), so it no longer waits
+# out its 10 s reconnect backoff. The window therefore only has to exceed one
+# switcher pass (about 1.2 s: a 1 s sleep plus a 0.2 s meter read), so that
+# the meters read a fresh frame between accesses. 5 s was checked against the
+# real reader, timers and access record: at normal passes TOSLINK never loses
+# a pass of meter data, and it only drops when accesses land roughly once per
+# pass. See TECHNICAL.md, "Choosing the window".
+DEFAULT_WINDOW_SECONDS = 5.0
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 
 # Bound at import: tests (and callers) that patch time.monotonic to script

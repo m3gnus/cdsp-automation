@@ -238,13 +238,39 @@ window) plus one pass to reconnect, and the dump before the first meter frame
 (0.12 s measured). That is about 2.5-3.5 s. It happened once on a live read:
 the drop was logged and the reader reconnected 1.1 s later. Held values cover
 the first 2 s, so the TOSLINK idle counter advances by at most about 1.5 s of
-its 5 s. Deferrable accesses are at least 15 s from every other extra access,
-so their gaps never stack. The only possible stacking is a clock write right
+its 5 s. Deferrable accesses are at least `MOTU_ACCESS_WINDOW_SECONDS` (5 s)
+from every other extra access, so their gaps never stack. The only possible stacking is a clock write right
 after a deferrable access. If the write lands before the reader has
 reconnected, both drops fall inside one gap. If it lands just after the
 reconnect but before the first meter frame, the gaps merge to about 5-6 s of
 no fresh meters. That is still under the ~7 s tolerance, with the idle
 counter reaching about 4 s. Previously that case stayed dark for ~10 s.
+
+**Choosing the window.** The window used to be 15 s, sized to exceed the
+meter reader's 10 s reconnect backoff. A recorded access no longer waits out
+that backoff, so the window only has to exceed one switcher pass: a 1 s sleep
+plus a 0.2 s meter read. It was checked by driving the real reader, meter
+parsing, TOSLINK timers and access record through minutes of simulated
+playback, with a fake one-client MOTU that drops the reader mid-read on every
+access and a clock write chasing each deferrable access. The window was swept
+against switcher passes of 1-6 s and every landing moment across a pass:
+
+- At normal passes (1-2 s), 3 s and wider never cost TOSLINK a single pass of
+  meter data. 5 s keeps it at zero, with margin, even at a 4.5 s pass.
+- TOSLINK drops only when accesses land about once per switcher pass, so the
+  reader never gets a pass with a fresh frame -- 2 s accesses against 2 s
+  passes, or 5 s against 5 s. Even then it takes a few specific landing
+  moments to line up.
+
+At 5 s that needs switcher passes stretched to about 5 s, one after another.
+A pass only runs that long inside `apply_config`, during a source change, so
+it takes several source changes in a row, each chased by a MOTU volume change
+landing in step, while TOSLINK is the source. Normal playback runs 1.2 s
+passes and is not exposed. `test_default_window_keeps_toslink_through_back_to_back_accesses`
+runs that simulation at the default window, and
+`test_toslink_simulation_detects_accesses_landing_once_per_pass` shows it can
+fail. Raise `MOTU_ACCESS_WINDOW_SECONDS` if a site needs more margin; it trades
+it for a slower response between MOTU changes.
 
 ---
 

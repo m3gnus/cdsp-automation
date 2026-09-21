@@ -310,25 +310,27 @@ def test_device_access_is_rate_limited_and_reads_come_from_cache() -> None:
     assert volume.status()["volume_db"] == -6.0
     assert len(device.sockets) == 1
 
+    window = motu_access.DEFAULT_WINDOW_SECONDS
     # A second page load inside the window answers from cache.
-    clock.now += 5
+    clock.now += window - 1
     status = volume.status()
     assert status["volume_db"] == -6.0 and len(device.sockets) == 1
-    assert status["retry_after"] == pytest.approx(10.0)
+    assert status["retry_after"] == pytest.approx(1.0)
 
     # A write inside the window is refused without connecting.
     with pytest.raises(motu_volume.MotuVolumeRateLimited) as refused:
         volume.set({"volume_db": -20, "expected_db": -6})
-    assert refused.value.retry_after == pytest.approx(10.0)
+    assert refused.value.retry_after == pytest.approx(1.0)
     assert len(device.sockets) == 1 and device.sent == []
 
     # Once the window has passed, exactly one connection makes the write.
-    clock.now += 10
+    clock.now += 1
     volume.set({"volume_db": -20, "expected_db": -6})
     assert len(device.sockets) == 2
     assert device.sent == [motu_volume.encode_main_trim_write(20)]
 
     # A burst of drag updates right after is all refused, none connect.
+    assert 29 * 0.1 < window, "the drag burst must fit inside the window"
     for step in range(1, 30):
         clock.now += 0.1
         with pytest.raises(motu_volume.MotuVolumeRateLimited):
@@ -347,10 +349,16 @@ def test_failed_connection_still_uses_the_access_window() -> None:
         volume.set({"volume_db": -20, "expected_db": -6})
 
 
-def test_access_window_is_configurable_and_defaults_past_the_meter_backoff() -> None:
-    # The switcher's meter reader waits 10 s between reconnects; the window
-    # must exceed it or a second access keeps the meters down ~10 s.
-    assert motu_access.DEFAULT_WINDOW_SECONDS > 10
+def test_access_window_is_configurable_and_spans_several_switcher_passes() -> None:
+    # A recorded access no longer waits out the meter reader's 10 s reconnect
+    # backoff (forgive_coordinated_kick), so the window need not exceed it.
+    # What it must exceed, comfortably, is one switcher pass, so the meters
+    # read a fresh frame between accesses; see test_motu_access for the
+    # simulation against the real reader that this default was chosen from.
+    import source_switcher
+
+    one_pass = source_switcher.CHECK_INTERVAL + source_switcher.MOTU_READ_WINDOW_SECONDS
+    assert motu_access.DEFAULT_WINDOW_SECONDS >= 3 * one_pass
     assert motu_access.window_seconds() == motu_access.DEFAULT_WINDOW_SECONDS
     with mock.patch.dict(os.environ, {"MOTU_ACCESS_WINDOW_SECONDS": "30"}):
         assert motu_access.window_seconds() == 30.0

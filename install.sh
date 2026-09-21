@@ -92,7 +92,7 @@ MOTU_MAIN_VOLUME_MAX_DB=0
 # read-backs, UI volume) is recorded here.  Read-backs and UI volume accesses
 # keep this far apart from any other one; clock writes never wait.
 MOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock
-MOTU_ACCESS_WINDOW_SECONDS=15
+MOTU_ACCESS_WINDOW_SECONDS=5
 SOURCE_CHECK_INTERVAL=1.0
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
