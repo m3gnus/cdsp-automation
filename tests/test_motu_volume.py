@@ -13,6 +13,7 @@ from unittest import mock
 
 import pytest
 
+import motu_access
 import motu_volume
 
 
@@ -36,6 +37,9 @@ class ReplaySocket:
         self.frames = list(frames)
         self.sent: list[bytes] = []
         self.closed = False
+
+    def connect(self, *_args: object, **_kwargs: object) -> None:
+        pass
 
     def settimeout(self, _timeout: float) -> None:
         pass
@@ -88,7 +92,7 @@ def control(device: Device, clock: FakeClock | None = None) -> motu_volume.MotuM
 def default_settings():
     names = (
         "MOTU_MAIN_VOLUME_MAX_DB",
-        "MOTU_VOLUME_MIN_INTERVAL_SECONDS",
+        "MOTU_ACCESS_WINDOW_SECONDS",
         "MOTU_VOLUME_CACHE_SECONDS",
     )
     env = {k: v for k, v in os.environ.items() if k not in names}
@@ -176,7 +180,8 @@ def test_default_ceiling_is_the_level_the_device_was_found_at() -> None:
 
 def test_ceiling_is_enforced_server_side() -> None:
     device = Device()
-    volume = control(device)
+    clock = FakeClock()
+    volume = control(device, clock)
 
     result = volume.set({"volume_db": 0, "expected_db": -6})
 
@@ -185,8 +190,9 @@ def test_ceiling_is_enforced_server_side() -> None:
     assert result["volume_db"] == -6.0 and result["written"] is False
 
     device = Device()
+    clock.now += 60  # past the shared access window
     with mock.patch.dict(os.environ, {"MOTU_MAIN_VOLUME_MAX_DB": "-10"}):
-        result = control(device).set({"volume_db": 0, "expected_db": -6})
+        result = control(device, clock).set({"volume_db": 0, "expected_db": -6})
     # Clamped to the ceiling: the only write is -10 dB.
     assert device.sent == [motu_volume.encode_main_trim_write(10)]
     assert result["volume_db"] == -10.0
@@ -341,10 +347,9 @@ def test_failed_connection_still_uses_the_access_window() -> None:
 def test_access_window_is_configurable_and_defaults_past_the_meter_backoff() -> None:
     # The switcher's meter reader waits 10 s between reconnects; the window
     # must exceed it or a second access keeps the meters down ~10 s.
-    assert motu_volume.DEFAULT_MIN_INTERVAL > 10
-    volume = control(Device())
-    assert volume.min_interval() == motu_volume.DEFAULT_MIN_INTERVAL
-    with mock.patch.dict(os.environ, {"MOTU_VOLUME_MIN_INTERVAL_SECONDS": "30"}):
-        assert volume.min_interval() == 30.0
-    with mock.patch.dict(os.environ, {"MOTU_VOLUME_MIN_INTERVAL_SECONDS": "soon"}):
-        assert volume.min_interval() == motu_volume.DEFAULT_MIN_INTERVAL
+    assert motu_access.DEFAULT_WINDOW_SECONDS > 10
+    assert motu_access.window_seconds() == motu_access.DEFAULT_WINDOW_SECONDS
+    with mock.patch.dict(os.environ, {"MOTU_ACCESS_WINDOW_SECONDS": "30"}):
+        assert motu_access.window_seconds() == 30.0
+    with mock.patch.dict(os.environ, {"MOTU_ACCESS_WINDOW_SECONDS": "soon"}):
+        assert motu_access.window_seconds() == motu_access.DEFAULT_WINDOW_SECONDS

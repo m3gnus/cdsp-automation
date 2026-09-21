@@ -88,9 +88,11 @@ MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 # so the profile volume limits do not bound it: this ceiling does.  -6 dB is
 # where the device stood when the control was added; raise it deliberately.
 MOTU_MAIN_VOLUME_MAX_DB=-6
-# Shortest gap between two UI accesses to the MOTU.  Each one briefly drops
-# the source switcher's meter connection, which waits 10 s between reconnects.
-MOTU_VOLUME_MIN_INTERVAL_SECONDS=15
+# Every MOTU connection besides the switcher's meters (clock writes and
+# read-backs, UI volume) is recorded here.  Read-backs and UI volume accesses
+# keep this far apart from any other one; clock writes never wait.
+MOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock
+MOTU_ACCESS_WINDOW_SECONDS=15
 SOURCE_CHECK_INTERVAL=1.0
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
@@ -356,7 +358,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
+  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_access.py motu_volume.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -416,11 +418,12 @@ ensure_user_writable_dir() {
 }
 
 ensure_audio_state_storage() {
-  local lock audio_eq_path audio_control_lock_path motu_clock_state_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
+  local lock audio_eq_path audio_control_lock_path motu_clock_state_path motu_access_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
   audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
   audio_eq_backup_dir="$(get_env_value AUDIO_EQ_BACKUP_DIR)"
   audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
   motu_clock_state_path="$(get_env_value MOTU_CLOCK_STATE_PATH)"
+  motu_access_path="$(get_env_value MOTU_ACCESS_PATH)"
   speaker_selection_path="$(get_env_value SPEAKER_SELECTION_PATH)"
   speaker_transition_path="$(get_env_value SPEAKER_TRANSITION_PATH)"
   speaker_audio_dir="$(get_env_value SPEAKER_AUDIO_DIR)"
@@ -430,6 +433,7 @@ ensure_audio_state_storage() {
   : "${audio_eq_path:=/var/lib/cdsp-automation/audio-eq.json}"
   : "${audio_control_lock_path:=/var/lib/cdsp-automation/audio-control.lock}"
   : "${motu_clock_state_path:=/var/lib/cdsp-automation/motu-clock-source}"
+  : "${motu_access_path:=/var/lib/cdsp-automation/motu-access.lock}"
   : "${speaker_selection_path:=/var/lib/cdsp-automation/speaker-selection.json}"
   : "${speaker_transition_path:=/var/lib/cdsp-automation/speaker-transition.json}"
   : "${speaker_audio_dir:=/var/lib/cdsp-automation/speaker-audio}"
@@ -440,6 +444,7 @@ ensure_audio_state_storage() {
   ensure_user_writable_dir "$(dirname "$audio_eq_path")"
   ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"
   ensure_user_writable_dir "$(dirname "$motu_clock_state_path")"
+  ensure_user_writable_dir "$(dirname "$motu_access_path")"
   ensure_user_writable_dir "$(dirname "$speaker_selection_path")"
   ensure_user_writable_dir "$(dirname "$speaker_transition_path")"
   ensure_user_writable_dir "$speaker_audio_dir"
@@ -451,14 +456,17 @@ ensure_audio_state_storage() {
   if [[ ! -d "$source_base_dir" ]]; then
     sudo install -d -m 0755 "$source_base_dir"
   fi
-  # The three locks every component shares are claimed by whichever process
-  # opens them first, which on a fresh install can be the root UI or the
-  # root Shairport callback.  Own them here, before anything runs.  Per-speaker
+  # The locks every component shares are claimed by whichever process opens
+  # them first, which on a fresh install can be the root UI or the root
+  # Shairport callback.  Own them here, before anything runs.  Per-speaker
   # locks appear later and are covered by the UI unit's Group= and UMask=.
+  # The MOTU access record is written by clock_sync and the source switcher
+  # (both $INSTALL_USER) and by the root control UI.
   for lock in \
     "${audio_eq_path}.lock" \
     "$audio_control_lock_path" \
-    "${speaker_selection_path}.lock"; do
+    "${speaker_selection_path}.lock" \
+    "$motu_access_path"; do
     if [[ ! -e "$lock" ]]; then
       sudo -u "$INSTALL_USER" touch "$lock"
     fi

@@ -191,12 +191,59 @@ together. A write is refused if the group ever stops covering all of them.
   the device, and shows `unknown` with no slider when the device cannot be
   read. Every write names the level it replaces and is refused (409) if the
   device reports anything else, for example after the front-panel knob moved.
-- **One client:** each device access drops the source switcher's meter
-  connection, which then waits up to 10 s
-  (`SOURCE_MOTU_CONNECT_RETRY_SECONDS`) before reconnecting. The UI touches the
-  MOTU at most once per `MOTU_VOLUME_MIN_INTERVAL_SECONDS` (default 15). The
-  browser debounces the slider and sends only the latest value when the window
-  reopens. The server answers 429 with `retry_after` inside the window.
+- **One client:** the browser debounces the slider and sends only the latest
+  value once the shared access window reopens. Inside the window the server
+  answers 429 with `retry_after`. The next section covers the window.
+
+### Shared MOTU access window
+
+The MOTU serves one WebSocket client at a time. The source switcher's meter
+reader holds that slot, and any other connection drops it. The reader then
+refuses to reconnect sooner than `SOURCE_MOTU_CONNECT_RETRY_SECONDS` (10 s)
+after its previous connect. So if two extra connections land within ~10 s, the
+meters stay dark for ~10 s. That exceeds the TOSLINK tolerance (2 s of held
+values, `SOURCE_MOTU_METER_MAX_AGE`, plus the 5 s `SOURCE_TOSLINK_IDLE_SECONDS`
+debounce), and TOSLINK drops mid-song.
+
+Every extra connection is therefore recorded in `MOTU_ACCESS_PATH` (default
+`/var/lib/cdsp-automation/motu-access.lock`, `scripts/motu_access.py`). The
+record is a `CLOCK_MONOTONIC` reading plus the kernel boot id, written under
+`flock`. clock_sync and the switcher (install user) and the root control UI all
+use it. The installer pre-creates it as `$INSTALL_USER:$INSTALL_GROUP` with
+mode 0660. Accesses are ranked:
+
+1. **Clock write** (a source change): never waits, only records itself. If the
+   record is unusable it is logged and the write still goes out.
+2. **Clock read-back:** deferrable. Within `MOTU_ACCESS_WINDOW_SECONDS`
+   (default 15) of any recorded access it is postponed until the window
+   opens, without connecting. This includes the read-back that used to confirm
+   a clock write about 1 s after sending it. If the record is unusable, the
+   read-back is skipped.
+3. **UI volume** read or write: deferrable, 429 with `retry_after`. If the
+   record is unusable, the UI refuses to touch the MOTU.
+
+A clock write cannot be delayed and cannot be predicted, so a deferrable access
+may still land shortly before one. That is the switch *to* TOSLINK, where the
+meters are what confirm the source. The meter reader closes this gap. When its
+connection drops and the record shows an extra access made after that
+connection opened, the reader reconnects on its next pass instead of waiting
+out the 10 s backoff. Each recorded access forgives one drop. A drop the
+record does not explain (the device vanished, a foreign client, an unreadable
+record) keeps the backoff.
+
+**Worst-case meter gap.** A single extra access costs the time the reader
+takes to notice the drop (up to one switcher pass, 1 s plus a 0.2 s read
+window) plus one pass to reconnect, and the dump before the first meter frame
+(0.12 s measured). That is about 2.5-3.5 s. It happened once on a live read:
+the drop was logged and the reader reconnected 1.1 s later. Held values cover
+the first 2 s, so the TOSLINK idle counter advances by at most about 1.5 s of
+its 5 s. Deferrable accesses are at least 15 s from every other extra access,
+so their gaps never stack. The only possible stacking is a clock write right
+after a deferrable access. If the write lands before the reader has
+reconnected, both drops fall inside one gap. If it lands just after the
+reconnect but before the first meter frame, the gaps merge to about 5-6 s of
+no fresh meters. That is still under the ~7 s tolerance, with the idle
+counter reaching about 4 s. Previously that case stayed dark for ~10 s.
 
 ---
 

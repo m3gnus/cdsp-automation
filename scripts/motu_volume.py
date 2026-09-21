@@ -33,8 +33,9 @@ Safety model:
   saw. A value that moved behind our back (the front-panel knob) is reported,
   never overwritten blindly.
 * The MOTU serves one WebSocket client at a time and every new connection
-  drops the source switcher's meter reader. Connections are rate-limited so
-  each kick is isolated (see DEFAULT_MIN_INTERVAL below).
+  drops the source switcher's meter reader. Every connection made here is a
+  deferrable access in the window shared with clock_sync (motu_access.py), so
+  it never lands within that window of any other extra MOTU access.
 """
 
 from __future__ import annotations
@@ -45,6 +46,8 @@ import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+from motu_access import AccessDeferred, AccessUnavailable, MotuAccess
 
 try:
     import websocket
@@ -79,13 +82,6 @@ DEFAULT_MOTU_WS_URL = "ws://169.254.51.193:1280"
 # voiced and its profile volume limits set with the MOTU there, so the default
 # ceiling keeps the control from ever making it louder than it already was.
 DEFAULT_MAX_DB = -6.0
-# The source switcher's meter reader retries a dropped connection no sooner
-# than SOURCE_MOTU_CONNECT_RETRY_SECONDS (10 s) after its previous connect.
-# Kicked twice inside that window it stays down for up to ~10 s, well past the
-# ~6-7 s TOSLINK tolerance (2 s of held meter values plus the 5 s idle
-# debounce). One device connection per 15 s leaves the reader 10 s of backoff
-# plus room to notice the drop (one 1 s switcher pass) and reconnect.
-DEFAULT_MIN_INTERVAL = 15.0
 # A GET reuses what was last read or written this long before reconnecting.
 DEFAULT_CACHE_SECONDS = 30.0
 READ_TIMEOUT = 3.0
@@ -100,9 +96,10 @@ class MotuVolumeError(Exception):
 class MotuVolumeRateLimited(MotuVolumeError):
     kind = "rate_limited"
 
-    def __init__(self, retry_after: float) -> None:
+    def __init__(self, retry_after: float, detail: str = "") -> None:
         super().__init__(
-            f"the MOTU accepts one client at a time; next access in {retry_after:.0f} s"
+            detail
+            or f"the MOTU accepts one client at a time; next access in {retry_after:.0f} s"
         )
         self.retry_after = retry_after
 
@@ -299,31 +296,37 @@ class MotuMainVolume:
         *,
         connect: Callable[[str, float], Any] = _default_connect,
         clock: Callable[[], float] = time.monotonic,
+        access: MotuAccess | None = None,
     ) -> None:
         self._connect = connect
         self._clock = clock
+        # Shared with clock_sync across processes; the thread lock only keeps
+        # this process's requests from racing each other.
+        self._access = access or MotuAccess(clock=clock)
         self._lock = threading.Lock()
-        self._last_access: float | None = None
         self._state: DeviceState | None = None
         self._state_at = 0.0
         self._confirmed = False
         self._error: str | None = None
 
     # -- helpers
-    def min_interval(self) -> float:
-        return _env_seconds("MOTU_VOLUME_MIN_INTERVAL_SECONDS", DEFAULT_MIN_INTERVAL)
-
-    def _retry_after(self, now: float) -> float:
-        if self._last_access is None:
+    def _retry_after(self) -> float:
+        try:
+            return self._access.retry_after()
+        except AccessUnavailable:
             return 0.0
-        return max(0.0, self._last_access + self.min_interval() - now)
 
-    def _open(self, now: float) -> Any:
-        """Claim the rate-limit slot and connect. Every attempt counts."""
-        wait = self._retry_after(now)
-        if wait > 0:
-            raise MotuVolumeRateLimited(wait)
-        self._last_access = now
+    def _open(self) -> Any:
+        """Claim the shared access window and connect. Every attempt counts."""
+        try:
+            self._access.claim("ui-volume", deferrable=True)
+        except AccessDeferred as deferred:
+            raise MotuVolumeRateLimited(deferred.retry_after, str(deferred)) from None
+        except AccessUnavailable as exc:
+            # Uncoordinated, a connection here could land next to a clock
+            # write and keep the switcher's meters dark; stay off the device.
+            self._error = f"MOTU access cannot be coordinated: {exc}"
+            raise MotuVolumeError(self._error) from None
         return self._connect(motu_ws_url(), READ_TIMEOUT)
 
     def _read(self, ws: Any, now: float) -> DeviceState:
@@ -369,7 +372,7 @@ class MotuMainVolume:
             "min_db": attenuation_to_db(MAIN_TRIM_MAX_ATTENUATION),
             "writable": state is not None and group_ok and config_error is None,
             "reason": reason,
-            "retry_after": round(self._retry_after(now), 1),
+            "retry_after": round(self._retry_after(), 1),
         }
 
     # -- public API
@@ -385,10 +388,10 @@ class MotuMainVolume:
             fresh_enough = (
                 self._state is not None and self._confirmed and now - self._state_at <= cache
             )
-            if not fresh_enough and self._retry_after(now) <= 0:
+            if not fresh_enough:
                 ws = None
                 try:
-                    ws = self._open(now)
+                    ws = self._open()
                     self._read(ws, now)
                 except MotuVolumeError:
                     pass
@@ -420,7 +423,7 @@ class MotuMainVolume:
             ws = None
             try:
                 try:
-                    ws = self._open(now)
+                    ws = self._open()
                 except MotuVolumeError:
                     raise
                 except Exception as exc:

@@ -19,3 +19,17 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # which makes it unrunnable on exactly the deployed hosts it should verify.
 HERMETIC_CATALOG_PATH = str(SCRIPTS_DIR / "no-such-speaker-catalog.json")
 os.environ["SPEAKER_CATALOG_PATH"] = HERMETIC_CATALOG_PATH
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def hermetic_motu_access_record(tmp_path, monkeypatch):
+    """Give every test its own MOTU access record (motu_access.py).
+
+    The default lives under /var/lib, and a record shared between tests would
+    let one test's MOTU access defer the next test's read-back.
+    """
+    monkeypatch.setenv("MOTU_ACCESS_PATH", str(tmp_path / "motu-access.lock"))
+    monkeypatch.delenv("MOTU_ACCESS_WINDOW_SECONDS", raising=False)
