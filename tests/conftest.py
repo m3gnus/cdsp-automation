@@ -33,3 +33,6 @@ def hermetic_motu_access_record(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("MOTU_ACCESS_PATH", str(tmp_path / "motu-access.lock"))
     monkeypatch.delenv("MOTU_ACCESS_WINDOW_SECONDS", raising=False)
+    # clock_sync takes the audio-control lock around each clock decision and
+    # resolves the path per call; keep it out of /var/lib as well.
+    monkeypatch.setenv("AUDIO_CONTROL_LOCK_PATH", str(tmp_path / "audio-control.lock"))

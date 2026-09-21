@@ -1064,11 +1064,12 @@ def run_verified_switch(
     timeout: float = 1.0,
     poll_interval: float = 0.25,
     before_reload: Callable[[Path], None] | None = None,
+    source: str = "streamer",
     **config_kwargs: object,
 ) -> tuple[SimpleNamespace, Exception | None]:
     """Apply a config whose target carries expected_config, capturing failure."""
     previous = tmp_path / "streamer.yml"
-    target_path = tmp_path / "streamer--partymeh.yml"
+    target_path = tmp_path / f"{source}--partymeh.yml"
     previous.write_text("devices: {}\n")
     target_path.write_text(
         yaml.safe_dump(expected, sort_keys=False), encoding="utf-8"
@@ -1088,7 +1089,7 @@ def run_verified_switch(
         client.general.reload = hooked_reload
     target = {
         "speaker": "partymeh",
-        "source": "streamer",
+        "source": source,
         "digest": switcher.config_digest(expected),
         "max_volume_db": -6,
         "expected_config": expected,
@@ -1171,6 +1172,125 @@ def test_operator_file_swapped_after_the_integrity_check_cannot_verify_itself(
         assert "differs" in str(error)
         assert client.volume.mute is True
         assert statuses[-1]["ok"] is False
+
+
+class MotuClockRecorder:
+    """Stands in for clock_sync: a shared cache plus a log of every write."""
+
+    def __init__(self, cached: str | None, events: list[str], *, sends: bool = True):
+        self.cached = cached
+        self.events = events
+        self.sends = sends
+
+    def read_persisted_clock(self) -> str | None:
+        return self.cached
+
+    def persist_clock(self, clock: str) -> None:
+        self.cached = clock
+
+    def set_motu_clock(self, clock: str) -> bool:
+        self.events.append(f"clock:{clock}")
+        return self.sends
+
+
+def run_clocked_switch(
+    tmp_path: Path,
+    motu: MotuClockRecorder,
+    *,
+    source: str = "toslink",
+    owns: str = "true",
+    active_config: dict | None = None,
+) -> tuple[SimpleNamespace, Exception | None]:
+    """run_verified_switch, to ``source``, with the reload order recorded."""
+    def record_reload(_path: Path) -> None:
+        motu.events.append("reload")
+
+    kwargs: dict = {}
+    if active_config is not None:
+        kwargs["active_config"] = active_config
+    with (
+        patch.object(switcher, "clock_sync", motu),
+        patch.object(switcher, "SOURCE_MOTU_CLOCK", owns),
+        patch.object(switcher, "MOTU_CLOCK_UNIT_PATH", tmp_path / "no-such.service"),
+        patch.object(switcher, "MOTU_CLOCK_SETTLE_SECONDS", 1.0),
+    ):
+        client, error = run_verified_switch(
+            tmp_path,
+            MINIMAL_ALSA_CONFIG,
+            before_reload=record_reload,
+            source=source,
+            **kwargs,
+        )
+    return client, error
+
+
+def test_clock_changes_inside_the_mute_window_before_the_new_graph_loads(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events)
+    client, error = run_clocked_switch(tmp_path, motu)
+    assert error is None
+    assert events == ["clock:optical", "reload"]
+    assert motu.cached == "optical"
+    assert client.volume.mute is False
+
+
+def test_a_clock_already_in_place_is_not_rewritten(tmp_path: Path) -> None:
+    events: list[str] = []
+    run_clocked_switch(tmp_path, MotuClockRecorder("optical", events))
+    assert events == ["reload"]
+    events.clear()
+    run_clocked_switch(tmp_path, MotuClockRecorder("internal", events), source="streamer")
+    assert events == ["reload"]
+
+
+def test_a_rolled_back_transition_takes_its_clock_back_while_muted(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events)
+    divergent = copy.deepcopy(MINIMAL_ALSA_CONFIG)
+    divergent["devices"]["playback"]["channels"] = 4
+    client, error = run_clocked_switch(tmp_path, motu, active_config=divergent)
+    assert isinstance(error, RuntimeError)
+    # Restored before the previous graph is reloaded onto the interface.
+    assert events == ["clock:optical", "reload", "clock:internal", "reload"]
+    assert motu.cached == "internal"
+    assert client.volume.mute is True
+
+
+def test_a_failed_clock_write_leaves_the_transition_to_clock_sync(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events, sends=False)
+    client, error = run_clocked_switch(tmp_path, motu)
+    assert error is None
+    assert events == ["clock:optical", "reload"]
+    # Not recorded as done, so clock_sync still sees the difference and retries.
+    assert motu.cached == "internal"
+    assert client.volume.mute is False
+
+
+def test_clock_ownership_follows_the_setting_and_the_clock_sync_unit(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    run_clocked_switch(tmp_path, MotuClockRecorder("internal", events), owns="false")
+    assert events == ["reload"]
+    # auto without the MOTU Clock Sync unit: not ours to drive.
+    events.clear()
+    run_clocked_switch(tmp_path, MotuClockRecorder("internal", events), owns="auto")
+    assert events == ["reload"]
+    unit = tmp_path / "cdsp-motu-sync.service"
+    unit.touch()
+    with (
+        patch.object(switcher, "clock_sync", MotuClockRecorder("internal", [])),
+        patch.object(switcher, "SOURCE_MOTU_CLOCK", "auto"),
+        patch.object(switcher, "MOTU_CLOCK_UNIT_PATH", unit),
+    ):
+        assert switcher._owns_motu_clock()
 
 
 def test_verification_still_rejects_a_genuinely_different_active_config(

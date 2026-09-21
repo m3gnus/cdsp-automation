@@ -104,6 +104,10 @@ SOURCE_PROBE_BACKOFF_MAX=900
 SOURCE_AUDIO_THRESHOLD_DB=-80
 SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
 SOURCE_TOSLINK_MOTU_METERS=true
+# The switcher changes the MOTU clock inside its muted transition whenever
+# the MOTU Clock Sync unit is installed (auto), or always/never (true/false).
+SOURCE_MOTU_CLOCK=auto
+MOTU_CLOCK_SETTLE_SECONDS=1.0
 SOURCE_ANALOG_MOTU_METERS=false
 SOURCE_IDLE_MODE=keep-last
 SOURCE_TOSLINK_METER_PAIRS=12,13

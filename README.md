@@ -403,6 +403,22 @@ MOTU_CLOCK_READBACK_RETRY_INTERVAL=300
 MOTU_CLOCK_REWRITE_INTERVAL=30
 ```
 
+When the Source Switcher is installed as well, it changes the clock itself,
+inside its muted source transition and before the new config is loaded, so the
+interface has re-locked before sound returns; a failed rollback puts the old
+clock back while still muted. The daemon then only verifies, and steps in for
+clock changes the switcher did not make. It decides under the same
+audio-control lock, so it never undoes a transition that is half done, and it
+reads the shared `MOTU_CLOCK_STATE_PATH` cache, so it never repeats the
+switcher's write. Switcher keys:
+
+```text
+# auto: drive the clock whenever the MOTU Clock Sync unit is installed
+SOURCE_MOTU_CLOCK=auto
+# re-lock time allowed before the new graph is loaded on the interface
+MOTU_CLOCK_SETTLE_SECONDS=1.0
+```
+
 `MOTU_DATASTORE_URL` is no longer read; an existing line for it can be removed.
 
 

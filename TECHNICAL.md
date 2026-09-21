@@ -191,12 +191,23 @@ owner even when both graphs run at 48 kHz. Failed WebSocket sends are retried
 instead of being recorded as applied, and so is a send the device accepted but
 never applied.
 
-**Known gap:** the clock change is not yet coordinated with the source
-switcher's muted transition. The daemon notices the new config after the
-switcher has already reloaded it, so a clock re-lock can land just after the
-mute interval ends. Closing that gap means the switcher owning the clock
-change inside its own mute window (see `scripts/source_switcher.py`), which is
-a larger change than the read-back verification above.
+**Clock changes inside the mute window.** With the MOTU Clock Sync unit
+installed (`SOURCE_MOTU_CLOCK=auto`; `true`/`false` override), the source
+switcher makes the clock change itself in `apply_config`: muted, under the
+audio-control lock, after the integrity and selection checks and *before* the
+reload, then waits `MOTU_CLOCK_SETTLE_SECONDS` so the new graph opens the
+interface on a clock that has already re-locked. A transition that rolls back
+restores the previous clock, still muted, before reloading the previous graph.
+A clock already named by the shared `MOTU_CLOCK_STATE_PATH` cache is not
+written again. A failed clock write does not fail the transition - the audio
+path is fine, and the clock is merely late, as before.
+
+The daemon stays as verifier and fallback. Each pass it adopts the shared cache
+as its own last request, so a switcher write is not repeated; and it re-makes
+every write decision under the audio-control lock, so it cannot observe the
+half-way state of a transition (new clock, old config path) and write the old
+clock back. Without a switcher that lock is always free and the daemon behaves
+as it did before.
 
 **Note:** The payloads and read-back values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
 

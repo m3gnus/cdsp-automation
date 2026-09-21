@@ -29,6 +29,11 @@ from audio_eq import (
     status_payload,
 )
 from motu_access import AccessUnavailable, MotuAccess
+
+try:
+    import clock_sync
+except ImportError:  # websocket-client missing: no MOTU control at all
+    clock_sync = None
 from speaker_config import (
     compile_profile_config,
     config_digest,
@@ -124,6 +129,17 @@ CONFIG_APPLY_POLL_INTERVAL = float(
 AUDIO_THRESHOLD_DB = float(os.environ.get("SOURCE_AUDIO_THRESHOLD_DB", "-80"))
 DEBUG_MODE = env_bool("SOURCE_DEBUG", False)
 MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
+# Whether the switcher changes the MOTU clock itself, inside the muted
+# transition.  "auto" follows the MOTU Clock Sync install: that unit's
+# presence is what says this rig's clock is ours to drive.
+SOURCE_MOTU_CLOCK = os.environ.get("SOURCE_MOTU_CLOCK", "auto").strip().lower()
+MOTU_CLOCK_UNIT_PATH = Path(
+    os.environ.get(
+        "MOTU_CLOCK_UNIT_PATH", "/etc/systemd/system/cdsp-motu-sync.service"
+    )
+)
+# How long the MOTU gets to re-lock before the new graph is loaded on it.
+MOTU_CLOCK_SETTLE_SECONDS = float(os.environ.get("MOTU_CLOCK_SETTLE_SECONDS", "1.0"))
 TOSLINK_MOTU_METERS = env_bool("SOURCE_TOSLINK_MOTU_METERS", True)
 ANALOG_MOTU_METERS = env_bool("SOURCE_ANALOG_MOTU_METERS", False)
 MOTU_METER_ACTIVE_BELOW = int(os.environ.get("SOURCE_MOTU_METER_ACTIVE_BELOW", "250"))
@@ -1248,6 +1264,70 @@ def ensure_current_speaker_audio_eq(cdsp: CamillaClient, current_speaker: str) -
         ensure_audio_eq(cdsp, speaker_id=current_speaker)
 
 
+def _owns_motu_clock() -> bool:
+    if clock_sync is None or SOURCE_MOTU_CLOCK in {"0", "false", "no", "off"}:
+        return False
+    if SOURCE_MOTU_CLOCK in {"1", "true", "yes", "on"}:
+        return True
+    return MOTU_CLOCK_UNIT_PATH.exists()
+
+
+def _set_motu_clock_muted(clock: str) -> bool:
+    """Write one clock source and let it re-lock; the caller holds mute."""
+    assert clock_sync is not None
+    if not clock_sync.set_motu_clock(clock):
+        return False
+    # The shared cache is how clock_sync learns this write was made: it
+    # re-reads it under the same lock and only verifies from here on.
+    clock_sync.persist_clock(clock)
+    time.sleep(MOTU_CLOCK_SETTLE_SECONDS)
+    return True
+
+
+def _switch_motu_clock(target: dict | None) -> str | None:
+    """Move the MOTU clock to the target's source inside the mute window.
+
+    Runs muted, under the audio-control lock, *before* the reload, so the new
+    graph opens the interface on a clock that has already re-locked and the
+    re-lock can never land after unmute.  Returns the clock to restore if the
+    transition rolls back, or None when nothing was changed.
+
+    A failed write does not fail the transition: the audio path itself is
+    fine, and clock_sync still owns retry and read-back, so the clock is only
+    late, as it always was before.  A clock the shared cache already names is
+    not written again: every write re-locks and clicks.
+    """
+    if not target or not _owns_motu_clock():
+        return None
+    source = target.get("source")
+    if source not in SOURCE_PRIORITY:
+        return None
+    assert clock_sync is not None
+    desired = "optical" if source == "toslink" else "internal"
+    believed = clock_sync.read_persisted_clock()
+    if believed == desired:
+        return None
+    if not _set_motu_clock_muted(desired):
+        print(
+            f"MOTU clock not switched to {desired} inside the transition; "
+            "clock sync will retry",
+            flush=True,
+        )
+        return None
+    return believed
+
+
+def _restore_motu_clock(previous_clock: str | None) -> None:
+    """Best-effort return of the clock during a muted rollback."""
+    if previous_clock is None or clock_sync is None:
+        return
+    try:
+        if not _set_motu_clock_muted(previous_clock):
+            print(f"MOTU clock not restored to {previous_clock}", flush=True)
+    except Exception as exc:
+        print(f"MOTU clock restore failed: {exc}", flush=True)
+
+
 def apply_config(
     cdsp: CamillaClient,
     file_path: str,
@@ -1292,6 +1372,7 @@ def apply_config(
         raise
     selection_guard = None
     selection_guard_entered = False
+    previous_clock: str | None = None
     try:
         if target and target.get("selection_revision") is not None:
             selection_guard = speaker_selection_lock(SPEAKER_SELECTION_PATH)
@@ -1309,6 +1390,7 @@ def apply_config(
                 or current_selection["revision"] != target["selection_revision"]
             ):
                 raise RuntimeError("speaker selection changed before config reload")
+        previous_clock = _switch_motu_clock(target)
         cdsp.config.set_file_path(file_path)
         cdsp.general.reload()
         time.sleep(settle_time)
@@ -1419,6 +1501,7 @@ def apply_config(
         except Exception:
             pass
         rollback_ok = False
+        _restore_motu_clock(previous_clock)
         if previous_path and os.path.exists(previous_path):
             try:
                 cdsp.config.set_file_path(previous_path)

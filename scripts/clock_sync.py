@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import binascii
+import contextlib
 import os
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 import websocket
 from camilladsp import CamillaClient
 
+from audio_eq import exclusive_file_lock
 from motu_access import AccessDeferred, AccessUnavailable, MotuAccess, claim_or_log
 from speaker_config import (
     SOURCE_IDS,
@@ -79,6 +81,36 @@ MOTU_READBACK_RETRY_INTERVAL = float(
 MOTU_REWRITE_INTERVAL = float(os.environ.get("MOTU_CLOCK_REWRITE_INTERVAL", "30"))
 
 _next_motu_error_log = 0.0
+
+
+@contextlib.contextmanager
+def transition_guard():
+    """Hold the audio-control lock around one clock decision and write.
+
+    The source switcher changes the clock itself, muted, inside its config
+    transition and under this lock, writing the shared STATE_PATH cache as it
+    does.  Deciding under the same lock means this daemon never sees the
+    half-way state (new clock, old config path) and writes the old clock
+    back, and never repeats a write the switcher already made.  Without a
+    switcher the lock is simply free.  A lock that cannot be taken at all is
+    logged and the decision goes ahead, as it did before the lock existed.
+    """
+    path = Path(
+        os.environ.get(
+            "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
+        )
+    )
+    try:
+        guard = exclusive_file_lock(path)
+        guard.__enter__()
+    except OSError as exc:
+        _log_motu_error(f"MOTU: audio-control lock unavailable ({exc}); deciding unlocked")
+        yield
+        return
+    try:
+        yield
+    finally:
+        guard.__exit__(None, None, None)
 
 
 def _log_motu_error(message: str) -> None:
@@ -274,14 +306,28 @@ def main() -> int:
                 cdsp.connect()
                 print("Connected to CamillaDSP", flush=True)
 
-            rate = current_sample_rate(cdsp.config.active())
-            config_path = cdsp.config.file_path()
-            # Identifying a generated config reads and digests it; the path is
-            # content-addressed and immutable, so remember the answer.
-            if config_path != known_path or known_source is None:
-                known_path = config_path
-                known_source = source_for_config_path(config_path)
-            source = known_source
+            def observe() -> tuple[int | None, str | None]:
+                nonlocal known_path, known_source
+                rate = current_sample_rate(cdsp.config.active())
+                config_path = cdsp.config.file_path()
+                # Identifying a generated config reads and digests it; the
+                # path is content-addressed and immutable, so remember it.
+                if config_path != known_path or known_source is None:
+                    known_path = config_path
+                    known_source = source_for_config_path(config_path)
+                return rate, known_source
+
+            def adopt_shared_clock() -> None:
+                """Take a clock the switcher wrote as our own last request."""
+                nonlocal last_clock, verified, next_readback
+                shared = read_persisted_clock()
+                if shared is not None and shared != last_clock:
+                    last_clock = shared
+                    verified = False
+                    next_readback = 0.0
+
+            adopt_shared_clock()
+            rate, source = observe()
             if rate is None or source is None:
                 time.sleep(CHECK_INTERVAL)
                 continue
@@ -321,26 +367,38 @@ def main() -> int:
                         persist_clock(actual)
 
             if desired_clock != last_clock:
-                if desired_clock == last_write and now < rewrite_not_before:
-                    # The device just contradicted this very write. Asking
-                    # again every pass would re-lock it every second.
-                    pass
-                elif set_motu_clock(desired_clock):
-                    print(
-                        f"CamillaDSP source={source}, sample rate={rate} Hz"
-                        + ("" if verified else " (clock unconfirmed)"),
-                        flush=True,
-                    )
-                    # A send that did not raise is not proof. Record it as the
-                    # cached belief, then confirm it on the next pass: a device
-                    # that ignored the write is written again instead of being
-                    # latched as done.
-                    last_clock = desired_clock
-                    last_write = desired_clock
-                    rewrite_not_before = now + MOTU_REWRITE_INTERVAL
-                    verified = False
-                    next_readback = 0.0
-                    persist_clock(desired_clock)
+                with transition_guard():
+                    # Re-decide under the lock: a transition that finished
+                    # while we waited has already moved both the config and
+                    # the clock, and the answer may now be "nothing to do".
+                    adopt_shared_clock()
+                    rate, source = observe()
+                    if source is not None:
+                        desired_clock = (
+                            "optical" if source == "toslink" else "internal"
+                        )
+                    if rate is None or source is None or desired_clock == last_clock:
+                        pass
+                    elif desired_clock == last_write and now < rewrite_not_before:
+                        # The device just contradicted this very write. Asking
+                        # again every pass would re-lock it every second.
+                        pass
+                    elif set_motu_clock(desired_clock):
+                        print(
+                            f"CamillaDSP source={source}, sample rate={rate} Hz"
+                            + ("" if verified else " (clock unconfirmed)"),
+                            flush=True,
+                        )
+                        # A send that did not raise is not proof. Record it as
+                        # the cached belief, then confirm it on the next pass:
+                        # a device that ignored the write is written again
+                        # instead of being latched as done.
+                        last_clock = desired_clock
+                        last_write = desired_clock
+                        rewrite_not_before = now + MOTU_REWRITE_INTERVAL
+                        verified = False
+                        next_readback = 0.0
+                        persist_clock(desired_clock)
 
         except Exception as exc:
             # A lost CamillaDSP connection does not change the MOTU clock, so

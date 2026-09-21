@@ -12,6 +12,8 @@ import itertools
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 
 if "camilladsp" not in sys.modules:
     camilladsp = types.ModuleType("camilladsp")
@@ -498,3 +500,97 @@ def test_clock_send_failure_is_not_latched_and_equal_rates_use_source_identity()
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _clock_sync_client(paths: list[str]) -> mock.Mock:
+    client = mock.Mock()
+    client.is_connected.return_value = True
+    client.config.active.return_value = {"devices": {"samplerate": 48000}}
+    client.config.file_path.side_effect = lambda: paths[0]
+    return client
+
+
+def test_main_adopts_a_clock_the_switcher_already_wrote(tmp_path: Path) -> None:
+    """The switcher moved config and clock together; do not write it again."""
+    state = tmp_path / "motu-clock-source"
+    state.write_text("internal\n")
+    paths = ["/tmp/streamer.yml"]
+    client = _clock_sync_client(paths)
+    passes = itertools.count()
+
+    def next_pass(_seconds: float) -> None:
+        if next(passes) == 0:
+            # A muted switcher transition, complete by the next pass.
+            paths[0] = "/tmp/toslink.yml"
+            state.write_text("optical\n")
+        else:
+            raise KeyboardInterrupt
+
+    with (
+        mock.patch.object(clock_sync, "STATE_PATH", state),
+        mock.patch.object(clock_sync, "CamillaClient", return_value=client),
+        mock.patch.object(clock_sync, "read_motu_clock", return_value=None),
+        mock.patch.object(clock_sync, "set_motu_clock") as set_clock,
+        mock.patch.object(clock_sync.time, "sleep", side_effect=next_pass),
+        contextlib.redirect_stdout(io.StringIO()),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        clock_sync.main()
+
+    set_clock.assert_not_called()
+
+
+def test_main_redecides_under_the_lock_instead_of_undoing_a_transition(
+    tmp_path: Path,
+) -> None:
+    """Half-way through a transition the clock is new but the path is old.
+
+    Observed outside the lock that reads as "write the old clock back"; the
+    decision is re-made once the switcher releases the lock, by which time
+    the path has caught up and there is nothing to do.
+    """
+    state = tmp_path / "motu-clock-source"
+    state.write_text("optical\n")
+    paths = ["/tmp/streamer.yml"]
+    client = _clock_sync_client(paths)
+    guarded: list[bool] = []
+
+    @contextlib.contextmanager
+    def switcher_finishes_while_we_wait():
+        paths[0] = "/tmp/toslink.yml"
+        guarded.append(True)
+        yield
+
+    with (
+        mock.patch.object(clock_sync, "STATE_PATH", state),
+        mock.patch.object(clock_sync, "CamillaClient", return_value=client),
+        mock.patch.object(clock_sync, "read_motu_clock", return_value=None),
+        mock.patch.object(clock_sync, "transition_guard", switcher_finishes_while_we_wait),
+        mock.patch.object(clock_sync, "set_motu_clock") as set_clock,
+        mock.patch.object(clock_sync.time, "sleep", side_effect=KeyboardInterrupt),
+        contextlib.redirect_stdout(io.StringIO()),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        clock_sync.main()
+
+    assert guarded == [True]
+    set_clock.assert_not_called()
+
+
+def test_clock_decisions_wait_for_the_audio_control_lock(tmp_path: Path) -> None:
+    lock = Path(os.environ["AUDIO_CONTROL_LOCK_PATH"])
+    entered: list[str] = []
+    with speaker_profiles.audio_control_lock(lock):
+        import threading
+
+        def decide() -> None:
+            with clock_sync.transition_guard():
+                entered.append("clock_sync")
+
+        worker = threading.Thread(target=decide)
+        worker.start()
+        worker.join(0.2)
+        assert entered == []
+        entered.append("switcher done")
+    worker.join(2)
+    assert entered == ["switcher done", "clock_sync"]
