@@ -172,6 +172,32 @@ a larger change than the read-back verification above.
 
 **Note:** The payloads and read-back values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
 
+### MOTU main output volume (control UI)
+
+The control UI's "MOTU main output" card replaces CueMix 5's main volume knob,
+which cannot reach the MOTU while it hangs off the Pi's USB network
+(`scripts/motu_volume.py`). It is CueMix's `kMainTrim`: parameter 5011, one
+byte of attenuation in dB (6 = -6 dB, 100 = -inf). It scales every output
+enabled in `kMainGroup` (parameter 5012, an int16 bit per output DAC). On this
+unit that group is `0x03ff`, meaning all ten analog line outputs. So the high
+(Main 1-2), mid (Line 3-4) and low (Line 5-6) crossover pairs always move
+together. A write is refused if the group ever stops covering all of them.
+
+- **Ceiling:** `MOTU_MAIN_VOLUME_MAX_DB` (default `-6`, the level the device
+  was found at). It is enforced server-side, because the MOTU sits after
+  CamillaDSP and the profile volume limits cannot bound it. An unparseable
+  value disables writes.
+- **No jumps:** the page starts the slider from the level the server read off
+  the device, and shows `unknown` with no slider when the device cannot be
+  read. Every write names the level it replaces and is refused (409) if the
+  device reports anything else, for example after the front-panel knob moved.
+- **One client:** each device access drops the source switcher's meter
+  connection, which then waits up to 10 s
+  (`SOURCE_MOTU_CONNECT_RETRY_SECONDS`) before reconnecting. The UI touches the
+  MOTU at most once per `MOTU_VOLUME_MIN_INTERVAL_SECONDS` (default 15). The
+  browser debounces the slider and sends only the latest value when the window
+  reopens. The server answers 429 with `retry_after` inside the window.
+
 ---
 
 ## 3. Source Switcher

@@ -84,6 +84,13 @@ TRIGGER_CHECK_INTERVAL=0.2
 TRIGGER_AUDIO_THRESHOLD_DB=-80
 MOTU_WS_URL=ws://169.254.51.193:1280
 MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
+# MOTU main output level, set from the control UI.  It sits after CamillaDSP,
+# so the profile volume limits do not bound it: this ceiling does.  -6 dB is
+# where the device stood when the control was added; raise it deliberately.
+MOTU_MAIN_VOLUME_MAX_DB=-6
+# Shortest gap between two UI accesses to the MOTU.  Each one briefly drops
+# the source switcher's meter connection, which waits 10 s between reconnects.
+MOTU_VOLUME_MIN_INTERVAL_SECONDS=15
 SOURCE_CHECK_INTERVAL=1.0
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
@@ -349,7 +356,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py web_ui.py; do
+  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
