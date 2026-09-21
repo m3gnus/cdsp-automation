@@ -83,17 +83,34 @@ MOTU_REWRITE_INTERVAL = float(os.environ.get("MOTU_CLOCK_REWRITE_INTERVAL", "30"
 _next_motu_error_log = 0.0
 
 
+def switcher_manages_clock() -> bool:
+    """True when the source switcher, not this daemon, writes the clock.
+
+    Mirrors the switcher's own ``SOURCE_MOTU_CLOCK`` rule from this side: in
+    ``auto`` it owns the clock whenever it is installed next to this unit.
+    Then every write happens there, muted and after the output has gone
+    silent -- including corrections -- and this daemon only verifies.
+    """
+    setting = os.environ.get("SOURCE_MOTU_CLOCK", "auto").strip().lower()
+    if setting in {"0", "false", "no", "off"}:
+        return False
+    unit = Path(
+        os.environ.get(
+            "SOURCE_SWITCHER_UNIT_PATH",
+            "/etc/systemd/system/cdsp-source-switcher.service",
+        )
+    )
+    return unit.exists()
+
+
 @contextlib.contextmanager
 def transition_guard():
     """Hold the audio-control lock around one clock decision and write.
 
-    The source switcher changes the clock itself, muted, inside its config
-    transition and under this lock, writing the shared STATE_PATH cache as it
-    does.  Deciding under the same lock means this daemon never sees the
-    half-way state (new clock, old config path) and writes the old clock
-    back, and never repeats a write the switcher already made.  Without a
-    switcher the lock is simply free.  A lock that cannot be taken at all is
-    logged and the decision goes ahead, as it did before the lock existed.
+    Yields whether the lock is held.  A standalone daemon (no switcher) takes
+    it so its write can never interleave with a volume or mute change.  A lock
+    that cannot be taken yields False and the caller skips the write: an
+    uncoordinated clock change is exactly what the lock exists to prevent.
     """
     path = Path(
         os.environ.get(
@@ -104,11 +121,11 @@ def transition_guard():
         guard = exclusive_file_lock(path)
         guard.__enter__()
     except OSError as exc:
-        _log_motu_error(f"MOTU: audio-control lock unavailable ({exc}); deciding unlocked")
-        yield
+        _log_motu_error(f"MOTU: audio-control lock unavailable ({exc}); clock write skipped")
+        yield False
         return
     try:
-        yield
+        yield True
     finally:
         guard.__exit__(None, None, None)
 
@@ -366,8 +383,12 @@ def main() -> int:
                         last_clock = actual
                         persist_clock(actual)
 
-            if desired_clock != last_clock:
-                with transition_guard():
+            if desired_clock != last_clock and switcher_manages_clock():
+                # The switcher corrects this itself, muted; a write from here
+                # could land on live audio.  Keep verifying only.
+                pass
+            elif desired_clock != last_clock:
+                with transition_guard() as locked:
                     # Re-decide under the lock: a transition that finished
                     # while we waited has already moved both the config and
                     # the clock, and the answer may now be "nothing to do".
@@ -377,7 +398,12 @@ def main() -> int:
                         desired_clock = (
                             "optical" if source == "toslink" else "internal"
                         )
-                    if rate is None or source is None or desired_clock == last_clock:
+                    if (
+                        not locked
+                        or rate is None
+                        or source is None
+                        or desired_clock == last_clock
+                    ):
                         pass
                     elif desired_clock == last_write and now < rewrite_not_before:
                         # The device just contradicted this very write. Asking

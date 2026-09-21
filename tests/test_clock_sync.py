@@ -559,7 +559,7 @@ def test_main_redecides_under_the_lock_instead_of_undoing_a_transition(
     def switcher_finishes_while_we_wait():
         paths[0] = "/tmp/toslink.yml"
         guarded.append(True)
-        yield
+        yield True
 
     with (
         mock.patch.object(clock_sync, "STATE_PATH", state),
@@ -594,3 +594,50 @@ def test_clock_decisions_wait_for_the_audio_control_lock(tmp_path: Path) -> None
         entered.append("switcher done")
     worker.join(2)
     assert entered == ["switcher done", "clock_sync"]
+
+
+def _one_pass_wanting_optical(tmp_path: Path, **patches) -> mock.Mock:
+    state = tmp_path / "motu-clock-source"
+    state.write_text("internal\n")
+    client = _clock_sync_client(["/tmp/toslink.yml"])
+    with contextlib.ExitStack() as stack:
+        for target, name, value in (
+            (clock_sync, "STATE_PATH", state),
+            (clock_sync, "CamillaClient", mock.Mock(return_value=client)),
+            (clock_sync, "read_motu_clock", mock.Mock(return_value=None)),
+            *patches.get("extra", ()),
+        ):
+            stack.enter_context(mock.patch.object(target, name, value))
+        set_clock = stack.enter_context(mock.patch.object(clock_sync, "set_motu_clock"))
+        stack.enter_context(
+            mock.patch.object(clock_sync.time, "sleep", side_effect=KeyboardInterrupt)
+        )
+        stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+        with pytest.raises(KeyboardInterrupt):
+            clock_sync.main()
+    return set_clock
+
+
+def test_main_only_verifies_while_the_switcher_manages_the_clock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    unit = tmp_path / "cdsp-source-switcher.service"
+    unit.touch()
+    monkeypatch.setenv("SOURCE_SWITCHER_UNIT_PATH", str(unit))
+    _one_pass_wanting_optical(tmp_path).assert_not_called()
+
+    # Opting the switcher out hands the writes back to this daemon.
+    monkeypatch.setenv("SOURCE_MOTU_CLOCK", "false")
+    _one_pass_wanting_optical(tmp_path).assert_called_once_with("optical")
+
+
+def test_main_skips_the_write_when_the_lock_cannot_be_taken(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("SOURCE_SWITCHER_UNIT_PATH", str(tmp_path / "absent"))
+    blocked = tmp_path / "not-a-dir"
+    blocked.write_text("")
+    monkeypatch.setenv("AUDIO_CONTROL_LOCK_PATH", str(blocked / "audio.lock"))
+    _one_pass_wanting_optical(
+        tmp_path, extra=((clock_sync, "_next_motu_error_log", 0.0),)
+    ).assert_not_called()

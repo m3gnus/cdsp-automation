@@ -192,22 +192,37 @@ instead of being recorded as applied, and so is a send the device accepted but
 never applied.
 
 **Clock changes inside the mute window.** With the MOTU Clock Sync unit
-installed (`SOURCE_MOTU_CLOCK=auto`; `true`/`false` override), the source
-switcher makes the clock change itself in `apply_config`: muted, under the
-audio-control lock, after the integrity and selection checks and *before* the
-reload, then waits `MOTU_CLOCK_SETTLE_SECONDS` so the new graph opens the
-interface on a clock that has already re-locked. A transition that rolls back
-restores the previous clock, still muted, before reloading the previous graph.
-A clock already named by the shared `MOTU_CLOCK_STATE_PATH` cache is not
-written again. A failed clock write does not fail the transition - the audio
-path is fine, and the clock is merely late, as before.
+installed (`SOURCE_MOTU_CLOCK=auto`; `true`/`false` override), every clock
+write is made by the source switcher through one operation: under the
+audio-control lock, with mute requested, it first waits for the output to
+actually go silent, then writes, then waits `MOTU_CLOCK_SETTLE_SECONDS` for
+the re-lock. "Silent" is not the mute flag: CamillaDSP ramps mute over
+`volume_ramp_time` (400 ms by default), and behind the ramp sit up to
+`queuelimit` processed chunks plus the `target_level` device buffer. The
+switcher waits out the ramp, requires the playback peak meter to read at or
+below `MOTU_CLOCK_SILENT_DB` over the queued-audio window, then lets that span
+drain. If silence is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the
+ramp, the clock is not written.
 
-The daemon stays as verifier and fallback. Each pass it adopts the shared cache
-as its own last request, so a switcher write is not repeated; and it re-makes
-every write decision under the audio-control lock, so it cannot observe the
-half-way state of a transition (new clock, old config path) and write the old
-clock back. Without a switcher that lock is always free and the daemon behaves
-as it did before.
+In a source transition that operation runs after the integrity and selection
+checks and *before* the reload, so the new graph opens the interface on a
+clock that has already re-locked. A transition that rolls back restores the
+previous clock the same way before reloading the previous graph. A clock the
+shared `MOTU_CLOCK_STATE_PATH` cache already names is not written again.
+
+A failed write does not fail the transition, but it is never retried on live
+audio. The cache still disagrees with the source, and so does it when
+clock_sync's read-back contradicts a write. The switcher's loop notices, and
+- while readiness is held, at most once per `MOTU_CLOCK_RETRY_SECONDS` - runs a
+small muted correction under the lock: mute, the same silent write and
+settle, then the listener's previous mute state.
+
+The daemon only verifies while the switcher manages the clock (it detects the
+switcher's unit, `SOURCE_SWITCHER_UNIT_PATH`): it reads back, writes what the
+device really reports into the shared cache, and never writes the clock
+itself. Standalone, without a switcher, it writes as before, under the
+audio-control lock; if the lock cannot be taken it skips the write rather
+than making an uncoordinated one.
 
 **Note:** The payloads and read-back values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
 

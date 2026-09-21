@@ -140,6 +140,14 @@ MOTU_CLOCK_UNIT_PATH = Path(
 )
 # How long the MOTU gets to re-lock before the new graph is loaded on it.
 MOTU_CLOCK_SETTLE_SECONDS = float(os.environ.get("MOTU_CLOCK_SETTLE_SECONDS", "1.0"))
+# Extra time allowed, past the mute ramp and output buffer, for the playback
+# meter to confirm silence before a clock write is given up.
+MOTU_CLOCK_SILENCE_TIMEOUT = float(os.environ.get("MOTU_CLOCK_SILENCE_TIMEOUT", "1.0"))
+# Playback peak at or below this reads as silent.
+MOTU_CLOCK_SILENT_DB = float(os.environ.get("MOTU_CLOCK_SILENT_DB", "-100"))
+# Shortest gap between two out-of-transition clock corrections; each one
+# briefly mutes, so a MOTU that keeps refusing must not blip every pass.
+MOTU_CLOCK_RETRY_SECONDS = float(os.environ.get("MOTU_CLOCK_RETRY_SECONDS", "30"))
 TOSLINK_MOTU_METERS = env_bool("SOURCE_TOSLINK_MOTU_METERS", True)
 ANALOG_MOTU_METERS = env_bool("SOURCE_ANALOG_MOTU_METERS", False)
 MOTU_METER_ACTIVE_BELOW = int(os.environ.get("SOURCE_MOTU_METER_ACTIVE_BELOW", "250"))
@@ -1272,19 +1280,94 @@ def _owns_motu_clock() -> bool:
     return MOTU_CLOCK_UNIT_PATH.exists()
 
 
-def _set_motu_clock_muted(clock: str) -> bool:
-    """Write one clock source and let it re-lock; the caller holds mute."""
+def _output_drain_times(config: object) -> tuple[float, float]:
+    """(mute ramp, audio queued after the DSP) in seconds, per upstream.
+
+    Requesting mute only starts CamillaDSP's gain ramp (``volume_ramp_time``,
+    400 ms unless configured).  Behind the ramp sits audio already processed:
+    up to ``queuelimit`` chunks waiting for playback plus the device buffer
+    the engine keeps at ``target_level`` frames.  The pinned engine's defaults
+    are used for anything the config leaves out.
+    """
+    devices = config.get("devices") if isinstance(config, dict) else None
+    devices = devices if isinstance(devices, dict) else {}
+
+    def number(key: str, default: float) -> float:
+        value = devices.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+            return default
+        return float(value)
+
+    samplerate = number("samplerate", 48000.0) or 48000.0
+    chunksize = number("chunksize", 1024.0)
+    ramp = number("volume_ramp_time", 400.0) / 1000.0
+    queued = number("queuelimit", 4.0) * chunksize + number("target_level", chunksize)
+    return ramp, queued / samplerate
+
+
+def _await_output_silence(cdsp: CamillaClient) -> bool:
+    """Wait until the MOTU is being fed silence, not merely asked for it.
+
+    ``main_mute() == True`` is the request, not the result.  Wait out the
+    ramp, then require the playback meter -- measured on the chunks as they
+    are handed to the device -- to read silent over the queued-audio window,
+    then let the device buffer drain.  Returns False when silence cannot be
+    confirmed within the ramp plus MOTU_CLOCK_SILENCE_TIMEOUT; the caller then
+    does not write the clock.  A client without the meter falls back to the
+    computed drain time alone.
+    """
+    try:
+        config = cdsp.config.active()
+    except Exception:
+        config = None
+    ramp, queued = _output_drain_times(config)
+    time.sleep(ramp)
+    peak_since = getattr(getattr(cdsp, "levels", None), "playback_peak_since", None)
+    if peak_since is None:
+        time.sleep(queued)
+        return True
+    deadline = time.monotonic() + queued + max(MOTU_CLOCK_SILENCE_TIMEOUT, 0.0)
+    window = max(queued, 0.05)
+    while True:
+        try:
+            peaks = list(peak_since(window))
+        except Exception:
+            peaks = []
+        if peaks and all(float(peak) <= MOTU_CLOCK_SILENT_DB for peak in peaks):
+            # The meter sees the chunk as it is handed over; what the device
+            # still holds plays out within one more queued-audio span.
+            time.sleep(queued)
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _set_motu_clock_muted(cdsp: CamillaClient, clock: str) -> bool:
+    """The one managed clock write: silence first, then write, then settle.
+
+    The caller holds the audio-control lock and has requested mute.
+    """
     assert clock_sync is not None
+    if not _await_output_silence(cdsp):
+        print(f"MOTU clock not set to {clock}: output did not go silent", flush=True)
+        return False
     if not clock_sync.set_motu_clock(clock):
         return False
-    # The shared cache is how clock_sync learns this write was made: it
-    # re-reads it under the same lock and only verifies from here on.
+    # The shared cache is how clock_sync learns this write was made; from
+    # here on it only verifies.
     clock_sync.persist_clock(clock)
     time.sleep(MOTU_CLOCK_SETTLE_SECONDS)
     return True
 
 
-def _switch_motu_clock(target: dict | None) -> str | None:
+def _desired_clock(source: object) -> str | None:
+    if source not in SOURCE_PRIORITY:
+        return None
+    return "optical" if source == "toslink" else "internal"
+
+
+def _switch_motu_clock(cdsp: CamillaClient, target: dict | None) -> str | None:
     """Move the MOTU clock to the target's source inside the mute window.
 
     Runs muted, under the audio-control lock, *before* the reload, so the new
@@ -1293,39 +1376,80 @@ def _switch_motu_clock(target: dict | None) -> str | None:
     transition rolls back, or None when nothing was changed.
 
     A failed write does not fail the transition: the audio path itself is
-    fine, and clock_sync still owns retry and read-back, so the clock is only
-    late, as it always was before.  A clock the shared cache already names is
-    not written again: every write re-locks and clicks.
+    fine.  The cache then still disagrees with the source, and
+    ``reconcile_motu_clock`` retries -- muted again, from the switcher, never
+    from clock_sync.  A clock the cache already names is not written again:
+    every write re-locks and clicks.
     """
     if not target or not _owns_motu_clock():
         return None
-    source = target.get("source")
-    if source not in SOURCE_PRIORITY:
+    desired = _desired_clock(target.get("source"))
+    if desired is None:
         return None
     assert clock_sync is not None
-    desired = "optical" if source == "toslink" else "internal"
     believed = clock_sync.read_persisted_clock()
     if believed == desired:
         return None
-    if not _set_motu_clock_muted(desired):
+    if not _set_motu_clock_muted(cdsp, desired):
         print(
             f"MOTU clock not switched to {desired} inside the transition; "
-            "clock sync will retry",
+            "retrying muted later",
             flush=True,
         )
         return None
     return believed
 
 
-def _restore_motu_clock(previous_clock: str | None) -> None:
+def _restore_motu_clock(cdsp: CamillaClient, previous_clock: str | None) -> None:
     """Best-effort return of the clock during a muted rollback."""
     if previous_clock is None or clock_sync is None:
         return
     try:
-        if not _set_motu_clock_muted(previous_clock):
+        if not _set_motu_clock_muted(cdsp, previous_clock):
             print(f"MOTU clock not restored to {previous_clock}", flush=True)
     except Exception as exc:
         print(f"MOTU clock restore failed: {exc}", flush=True)
+
+
+class ClockReconciler:
+    """Correct a clock that disagrees with the live source, outside a switch.
+
+    The disagreement shows up in the shared cache: a transition whose clock
+    write failed leaves the old value there, and clock_sync writes back what
+    the device really reports.  The correction is its own small muted
+    transaction under the audio-control lock -- mute, wait for silence,
+    write, settle, restore the previous mute -- and is attempted at most once
+    per MOTU_CLOCK_RETRY_SECONDS.  It never runs while readiness is withheld:
+    whatever transition is pending will set the clock itself.
+    """
+
+    def __init__(self) -> None:
+        self.next_attempt = 0.0
+
+    def run(self, cdsp: CamillaClient, source: str | None, now: float) -> None:
+        if now < self.next_attempt or not _owns_motu_clock():
+            return
+        desired = _desired_clock(source)
+        if desired is None:
+            return
+        assert clock_sync is not None
+        if clock_sync.read_persisted_clock() == desired:
+            return
+        self.next_attempt = now + MOTU_CLOCK_RETRY_SECONDS
+        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+            if audio_inhibit_active(
+                AUDIO_READY_PATH, cdsp, generation=engine_generation()
+            ):
+                return
+            if clock_sync.read_persisted_clock() == desired:
+                return
+            previous_mute = bool(cdsp.volume.main_mute())
+            cdsp.volume.set_main_mute(True)
+            try:
+                if _set_motu_clock_muted(cdsp, desired):
+                    print(f"MOTU clock corrected to {desired} while muted", flush=True)
+            finally:
+                cdsp.volume.set_main_mute(previous_mute)
 
 
 def apply_config(
@@ -1390,7 +1514,7 @@ def apply_config(
                 or current_selection["revision"] != target["selection_revision"]
             ):
                 raise RuntimeError("speaker selection changed before config reload")
-        previous_clock = _switch_motu_clock(target)
+        previous_clock = _switch_motu_clock(cdsp, target)
         cdsp.config.set_file_path(file_path)
         cdsp.general.reload()
         time.sleep(settle_time)
@@ -1501,7 +1625,7 @@ def apply_config(
         except Exception:
             pass
         rollback_ok = False
-        _restore_motu_clock(previous_clock)
+        _restore_motu_clock(cdsp, previous_clock)
         if previous_path and os.path.exists(previous_path):
             try:
                 cdsp.config.set_file_path(previous_path)
@@ -1923,6 +2047,7 @@ def main() -> int:
     error_log_deadline = 0.0
     last_error_message = None
     next_audio_eq_check = 0.0
+    clock_reconciler = ClockReconciler()
     startup_restore_mute: bool | None = None
     startup_configs_validated = False
     recovery = ConfigRecoveryGuard()
@@ -2109,6 +2234,14 @@ def main() -> int:
                     except Exception:
                         pass
                     print(f"Audio EQ ensure failed: {exc}", flush=True)
+
+            # A clock this pass finds wrong (a failed in-transition write, or
+            # a read-back that contradicted one) is corrected muted, here.
+            if not inhibited:
+                try:
+                    clock_reconciler.run(cdsp, current_source, now)
+                except Exception as exc:
+                    print(f"MOTU clock correction failed: {exc}", flush=True)
 
             manual_source = read_manual_source()
             if manual_source and manual_source not in CONFIGS:

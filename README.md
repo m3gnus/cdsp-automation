@@ -403,20 +403,26 @@ MOTU_CLOCK_READBACK_RETRY_INTERVAL=300
 MOTU_CLOCK_REWRITE_INTERVAL=30
 ```
 
-When the Source Switcher is installed as well, it changes the clock itself,
-inside its muted source transition and before the new config is loaded, so the
-interface has re-locked before sound returns; a failed rollback puts the old
-clock back while still muted. The daemon then only verifies, and steps in for
-clock changes the switcher did not make. It decides under the same
-audio-control lock, so it never undoes a transition that is half done, and it
-reads the shared `MOTU_CLOCK_STATE_PATH` cache, so it never repeats the
-switcher's write. Switcher keys:
+When the Source Switcher is installed as well, it makes every clock write
+itself, and only into silence: inside its muted source transition, before the
+new config is loaded, it waits for CamillaDSP's mute ramp and output buffer
+to go quiet (confirmed on the playback meter), writes, and lets the interface
+re-lock before sound returns. A rolled-back transition puts the old clock
+back the same way. A write that failed - or that the daemon's read-back
+contradicts - is corrected later by the switcher in its own brief muted step,
+never on live audio. The daemon then only verifies: it reads the clock back
+and records what the device reports in the shared `MOTU_CLOCK_STATE_PATH`
+cache, and does not write the clock at all. Switcher keys:
 
 ```text
 # auto: drive the clock whenever the MOTU Clock Sync unit is installed
 SOURCE_MOTU_CLOCK=auto
 # re-lock time allowed before the new graph is loaded on the interface
 MOTU_CLOCK_SETTLE_SECONDS=1.0
+# optional: silence confirmation and correction pacing
+MOTU_CLOCK_SILENCE_TIMEOUT=1.0
+MOTU_CLOCK_SILENT_DB=-100
+MOTU_CLOCK_RETRY_SECONDS=30
 ```
 
 `MOTU_DATASTORE_URL` is no longer read; an existing line for it can be removed.

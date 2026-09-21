@@ -1293,6 +1293,198 @@ def test_clock_ownership_follows_the_setting_and_the_clock_sync_unit(
         assert switcher._owns_motu_clock()
 
 
+class FadingOutput:
+    """Playback meter that stays loud for a few reads after mute is asked."""
+
+    def __init__(self, events: list[str], loud_reads: int) -> None:
+        self.events = events
+        self.loud_reads = loud_reads
+
+    def playback_peak_since(self, _interval: float) -> list[float]:
+        if self.loud_reads > 0:
+            self.loud_reads -= 1
+            return [-12.0, -1000.0]
+        self.events.append("silent")
+        return [-1000.0, -1000.0]
+
+
+def test_output_drain_times_follow_the_config_and_upstream_defaults() -> None:
+    pi = {"devices": {"samplerate": 192000, "chunksize": 4096, "target_level": 8192}}
+    ramp, queued = switcher._output_drain_times(pi)
+    assert ramp == pytest.approx(0.4)
+    assert queued == pytest.approx((4 * 4096 + 8192) / 192000)
+    ramp, _ = switcher._output_drain_times(
+        {"devices": {"samplerate": 48000, "chunksize": 1024, "volume_ramp_time": 150}}
+    )
+    assert ramp == pytest.approx(0.15)
+
+
+def test_the_clock_is_written_only_once_the_output_is_silent(tmp_path: Path) -> None:
+    """A muted flag is the request; the playback meter is the result."""
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events)
+    clock = FakeClock()
+    cdsp = SimpleNamespace(
+        config=SimpleNamespace(active=lambda: {"devices": {"samplerate": 48000}}),
+        levels=FadingOutput(events, loud_reads=3),
+    )
+    with (
+        patch.object(switcher, "clock_sync", motu),
+        patch.object(switcher, "time", clock),
+        patch.object(switcher, "MOTU_CLOCK_SETTLE_SECONDS", 1.0),
+    ):
+        assert switcher._set_motu_clock_muted(cdsp, "optical")
+    assert events == ["silent", "clock:optical"]
+    # The ramp was waited out before the meter was even consulted.
+    assert clock.slept[0] == pytest.approx(0.4)
+    assert motu.cached == "optical"
+
+
+def test_a_clock_is_not_written_into_output_that_never_went_silent(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events)
+    cdsp = SimpleNamespace(
+        config=SimpleNamespace(active=lambda: {"devices": {"samplerate": 48000}}),
+        levels=FadingOutput(events, loud_reads=10**6),
+    )
+    with (
+        patch.object(switcher, "clock_sync", motu),
+        patch.object(switcher, "time", FakeClock()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        assert not switcher._set_motu_clock_muted(cdsp, "optical")
+    assert events == []
+    assert motu.cached == "internal"
+
+
+def reconciler_client(
+    tmp_path: Path, events: list[str], *, mute: bool = False
+) -> tuple[SimpleNamespace, str]:
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(tmp_path / "ready.json", generation=generation)
+
+    class RecordingVolume(FakeSwitcherVolume):
+        def set_main_mute(self, value: bool) -> None:
+            events.append(f"mute:{value}")
+            super().set_main_mute(value)
+
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(
+            str(tmp_path / "toslink.yml"),
+            description=speaker_profiles.engine_generation_marker(generation),
+        ),
+        volume=RecordingVolume(mute=mute),
+    )
+    return client, generation
+
+
+def run_reconciler(
+    tmp_path: Path,
+    motu: MotuClockRecorder,
+    client: SimpleNamespace,
+    generation: str,
+    *,
+    source: str = "toslink",
+    at: float = 0.0,
+    reconciler: object | None = None,
+) -> object:
+    reconciler = reconciler or switcher.ClockReconciler()
+    with (
+        patch.object(switcher, "clock_sync", motu),
+        patch.object(switcher, "SOURCE_MOTU_CLOCK", "true"),
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.object(switcher, "time", FakeClock()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        reconciler.run(client, source, at)  # type: ignore[attr-defined]
+    return reconciler
+
+
+def test_a_clock_correction_is_its_own_muted_transaction(tmp_path: Path) -> None:
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events)
+    client, generation = reconciler_client(tmp_path, events)
+    run_reconciler(tmp_path, motu, client, generation)
+    assert events == ["mute:True", "clock:optical", "mute:False"]
+    assert motu.cached == "optical"
+    # A listener who had muted stays muted.
+    events.clear()
+    muted, generation = reconciler_client(tmp_path, events, mute=True)
+    run_reconciler(tmp_path, MotuClockRecorder("internal", events), muted, generation)
+    assert events == ["mute:True", "clock:optical", "mute:True"]
+
+
+def test_clock_corrections_wait_for_readiness_and_are_rate_limited(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    client, generation = reconciler_client(tmp_path, events)
+    # Withheld readiness: a pending transition owns the clock change.
+    (tmp_path / "ready.json").unlink()
+    run_reconciler(tmp_path, MotuClockRecorder("internal", events), client, generation)
+    assert events == []
+
+    client, generation = reconciler_client(tmp_path, events)
+    refusing = MotuClockRecorder("internal", events, sends=False)
+    reconciler = run_reconciler(tmp_path, refusing, client, generation, at=100.0)
+    assert events == ["mute:True", "clock:optical", "mute:False"]
+    run_reconciler(
+        tmp_path, refusing, client, generation, at=110.0, reconciler=reconciler
+    )
+    assert events == ["mute:True", "clock:optical", "mute:False"]
+    run_reconciler(
+        tmp_path, refusing, client, generation,
+        at=100.0 + switcher.MOTU_CLOCK_RETRY_SECONDS, reconciler=reconciler,
+    )
+    assert events.count("clock:optical") == 2
+
+
+def test_a_failed_switch_write_is_retried_muted_by_the_switcher_only(
+    tmp_path: Path,
+) -> None:
+    """The reviewer's sequence: switch write fails, audio returns, then what?"""
+    import clock_sync as real_clock_sync
+
+    events: list[str] = []
+    motu = MotuClockRecorder("internal", events, sends=False)
+    client, error = run_clocked_switch(tmp_path, motu)
+    assert error is None and client.volume.mute is False
+    assert motu.cached == "internal"
+
+    # clock_sync, with the switcher installed, sees the mismatch and only waits.
+    state = tmp_path / "motu-clock-source"
+    state.write_text("internal\n")
+    unit = tmp_path / "cdsp-source-switcher.service"
+    unit.touch()
+    daemon_client = mock.Mock()
+    daemon_client.is_connected.return_value = True
+    daemon_client.config.active.return_value = {"devices": {"samplerate": 48000}}
+    daemon_client.config.file_path.return_value = "/tmp/toslink.yml"
+    with (
+        patch.dict(os.environ, {"SOURCE_SWITCHER_UNIT_PATH": str(unit)}),
+        patch.object(real_clock_sync, "STATE_PATH", state),
+        patch.object(real_clock_sync, "CamillaClient", return_value=daemon_client),
+        patch.object(real_clock_sync, "read_motu_clock", return_value="internal"),
+        patch.object(real_clock_sync, "set_motu_clock") as daemon_write,
+        patch.object(real_clock_sync.time, "sleep", side_effect=KeyboardInterrupt),
+        contextlib.redirect_stdout(io.StringIO()),
+        pytest.raises(KeyboardInterrupt),
+    ):
+        real_clock_sync.main()
+    daemon_write.assert_not_called()
+
+    # The switcher's next pass corrects it, muted.
+    events.clear()
+    motu.sends = True
+    client, generation = reconciler_client(tmp_path, events)
+    run_reconciler(tmp_path, motu, client, generation)
+    assert events == ["mute:True", "clock:optical", "mute:False"]
+
+
 def test_verification_still_rejects_a_genuinely_different_active_config(
     tmp_path: Path,
 ) -> None:
