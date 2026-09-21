@@ -56,6 +56,9 @@ DEFAULT_ACCESS_PATH = "/var/lib/cdsp-automation/motu-access.lock"
 # pass. See TECHNICAL.md, "Choosing the window".
 DEFAULT_WINDOW_SECONDS = 5.0
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+# The longest any access may hold the device from the meter reader: the
+# longest claimant (a clock read-back: connect + frame, 3 s each) plus margin.
+MAX_HOLD_SECONDS = 10.0
 
 # Bound at import: tests (and callers) that patch time.monotonic to script
 # their own timing must not have it consumed by the access bookkeeping.
@@ -133,22 +136,46 @@ class MotuAccess:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def _parse(self, handle: Any, now: float) -> tuple[float | None, str]:
+    def _record(self, handle: Any, now: float) -> dict[str, Any] | None:
+        """The current boot's record, or None for anything unusable."""
         handle.seek(0)
         try:
             record = json.loads(handle.read() or "{}")
         except ValueError:
-            return None, ""
+            return None
         if not isinstance(record, dict) or record.get("boot_id") != self._boot_id():
-            return None, ""
+            return None
         at = record.get("monotonic")
         if isinstance(at, bool) or not isinstance(at, (int, float)):
-            return None, ""
-        at = float(at)
+            return None
         # A time in the future cannot come from this boot's clock.
-        if not math.isfinite(at) or at > now:
+        if not math.isfinite(float(at)) or float(at) > now:
+            return None
+        return record
+
+    def _parse(self, handle: Any, now: float) -> tuple[float | None, str]:
+        record = self._record(handle, now)
+        if record is None:
             return None, ""
-        return at, str(record.get("kind") or "unknown")
+        return float(record["monotonic"]), str(record.get("kind") or "unknown")
+
+    @staticmethod
+    def _busy_until(record: dict[str, Any] | None) -> float:
+        value = record.get("busy_until") if record else None
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
+        value = float(value)
+        if not math.isfinite(value):
+            return 0.0
+        # A span is bounded by its claimant's own timeouts; never trust one
+        # far beyond that, so a crashed claimant cannot starve the meters.
+        return min(value, float(record["monotonic"]) + MAX_HOLD_SECONDS)
+
+    def _write(self, handle: Any, record: dict[str, Any]) -> None:
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps(record))
+        handle.flush()
 
     def last_access(self) -> tuple[float | None, str]:
         """(monotonic time, kind) of the last recorded extra access."""
@@ -163,12 +190,17 @@ class MotuAccess:
             return 0.0
         return max(0.0, at + window_seconds() - now)
 
-    def claim(self, kind: str, *, deferrable: bool) -> float:
+    def claim(self, kind: str, *, deferrable: bool, hold: float = 0.0) -> float:
         """Record an extra access about to be made; return its time.
 
         A deferrable access raises AccessDeferred inside the window. A
         non-deferrable one (a clock write) always proceeds: if even the record
         cannot be written it is still allowed, and the caller should log it.
+
+        ``hold`` is the longest the access can keep the device (its own
+        timeouts).  Until it calls :meth:`release`, or that span runs out, the
+        switcher's meter reader will not reconnect: the device serves one
+        client, and a reconnect landing mid-access resets the access instead.
         """
         with self._locked(fcntl.LOCK_EX) as handle:
             now = self._clock()
@@ -177,18 +209,59 @@ class MotuAccess:
                 wait = at + window_seconds() - now
                 if wait > 0:
                     raise AccessDeferred(wait, last_kind)
-            handle.seek(0)
-            handle.truncate()
-            handle.write(
-                json.dumps({"boot_id": self._boot_id(), "monotonic": now, "kind": kind})
+            self._write(
+                handle,
+                {
+                    "boot_id": self._boot_id(),
+                    "monotonic": now,
+                    "kind": kind,
+                    "busy_until": now + max(float(hold), 0.0),
+                },
             )
-            handle.flush()
             return now
 
+    def release(self, claimed_at: float | None) -> None:
+        """End the busy span of the access claimed at ``claimed_at``.
 
-def claim_or_log(kind: str) -> None:
+        Best effort: a record that has since been replaced, or cannot be
+        used, is left alone -- the span then simply runs out.
+        """
+        if claimed_at is None:
+            return
+        try:
+            with self._locked(fcntl.LOCK_EX) as handle:
+                now = self._clock()
+                record = self._record(handle, now)
+                if record is None or float(record["monotonic"]) != claimed_at:
+                    return
+                record["busy_until"] = min(self._busy_until(record), now)
+                self._write(handle, record)
+        except AccessUnavailable:
+            pass
+
+    def connect_when_idle(self, connect: Callable[[], Any]) -> tuple[bool, Any]:
+        """Run the meter reader's (re)connect unless an access holds the device.
+
+        Checked and connected under the record's lock, so an access cannot
+        claim the device between the check and the connect.  Returns
+        ``(False, None)`` while an access is in progress; the reader simply
+        tries again on its next pass.  Without a usable record the reader
+        connects as it always did.
+        """
+        try:
+            with self._locked(fcntl.LOCK_EX) as handle:
+                now = self._clock()
+                if self._busy_until(self._record(handle, now)) > now:
+                    return False, None
+                return True, connect()
+        except AccessUnavailable:
+            return True, connect()
+
+
+def claim_or_log(kind: str, *, hold: float = 0.0) -> float | None:
     """Record a non-deferrable access; never stop it, only report trouble."""
     try:
-        MotuAccess().claim(kind, deferrable=False)
+        return MotuAccess().claim(kind, deferrable=False, hold=hold)
     except AccessUnavailable as exc:
         print(f"MOTU: access not recorded ({exc}); proceeding", flush=True)
+        return None

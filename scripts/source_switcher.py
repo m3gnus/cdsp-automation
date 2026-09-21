@@ -354,26 +354,41 @@ class MotuMeterReader:
         if now < self.next_connect_attempt:
             return False
 
-        self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
         if websocket is None:
+            self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
             self.log_error(
                 "MOTU meter connection unavailable: install websocket-client"
             )
             return False
 
-        try:
+        def attempt():
             ws = websocket.WebSocket()
             ws.settimeout(1)
             ws.connect(self.url, timeout=1)
             ws.settimeout(0.05)
-            self.ws = ws
-            self.connected_at = now
-            print(f"MOTU meters connected: {self.url}", flush=True)
-            return True
+            return ws
+
+        # A clock read-back, clock write or UI volume access in progress holds
+        # the device; connecting now would reset it.  Wait a pass instead,
+        # without the backoff: the device is there, just busy.
+        connect_when_idle = getattr(self.access, "connect_when_idle", None)
+        try:
+            if connect_when_idle is None:
+                went, ws = True, attempt()
+            else:
+                went, ws = connect_when_idle(attempt)
         except Exception as exc:
+            self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
             self.close()
             self.log_error(f"MOTU meter connection failed: {exc}")
             return False
+        if not went:
+            return False
+        self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
+        self.ws = ws
+        self.connected_at = now
+        print(f"MOTU meters connected: {self.url}", flush=True)
+        return True
 
     def read(self) -> dict[int, tuple[int, int]]:
         if not self.connect():

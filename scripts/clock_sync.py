@@ -68,6 +68,7 @@ STATE_PATH = Path(
 MOTU_CLOCK_SOURCE_PARAM = 11
 MOTU_CLOCK_SOURCE_VALUES = {3: "internal", 2: "optical"}
 MOTU_READBACK_TIMEOUT = float(os.environ.get("MOTU_CLOCK_READBACK_TIMEOUT", "3"))
+MOTU_WRITE_TIMEOUT = 3.0
 # How often a *confirmed* clock value is re-checked; this is what notices a
 # clock changed behind our back from CueMix 5.
 MOTU_VERIFY_INTERVAL = float(os.environ.get("MOTU_CLOCK_VERIFY_INTERVAL", "300"))
@@ -172,12 +173,12 @@ def set_motu_clock(source: str) -> bool:
     # A clock write is the one MOTU access that never waits for the shared
     # window (a source change is audible until it lands); it only records
     # itself, so read-backs and UI volume accesses keep clear of it.
-    claim_or_log("clock-write")
+    claimed = claim_or_log("clock-write", hold=MOTU_WRITE_TIMEOUT + 1.0)
     ws = None
     try:
         payload = binascii.unhexlify(payload_hex)
         ws = websocket.WebSocket()
-        ws.connect(MOTU_WS_URL, timeout=3)
+        ws.connect(MOTU_WS_URL, timeout=MOTU_WRITE_TIMEOUT)
         ws.send(payload, opcode=websocket.ABNF.OPCODE_BINARY)
         print(f"MOTU: clock source set to {source}", flush=True)
         return True
@@ -190,6 +191,7 @@ def set_motu_clock(source: str) -> bool:
                 ws.close()
             except Exception:
                 pass
+        MotuAccess().release(claimed)
 
 
 def clock_source_value(frame: bytes) -> int | None:
@@ -221,7 +223,11 @@ def read_motu_clock() -> str | None:
     AccessUnavailable when the shared record cannot be used, since connecting
     uncoordinated could keep the switcher's meters dark.
     """
-    MotuAccess().claim("clock-readback", deferrable=True)
+    access = MotuAccess()
+    # Connect plus waiting for the frame: two timeouts at most.
+    claimed = access.claim(
+        "clock-readback", deferrable=True, hold=2 * MOTU_READBACK_TIMEOUT + 1.0
+    )
     ws = None
     value = None
     try:
@@ -245,6 +251,7 @@ def read_motu_clock() -> str | None:
                 ws.close()
             except Exception:
                 pass
+        access.release(claimed)
     clock = MOTU_CLOCK_SOURCE_VALUES.get(value)
     if clock is None:
         _log_motu_error(f"MOTU: clock source {value} is neither internal nor optical")

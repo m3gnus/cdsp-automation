@@ -286,6 +286,18 @@ out the 10 s backoff. Each recorded access forgives one drop. A drop the
 record does not explain (the device vanished, a foreign client, an unreadable
 record) keeps the backoff.
 
+**An access in progress holds the device.** Each claim also records how long
+the access can keep the device at most (its own timeouts: 7 s for a clock
+read-back, 4 s for a clock write, 7 s for a UI volume access, never more than
+10 s), and the access releases it as soon as it closes its connection. The
+meter reader checks that span and reconnects under the record's lock, so it
+cannot reconnect in the middle of an access. It used to: after a clock write
+inside a source transition the switcher only notices the dropped meters once
+the transition is done, and on the rig that late reconnect landed 70 ms into a
+read-back that had just been let through the reopened window, resetting it
+before the device had sent its clock. A skipped pass costs no backoff; the
+reader connects on the next pass after the access ends.
+
 **Worst-case meter gap.** A single extra access costs the time the reader
 takes to notice the drop (up to one switcher pass, 1 s plus a 0.2 s read
 window) plus one pass to reconnect, and the dump before the first meter frame

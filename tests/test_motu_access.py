@@ -431,3 +431,122 @@ def test_meter_reader_without_a_usable_record_keeps_the_backoff(tmp_path: Path) 
         with contextlib.redirect_stdout(io.StringIO()):
             reader.read()
     assert reader.next_connect_attempt == backoff
+
+
+# ------------------------------------------------------------------ busy span
+
+
+def test_an_access_in_progress_keeps_the_meter_reader_off_the_device() -> None:
+    clock = FakeClock()
+    access = access_at(clock)
+    connects: list[float] = []
+
+    def connect() -> str:
+        connects.append(clock.now)
+        return "ws"
+
+    claimed = access.claim("clock-readback", deferrable=True, hold=7.0)
+    clock.now += 1.0
+    assert access.connect_when_idle(connect) == (False, None)
+    # Done early: the device is handed back at once, not after the hold.
+    access.release(claimed)
+    assert access.connect_when_idle(connect) == (True, "ws")
+    # The deferral window itself is unchanged by the release.
+    with pytest.raises(motu_access.AccessDeferred):
+        access.claim("ui-volume", deferrable=True)
+
+    # An access that never releases (it crashed) holds only for its span.
+    clock.now += 10.0
+    access.claim("clock-write", deferrable=False, hold=4.0)
+    clock.now += 3.9
+    assert access.connect_when_idle(connect)[0] is False
+    clock.now += 0.2
+    assert access.connect_when_idle(connect)[0] is True
+    assert len(connects) == 2
+
+
+def test_release_only_ends_its_own_span_and_a_forged_span_is_capped() -> None:
+    clock = FakeClock()
+    access = access_at(clock)
+    first = access.claim("clock-write", deferrable=False, hold=4.0)
+    clock.now += 0.5
+    access.claim("clock-readback", deferrable=False, hold=7.0)
+    access.release(first)  # superseded: must not free the read-back
+    assert access.connect_when_idle(lambda: "ws")[0] is False
+
+    record = json.loads(access.path.read_text())
+    record["busy_until"] = record["monotonic"] + 1e9
+    access.path.write_text(json.dumps(record))
+    clock.now += motu_access.MAX_HOLD_SECONDS + 0.1
+    assert access.connect_when_idle(lambda: "ws") == (True, "ws")
+
+
+def test_a_meter_reconnect_cannot_reset_a_read_back_in_progress() -> None:
+    """The live failure: the switcher noticed a clock write's drop late, and
+    its reconnect landed on a read-back that had just started, which lost
+    its settings dump to a connection reset."""
+    reader = source_switcher.MotuMeterReader("ws://motu:1280")
+    attempts: list[str] = []
+
+    class Meter:
+        def __init__(self) -> None:
+            attempts.append("meter-connect")
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+        def connect(self, *_a, **_k) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    class ReadBack:
+        """The device's settings dump; mid-read, the meter reader tries."""
+
+        def __init__(self) -> None:
+            self.frames = [bytes.fromhex("000b000003")]
+
+        def connect(self, *_a, **_k) -> None:
+            pass
+
+        def settimeout(self, _t: float) -> None:
+            pass
+
+        def recv_data(self):
+            with contextlib.redirect_stdout(io.StringIO()):
+                assert reader.connect() is False
+            return 2, self.frames.pop(0)
+
+        def close(self) -> None:
+            pass
+
+    meter_ws = types.SimpleNamespace(
+        WebSocket=Meter, WebSocketTimeoutException=TimeoutError,
+        ABNF=types.SimpleNamespace(OPCODE_BINARY=2),
+    )
+    with mock.patch.object(source_switcher, "websocket", meter_ws), \
+            mock.patch.object(clock_sync.websocket, "WebSocket", ReadBack):
+        assert clock_sync.read_motu_clock() == "internal"
+        assert attempts == []
+        # The read-back released the device: the next pass connects, with no
+        # 10 s backoff charged for the pass it had to skip.
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert reader.connect() is True
+    assert attempts == ["meter-connect"]
+
+
+def test_a_ui_volume_access_holds_the_device_only_while_it_runs() -> None:
+    clock = FakeClock()
+    device = Device()
+    access = motu_access.MotuAccess(clock=clock)
+    during: list[tuple[bool, object]] = []
+
+    def connect(url: str, timeout: float):
+        during.append(access.connect_when_idle(lambda: "ws"))
+        return device.connect(url, timeout)
+
+    control = motu_volume.MotuMainVolume(connect=connect, clock=clock)
+    assert control.status()["known"] is True
+    assert during == [(False, None)]
+    assert access.connect_when_idle(lambda: "ws") == (True, "ws")

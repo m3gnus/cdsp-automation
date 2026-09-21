@@ -304,6 +304,7 @@ class MotuMainVolume:
         # this process's requests from racing each other.
         self._access = access or MotuAccess(clock=clock)
         self._lock = threading.Lock()
+        self._claimed: float | None = None
         self._state: DeviceState | None = None
         self._state_at = 0.0
         self._confirmed = False
@@ -319,7 +320,10 @@ class MotuMainVolume:
     def _open(self) -> Any:
         """Claim the shared access window and connect. Every attempt counts."""
         try:
-            self._access.claim("ui-volume", deferrable=True)
+            # Connect, then read the state dump: two timeouts at most.
+            self._claimed = self._access.claim(
+                "ui-volume", deferrable=True, hold=2 * READ_TIMEOUT + 1.0
+            )
         except AccessDeferred as deferred:
             raise MotuVolumeRateLimited(deferred.retry_after, str(deferred)) from None
         except AccessUnavailable as exc:
@@ -328,6 +332,13 @@ class MotuMainVolume:
             self._error = f"MOTU access cannot be coordinated: {exc}"
             raise MotuVolumeError(self._error) from None
         return self._connect(motu_ws_url(), READ_TIMEOUT)
+
+    def _release(self) -> None:
+        """Hand the device back to the switcher's meters as soon as we are done."""
+        claimed, self._claimed = self._claimed, None
+        release = getattr(self._access, "release", None)
+        if release is not None:
+            release(claimed)
 
     def _read(self, ws: Any, now: float) -> DeviceState:
         try:
@@ -400,6 +411,7 @@ class MotuMainVolume:
                 finally:
                     if ws is not None:
                         _close(ws)
+                    self._release()
             return self._payload(now)
 
     def set(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -456,6 +468,7 @@ class MotuMainVolume:
             finally:
                 if ws is not None:
                     _close(ws)
+                self._release()
             result = self._payload(now)
             result["requested_db"] = requested
             result["written"] = target != expected_att
