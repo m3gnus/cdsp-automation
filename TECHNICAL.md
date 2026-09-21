@@ -172,6 +172,79 @@ a larger change than the read-back verification above.
 
 **Note:** The payloads and read-back values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
 
+### MOTU main output volume (control UI)
+
+The control UI's "MOTU main output" card replaces CueMix 5's main volume knob,
+which cannot reach the MOTU while it hangs off the Pi's USB network
+(`scripts/motu_volume.py`). It is CueMix's `kMainTrim`: parameter 5011, one
+byte of attenuation in dB (6 = -6 dB, 100 = -inf). It scales every output
+enabled in `kMainGroup` (parameter 5012, an int16 bit per output DAC). On this
+unit that group is `0x03ff`, meaning all ten analog line outputs. So the high
+(Main 1-2), mid (Line 3-4) and low (Line 5-6) crossover pairs always move
+together. A write is refused if the group ever stops covering all of them.
+
+- **Ceiling:** `MOTU_MAIN_VOLUME_MAX_DB` (default `-6`, the level the device
+  was found at). It is enforced server-side, because the MOTU sits after
+  CamillaDSP and the profile volume limits cannot bound it. An unparseable
+  value disables writes.
+- **No jumps:** the page starts the slider from the level the server read off
+  the device, and shows `unknown` with no slider when the device cannot be
+  read. Every write names the level it replaces and is refused (409) if the
+  device reports anything else, for example after the front-panel knob moved.
+- **One client:** the browser debounces the slider and sends only the latest
+  value once the shared access window reopens. Inside the window the server
+  answers 429 with `retry_after`. The next section covers the window.
+
+### Shared MOTU access window
+
+The MOTU serves one WebSocket client at a time. The source switcher's meter
+reader holds that slot, and any other connection drops it. The reader then
+refuses to reconnect sooner than `SOURCE_MOTU_CONNECT_RETRY_SECONDS` (10 s)
+after its previous connect. So if two extra connections land within ~10 s, the
+meters stay dark for ~10 s. That exceeds the TOSLINK tolerance (2 s of held
+values, `SOURCE_MOTU_METER_MAX_AGE`, plus the 5 s `SOURCE_TOSLINK_IDLE_SECONDS`
+debounce), and TOSLINK drops mid-song.
+
+Every extra connection is therefore recorded in `MOTU_ACCESS_PATH` (default
+`/var/lib/cdsp-automation/motu-access.lock`, `scripts/motu_access.py`). The
+record is a `CLOCK_MONOTONIC` reading plus the kernel boot id, written under
+`flock`. clock_sync and the switcher (install user) and the root control UI all
+use it. The installer pre-creates it as `$INSTALL_USER:$INSTALL_GROUP` with
+mode 0660. Accesses are ranked:
+
+1. **Clock write** (a source change): never waits, only records itself. If the
+   record is unusable it is logged and the write still goes out.
+2. **Clock read-back:** deferrable. Within `MOTU_ACCESS_WINDOW_SECONDS`
+   (default 15) of any recorded access it is postponed until the window
+   opens, without connecting. This includes the read-back that used to confirm
+   a clock write about 1 s after sending it. If the record is unusable, the
+   read-back is skipped.
+3. **UI volume** read or write: deferrable, 429 with `retry_after`. If the
+   record is unusable, the UI refuses to touch the MOTU.
+
+A clock write cannot be delayed and cannot be predicted, so a deferrable access
+may still land shortly before one. That is the switch *to* TOSLINK, where the
+meters are what confirm the source. The meter reader closes this gap. When its
+connection drops and the record shows an extra access made after that
+connection opened, the reader reconnects on its next pass instead of waiting
+out the 10 s backoff. Each recorded access forgives one drop. A drop the
+record does not explain (the device vanished, a foreign client, an unreadable
+record) keeps the backoff.
+
+**Worst-case meter gap.** A single extra access costs the time the reader
+takes to notice the drop (up to one switcher pass, 1 s plus a 0.2 s read
+window) plus one pass to reconnect, and the dump before the first meter frame
+(0.12 s measured). That is about 2.5-3.5 s. It happened once on a live read:
+the drop was logged and the reader reconnected 1.1 s later. Held values cover
+the first 2 s, so the TOSLINK idle counter advances by at most about 1.5 s of
+its 5 s. Deferrable accesses are at least 15 s from every other extra access,
+so their gaps never stack. The only possible stacking is a clock write right
+after a deferrable access. If the write lands before the reader has
+reconnected, both drops fall inside one gap. If it lands just after the
+reconnect but before the first meter frame, the gaps merge to about 5-6 s of
+no fresh meters. That is still under the ~7 s tolerance, with the idle
+counter reaching about 4 s. Previously that case stayed dark for ~10 s.
+
 ---
 
 ## 3. Source Switcher

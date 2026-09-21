@@ -1324,3 +1324,162 @@ def test_frontend_sends_the_token_and_recovers_from_a_challenge() -> None:
     # A 401 asks once and retries once; `retried` stops it looping.
     assert "if (res.status === 401 && !retried)" in page
     assert "return api(path, options, true);" in page
+
+
+# ---------------------------------------------------------- MOTU main volume
+
+
+@contextmanager
+def _motu_device(**device_kwargs: object):
+    """Point the UI's MOTU control at a replay of the real connect dump."""
+    import motu_volume
+    from test_motu_volume import Device, FakeClock
+
+    device = Device(**device_kwargs)  # type: ignore[arg-type]
+    clock = FakeClock()
+    control = motu_volume.MotuMainVolume(connect=device.connect, clock=clock)
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "MOTU_MAIN_VOLUME_MAX_DB",
+            "MOTU_ACCESS_WINDOW_SECONDS",
+            "MOTU_VOLUME_CACHE_SECONDS",
+            "INSTALLATION_UI_TOKEN",
+        )
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with patch.object(motu_volume, "MAIN_VOLUME", control):
+            yield device, clock
+
+
+def _get(path: str) -> _DrivableHandler:
+    handler = _DrivableHandler(path, _raw_headers(), b"")
+    handler.command = "GET"
+    handler.do_GET()
+    return handler
+
+
+def test_motu_volume_change_is_token_gated_and_the_read_is_not() -> None:
+    body = json.dumps({"volume_db": -20, "expected_db": -6}).encode()
+    with _motu_device() as (device, clock):
+        with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+            refused = _post("/api/motu/volume", body=body)
+            refused.do_POST()
+            assert refused.status == HTTPStatus.UNAUTHORIZED
+            cross_site = _post(
+                "/api/motu/volume",
+                body=body,
+                origin="http://evil.example",
+                token="s3cret-value",
+            )
+            cross_site.do_POST()
+            assert cross_site.status == HTTPStatus.FORBIDDEN
+            assert device.sockets == []
+
+            read = _get("/api/motu/volume")
+            assert read.status == HTTPStatus.OK
+            assert read.response_body()["motu"]["volume_db"] == -6.0
+
+            clock.now += 60
+            allowed = _post("/api/motu/volume", body=body, token="s3cret-value")
+            allowed.do_POST()
+            assert allowed.status == HTTPStatus.OK
+    assert device.sent == [bytes.fromhex("13930000000114")]
+
+
+def test_motu_volume_ceiling_holds_for_a_request_straight_to_the_server() -> None:
+    with _motu_device() as (device, _clock):
+        with patch.dict(os.environ, {"MOTU_MAIN_VOLUME_MAX_DB": "-10"}):
+            handler = _post(
+                "/api/motu/volume",
+                body=json.dumps({"volume_db": 0, "expected_db": -6}).encode(),
+            )
+            handler.do_POST()
+    assert handler.status == HTTPStatus.OK
+    assert handler.response_body()["motu"]["volume_db"] == -10.0
+    assert device.sent == [bytes.fromhex("1393000000010a")]
+
+
+def test_motu_volume_unknown_device_is_reported_and_writes_are_refused() -> None:
+    with _motu_device(fail=True) as (device, clock):
+        read = _get("/api/motu/volume")
+        motu = read.response_body()["motu"]
+        assert motu["known"] is False and motu["volume_db"] is None
+        assert motu["writable"] is False
+
+        clock.now += 60
+        handler = _post(
+            "/api/motu/volume",
+            body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
+        )
+        handler.do_POST()
+    assert handler.status == HTTPStatus.SERVICE_UNAVAILABLE
+    assert handler.response_body()["motu"]["known"] is False
+    assert device.sent == []
+
+
+def test_motu_volume_burst_is_answered_429_with_retry_after() -> None:
+    with _motu_device() as (device, clock):
+        first = _post(
+            "/api/motu/volume",
+            body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
+        )
+        first.do_POST()
+        assert first.status == HTTPStatus.OK
+        clock.now += 1
+        second = _post(
+            "/api/motu/volume",
+            body=json.dumps({"volume_db": -21, "expected_db": -20}).encode(),
+        )
+        second.do_POST()
+    assert second.status == HTTPStatus.TOO_MANY_REQUESTS
+    assert second.response_body()["retry_after"] == 14.0
+    assert len(device.sockets) == 1
+
+
+def test_motu_volume_stale_expected_level_is_a_conflict_with_the_real_level() -> None:
+    with _motu_device() as (device, _clock):
+        handler = _post(
+            "/api/motu/volume",
+            body=json.dumps({"volume_db": -3, "expected_db": -30}).encode(),
+        )
+        handler.do_POST()
+    assert handler.status == HTTPStatus.CONFLICT
+    assert handler.response_body()["motu"]["volume_db"] == -6.0
+    assert device.sent == []
+
+
+def test_motu_volume_page_starts_from_the_device_and_debounces() -> None:
+    page = web_ui.HTML
+    # Read once at page load, never from the 5 s status sweep.
+    load_body = page[
+        page.index("async function load() {") : page.index("async function pollLevels()")
+    ]
+    assert "motu" not in load_body.lower()
+    assert "\n    loadMotu();\n" in page
+    # The slider exists only once a real reading is known; an unknown level
+    # renders as text with no control to drag.
+    render = page[
+        page.index("function renderMotu() {") : page.index("function renderMotuCaption() {")
+    ]
+    assert render.index("if (!known)") < render.index('id="motuRange"')
+    # Every write names the level it replaces, and moves are debounced and
+    # retried after the server's window rather than sent per pixel.
+    assert "expected_db: motu.volume_db" in page
+    assert "setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS" in page
+    assert "e.status === 429" in page
+    # Nothing on this control touches the CamillaDSP mute or the ready token.
+    motu_js = page[
+        page.index("MOTU main volume ---") : page.index("/* ---------------- actions")
+    ]
+    assert "mute" not in motu_js.lower() and "/api/camilla" not in motu_js
+
+
+def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
+    installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
+    assert "motu_access.py motu_volume.py web_ui.py" in installer
+    assert "\nMOTU_MAIN_VOLUME_MAX_DB=-6\n" in installer
+    assert "\nMOTU_ACCESS_WINDOW_SECONDS=15\n" in installer
+    assert "\nMOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock\n" in installer

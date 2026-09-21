@@ -11,6 +11,7 @@ from pathlib import Path
 import websocket
 from camilladsp import CamillaClient
 
+from motu_access import AccessDeferred, AccessUnavailable, MotuAccess, claim_or_log
 from speaker_config import (
     SOURCE_IDS,
     env_managed_config_dirs,
@@ -119,6 +120,10 @@ def set_motu_clock(source: str) -> bool:
         print(f"MOTU: unknown clock source {source}", flush=True)
         return False
 
+    # A clock write is the one MOTU access that never waits for the shared
+    # window (a source change is audible until it lands); it only records
+    # itself, so read-backs and UI volume accesses keep clear of it.
+    claim_or_log("clock-write")
     ws = None
     try:
         payload = binascii.unhexlify(payload_hex)
@@ -161,7 +166,13 @@ def read_motu_clock() -> str | None:
     when the device cannot be read or reports a source we do not drive
     (S/PDIF). None is "unknown", never "wrong": callers fall back to the
     cached value rather than forcing an audible re-lock on a guess.
+
+    A read-back is deferrable: inside the shared MOTU access window it raises
+    AccessDeferred (with ``retry_after``) without connecting, and it raises
+    AccessUnavailable when the shared record cannot be used, since connecting
+    uncoordinated could keep the switcher's meters dark.
     """
+    MotuAccess().claim("clock-readback", deferrable=True)
     ws = None
     value = None
     try:
@@ -282,7 +293,18 @@ def main() -> int:
             # and a clock change that is already due must never wait behind
             # a read-back that a silent device can stall until it times out.
             if desired_clock == last_clock and now >= next_readback:
-                actual = read_motu_clock()
+                try:
+                    actual = read_motu_clock()
+                except AccessDeferred as deferred:
+                    # Another MOTU access (often our own clock write just
+                    # now) is too recent: a second one would keep the
+                    # switcher's meters down. Verify once the window opens.
+                    next_readback = now + deferred.retry_after
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                except AccessUnavailable as exc:
+                    _log_motu_error(f"MOTU: clock read-back skipped: {exc}")
+                    actual = None
                 if actual is None:
                     verified = False
                     next_readback = now + MOTU_READBACK_RETRY_INTERVAL

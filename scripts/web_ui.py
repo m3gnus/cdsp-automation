@@ -22,6 +22,7 @@ from typing import Any, Iterator
 
 import yaml
 
+import motu_volume
 from audio_eq import (
     atomic_write_json,
     audio_state_lock,
@@ -596,6 +597,11 @@ HTML = r"""<!doctype html>
             <div id="volumePanel"></div>
           </div>
           <div class="card">
+            <div class="cap">MOTU main output <span id="motuBadge" class="badge">—</span></div>
+            <div id="motuPanel"></div>
+            <div class="sub2" id="motuCaption"></div>
+          </div>
+          <div class="card">
             <div class="cap">Speaker profile</div>
             <div id="dashboardSpeaker" class="speaker-summary"></div>
           </div>
@@ -741,7 +747,11 @@ HTML = r"""<!doctype html>
           return api(path, options, true);
         }
       }
-      if (!res.ok) throw new Error(data.error || text || res.statusText);
+      if (!res.ok) {
+        const err = new Error(data.error || text || res.statusText);
+        err.status = res.status; err.data = data;
+        throw err;
+      }
       return data;
     }
 
@@ -1176,6 +1186,104 @@ HTML = r"""<!doctype html>
       sel.value = services[cur] && services[cur].load !== "not-found" ? cur : "camilladsp.service";
     }
 
+    /* ---------------- MOTU main volume ----------------
+       The MOTU's own output level, after CamillaDSP.  The control starts only
+       from a level the server read off the device (never a default), and each
+       write names the level it expects to replace, so it cannot jump.  The
+       MOTU serves one client at a time and every access briefly drops the
+       source switcher's meters: slider moves are debounced here and the server
+       allows one device access per window, sending the latest value after. */
+    let motu = null, motuTarget = null, motuTimer = null, motuBusy = false, motuWaitUntil = 0;
+    const MOTU_DEBOUNCE_MS = 700;
+    const motuDb = v => v == null ? "unknown" : (v <= -100 ? "−∞" : `${v.toFixed(0)}`);
+    function renderMotu() {
+      const panel = qs("#motuPanel"), badge = qs("#motuBadge");
+      if (!panel) return;
+      const known = !!(motu && motu.known);
+      const writable = known && motu.writable && motu.max_db != null;
+      badge.textContent = !known ? "unknown" : (motu.confirmed ? "read" : "sent");
+      badge.className = "badge " + (!known ? "bad" : (writable ? "ok" : "warn"));
+      if (!known) {
+        panel.innerHTML = `<div class="val sm bad">unknown</div>
+          <div class="row" style="margin-top:10px"><button class="btn sm" id="motuRead">Read from MOTU</button></div>`;
+        qs("#motuRead").addEventListener("click", loadMotu);
+      } else if (!qs("#motuRange") || motuTarget == null) {
+        // Rebuilt only while no drag is pending, so a reply never yanks the
+        // slider out from under the operator's finger.
+        const max = writable ? motu.max_db : motu.volume_db;
+        const shown = Math.min(motu.volume_db, max);
+        panel.innerHTML = `<div class="volume">
+            <input id="motuRange" type="range" min="${motu.min_db}" max="${max}" step="1" value="${shown}" ${writable ? "" : "disabled"}>
+            <div class="val sm" id="motuValue">${motuDb(shown)}<span class="unit"> dB</span></div>
+          </div>
+          <div class="row" style="margin-top:10px"><button class="btn sm" id="motuRead">Read again</button></div>`;
+        qs("#motuRange").addEventListener("input", motuInput);
+        qs("#motuRead").addEventListener("click", loadMotu);
+      }
+      renderMotuCaption();
+    }
+    function renderMotuCaption() {
+      const cap = qs("#motuCaption"); if (!cap) return;
+      const known = !!(motu && motu.known);
+      const notes = [];
+      if (known) notes.push(`device at <b>${motuDb(motu.volume_db)} dB</b>${motu.confirmed ? "" : " (sent, not yet read back)"}`);
+      if (known && motu.max_db != null) notes.push(`ceiling ${motu.max_db.toFixed(0)} dB (MOTU_MAIN_VOLUME_MAX_DB)`);
+      if (known && motu.max_db != null && motu.volume_db > motu.max_db) notes.push(`<span class="warn">above the ceiling</span>`);
+      if (motuTarget != null) {
+        const wait = Math.ceil((motuWaitUntil - Date.now()) / 1000);
+        notes.push(`<span class="warn">${motuDb(motuTarget)} dB pending${wait > 0 ? ` in ${wait} s` : ""}</span>`);
+      }
+      if (motu && motu.reason) notes.push(`<span class="bad">${esc(motu.reason)}</span>`);
+      cap.innerHTML = notes.join(" · ");
+    }
+    async function loadMotu() {
+      try {
+        motu = (await api("/api/motu/volume")).motu;
+        if (motu && motu.retry_after > 0) motuWaitUntil = Date.now() + 1000 * motu.retry_after + 250;
+      }
+      catch (e) { motu = null; toast(e.message); }
+      renderMotu();
+    }
+    function motuInput(e) {
+      motuTarget = Number(e.target.value);
+      const label = qs("#motuValue"); if (label) label.innerHTML = `${motuDb(motuTarget)}<span class="unit"> dB</span>`;
+      renderMotuCaption();
+      clearTimeout(motuTimer);
+      motuTimer = setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS, motuWaitUntil - Date.now()));
+    }
+    async function flushMotu() {
+      if (motuBusy || motuTarget == null) return;
+      if (!motu || !motu.known || !motu.writable) { motuTarget = null; renderMotu(); return; }
+      if (motuTarget === motu.volume_db) { motuTarget = null; renderMotu(); return; }
+      motuBusy = true;
+      const target = motuTarget;
+      try {
+        const d = await api("/api/motu/volume", { method: "POST", body: JSON.stringify({ volume_db: target, expected_db: motu.volume_db }) });
+        motu = d.motu;
+        if (motuTarget === target) motuTarget = null;
+      } catch (e) {
+        if (e.status === 429) {
+          // Keep the latest target and send it when the window reopens.
+          motuWaitUntil = Date.now() + 1000 * Number(e.data?.retry_after || 5) + 250;
+          clearTimeout(motuTimer);
+          motuTimer = setTimeout(flushMotu, motuWaitUntil - Date.now());
+        } else {
+          // Refused: re-sync to what the device reports, drop the target.
+          motu = e.data?.motu || null; motuTarget = null;
+          toast(e.message);
+        }
+      } finally {
+        motuBusy = false;
+        if (motu && motu.retry_after > 0) motuWaitUntil = Math.max(motuWaitUntil, Date.now() + 1000 * motu.retry_after + 250);
+        // A value dragged to while this request was in flight still goes out.
+        if (motuTarget != null && motuTarget !== target) {
+          clearTimeout(motuTimer);
+          motuTimer = setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS, motuWaitUntil - Date.now()));
+        }
+        renderMotu();
+      }
+    }
+
     /* ---------------- actions ---------------- */
     async function setVolume(payload) { try { await api("/api/camilla/volume", { method: "POST", body: JSON.stringify(payload) }); await load(); } catch (e) { toast(e.message); } }
     function currentVolumeInput() { return Number(qs("#volNum").value); }
@@ -1348,6 +1456,10 @@ HTML = r"""<!doctype html>
     animateEq();
     if (location.hash.slice(1)) activateTab(location.hash.slice(1));
     load().catch(e => toast(e.message));
+    // Once per page load, not with the 5 s status sweep: each device read
+    // briefly drops the source switcher's meters.
+    loadMotu();
+    setInterval(() => { if (motuTarget != null) renderMotuCaption(); }, 1000);
     // A backgrounded phone must not keep the Pi spawning a status sweep every
     // 5s; refresh immediately instead when the page becomes visible again.
     const refresh = () => { if (!document.hidden) load().catch(() => {}); };
@@ -2438,6 +2550,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(camilla_levels())
             return
 
+        if parsed.path == "/api/motu/volume":
+            # A read, so ungated like every GET; it touches the device at most
+            # once per rate-limit window and otherwise answers from cache.
+            self.send_json({"ok": True, "motu": motu_volume.MAIN_VOLUME.status()})
+            return
+
         if parsed.path == "/api/audio":
             try:
                 self.send_json(audio_eq_payload())
@@ -2487,6 +2605,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/camilla/volume":
                 self.send_json({"ok": True, "camilla": set_camilla_volume(payload)})
+                return
+
+            if parsed.path == "/api/motu/volume":
+                self.send_motu_volume_change(payload)
                 return
 
             if parsed.path == "/api/audio":
@@ -2554,6 +2676,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+
+    def send_motu_volume_change(self, payload: dict[str, Any]) -> None:
+        """Apply a MOTU main-volume change, mapping refusals to statuses.
+
+        Every refusal carries the current reading, so the page re-syncs its
+        control to the device instead of retrying from a stale value.
+        """
+        control = motu_volume.MAIN_VOLUME
+        try:
+            result = control.set(payload)
+        except motu_volume.MotuVolumeRateLimited as exc:
+            body = {"ok": False, "error": str(exc), "retry_after": exc.retry_after}
+            self.send_json(body, HTTPStatus.TOO_MANY_REQUESTS)
+            return
+        except motu_volume.MotuVolumeError as exc:
+            status = {
+                "conflict": HTTPStatus.CONFLICT,
+                "refused": HTTPStatus.CONFLICT,
+            }.get(exc.kind, HTTPStatus.SERVICE_UNAVAILABLE)
+            # status() only answers from cache here: the failed attempt just
+            # used this window's device access.
+            self.send_json(
+                {"ok": False, "error": str(exc), "motu": control.status()}, status
+            )
+            return
+        self.send_json({"ok": True, "motu": result})
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}", flush=True)

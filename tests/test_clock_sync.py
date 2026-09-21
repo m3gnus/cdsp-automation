@@ -220,6 +220,11 @@ class ClockSyncTests(unittest.TestCase):
         self.assertEqual(sock.frames, frames[clock_at + 1 :])
 
     def test_read_back_maps_optical_and_leaves_other_sources_unknown(self) -> None:
+        # Several read-backs in one test: lift the shared access window, which
+        # has its own tests below.
+        window = mock.patch.dict(os.environ, {"MOTU_ACCESS_WINDOW_SECONDS": "0"})
+        window.start()
+        self.addCleanup(window.stop)
         def dump_with_clock(value: int) -> list[bytes]:
             return [
                 frame[:4] + bytes([value])
@@ -245,6 +250,11 @@ class ClockSyncTests(unittest.TestCase):
         self.assertIn("neither internal nor optical", out.getvalue())
 
     def test_read_back_reports_unknown_when_the_device_cannot_be_read(self) -> None:
+        # Several read-backs in one test: lift the shared access window, which
+        # has its own tests below.
+        window = mock.patch.dict(os.environ, {"MOTU_ACCESS_WINDOW_SECONDS": "0"})
+        window.start()
+        self.addCleanup(window.stop)
         offline = mock.Mock()
         offline.connect.side_effect = OSError("no route")
         with (

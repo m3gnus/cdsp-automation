@@ -299,7 +299,7 @@ if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; 
         self.assertIn("GATE=CANCELLED", result.stdout)
         self.assertEqual(contents, env_file.read_text(encoding="utf-8"))
 
-    def test_state_storage_claims_the_three_shared_locks(self) -> None:
+    def test_state_storage_claims_the_shared_locks(self) -> None:
         """Lazy creation never chowns, so a fresh install claims these up front."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -314,6 +314,7 @@ if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; 
                         f"AUDIO_EQ_PATH={state}/audio-eq.json",
                         f"AUDIO_CONTROL_LOCK_PATH={state}/audio-control.lock",
                         f"MOTU_CLOCK_STATE_PATH={state}/motu-clock-source",
+                        f"MOTU_ACCESS_PATH={state}/motu-access.lock",
                         f"SPEAKER_SELECTION_PATH={state}/speaker-selection.json",
                         f"SPEAKER_TRANSITION_PATH={state}/speaker-transition.json",
                         f"SPEAKER_AUDIO_DIR={state}/speaker-audio",
@@ -368,6 +369,9 @@ ensure_audio_state_storage
                 state / "audio-eq.json.lock",
                 state / "audio-control.lock",
                 state / "speaker-selection.json.lock",
+                # Written by clock_sync and the switcher (install user) and by
+                # the root control UI.
+                state / "motu-access.lock",
             ):
                 self.assertTrue(lock.is_file(), lock)
                 self.assertEqual(lock.stat().st_mode & 0o777, 0o660)

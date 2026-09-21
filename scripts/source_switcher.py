@@ -27,6 +27,7 @@ from audio_eq import (
     effective_preamp_db,
     status_payload,
 )
+from motu_access import AccessUnavailable, MotuAccess
 from speaker_config import (
     compile_profile_config,
     config_digest,
@@ -291,13 +292,18 @@ def iso226_capability_available() -> bool:
 class MotuMeterReader:
     """Read passive meter frames from MOTU UltraLite mk5 CueMix WebSocket."""
 
-    def __init__(self, url: str) -> None:
+    def __init__(self, url: str, access: MotuAccess | None = None) -> None:
         self.url = url
         self.ws = None
         self.last_pairs: dict[int, tuple[int, int]] = {}
         self.last_seen = 0.0
         self.next_connect_attempt = 0.0
         self.next_error_log = 0.0
+        self.connected_at = 0.0
+        # The extra MOTU accesses (clock writes and read-backs, control-UI
+        # volume) are recorded in a shared file; see motu_access.py.
+        self.access = access or MotuAccess()
+        self.forgiven_access: float | None = None
 
     def close(self) -> None:
         if self.ws is None:
@@ -334,6 +340,7 @@ class MotuMeterReader:
             ws.connect(self.url, timeout=1)
             ws.settimeout(0.05)
             self.ws = ws
+            self.connected_at = now
             print(f"MOTU meters connected: {self.url}", flush=True)
             return True
         except Exception as exc:
@@ -358,6 +365,7 @@ class MotuMeterReader:
             except Exception as exc:
                 self.close()
                 self.log_error(f"MOTU meter read failed: {exc}")
+                self.forgive_coordinated_kick()
                 break
 
             # MOTU meter frames are binary. A text frame here is never a valid
@@ -379,6 +387,31 @@ class MotuMeterReader:
         if time.monotonic() - self.last_seen > MOTU_METER_MAX_AGE:
             return {}
         return self.last_pairs
+
+
+    def forgive_coordinated_kick(self) -> None:
+        """Reconnect on the next pass when a recorded MOTU access explains
+        the drop, instead of after the SOURCE_MOTU_CONNECT_RETRY_SECONDS
+        backoff.
+
+        The device serves one client at a time, so every extra access drops
+        this connection. The backoff exists for a device that is absent; a
+        drop caused by an access recorded after this connection was made says
+        the device is right there. Without this, an access followed within
+        ~10 s by another (a UI volume change, then a clock write for a switch
+        to TOSLINK) keeps the meters dark ~10 s and TOSLINK drops. Each
+        recorded access forgives at most one drop, and an unexplained drop (or
+        an unreadable record) keeps the backoff.
+        """
+        try:
+            at, kind = self.access.last_access()
+        except AccessUnavailable:
+            return
+        if at is None or at < self.connected_at or at == self.forgiven_access:
+            return
+        self.forgiven_access = at
+        self.next_connect_attempt = time.monotonic()
+        print(f"MOTU meters displaced by a {kind} access; reconnecting", flush=True)
 
 
 def meter_pairs_active(
