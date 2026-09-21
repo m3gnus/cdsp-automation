@@ -67,6 +67,8 @@ def env_bool(name: str, default: bool = False) -> bool:
 CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 CHECK_INTERVAL = float(os.environ.get("SOURCE_CHECK_INTERVAL", "1.0"))
+# Longest span one arbitration pass may account for (see main()).
+MAX_ARBITRATION_STEP = 5 * CHECK_INTERVAL
 # How long a source whose playback has been *confirmed* is held through
 # silence before the switcher looks elsewhere.  This is the track-gap grace
 # period and its meaning is unchanged.
@@ -673,20 +675,29 @@ class ConfigRecoveryGuard:
             self.last_message = message
             self.next_log = now + self.log_seconds
 
-    def _inhibit(self, cdsp: CamillaClient, now: float) -> None:
+    def _inhibit(self, cdsp: CamillaClient, now: float) -> bool:
         """Latch muted before recovery so the reload cannot become audible.
 
         A remembered config that failed to activate has never been through the
         verified apply path.  Dropping readiness here makes the main loop treat
         the recovered graph exactly like an intentional transition: muted,
         re-resolved, re-validated and re-stamped before anything may unmute.
+
+        Dropping the token only stops cooperating controls from unmuting; it
+        does not mute the engine.  So the mute is read back, and any failure
+        -- lock, token, request or read-back -- returns False, which the caller
+        must treat as "do not reload".
         """
         try:
             with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
                 set_audio_inhibit(AUDIO_READY_PATH)
                 cdsp.volume.set_main_mute(True)
+                if not bool(cdsp.volume.main_mute()):
+                    raise RuntimeError("engine did not report mute after the request")
         except Exception as exc:
             self._log(f"CamillaDSP recovery could not latch mute: {exc}", now)
+            return False
+        return True
 
     def ready(self, cdsp: CamillaClient, now: float) -> bool:
         state = _processing_state(cdsp)
@@ -696,10 +707,14 @@ class ConfigRecoveryGuard:
             self.next_log = 0.0
             self.last_message = None
             return True
-        self._inhibit(cdsp, now)
+        muted = self._inhibit(cdsp, now)
         if now < self.next_attempt:
             return False
         self.next_attempt = now + self.retry_seconds
+        if not muted:
+            # Reloading unmuted could make an unverified config audible; wait
+            # for the next attempt instead.
+            return False
 
         remembered = cdsp.config.file_path()
         try:
@@ -970,13 +985,12 @@ def _configs_equivalent(actual: dict, expected: dict) -> bool:
 def _engine_parsed_config(cdsp: CamillaClient, file_path: str) -> dict | None:
     """Return the engine's own parse of ``file_path``, or None if unavailable.
 
-    Normalization approach: let the engine define it. ``config.active()`` is
-    the engine's serialization of a config it loaded through ReadConfigFile,
-    which fills in defaults and resolves relative coefficient paths against
-    the config file's own directory. Asking the engine to read that same file
-    yields the identical representation, so the read-back comparison is
-    like-for-like without this module maintaining an allowlist of optional
-    fields that would drift with every upstream release.
+    Normalization approach: let the engine define it. Asking the engine to
+    read the file yields its own deserialization, defaults filled in, so the
+    read-back comparison needs no allowlist of optional fields that would
+    drift with every upstream release.  ReadConfigFile does *not* run the
+    filename-aware validation a reload does (token substitution, relative
+    coefficient paths); ``_engine_load_view`` adds that step on top.
 
     The file we ask the engine to parse is the file we just handed it, and
     ``apply_config`` has already checked its digest against the target, so
@@ -993,6 +1007,76 @@ def _engine_parsed_config(cdsp: CamillaClient, file_path: str) -> dict | None:
     except Exception:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+def _engine_load_view(config: dict, config_path: str) -> dict:
+    """Apply the preprocessing CamillaDSP performs when it loads ``config_path``.
+
+    Neither the engine's ReadConfigFile nor our own YAML read does this, but a
+    reload validates the file *with its filename*, which (pinned upstream
+    ``validate_config``) first substitutes ``$samplerate$``/``$channels$`` in
+    Conv filenames and pipeline step names, then rewrites a relative Conv
+    filename to ``<canonical config dir>/<filename>`` when that file exists.
+    The active config therefore names ``/.../configs/coeffs/hf.txt`` where the
+    file says ``coeffs/hf.txt``.  Mirror exactly that, so the comparison stays
+    strict about which coefficient file is loaded without tripping over how it
+    was spelled.
+    """
+    result = copy.deepcopy(config)
+    devices = result.get("devices")
+    devices = devices if isinstance(devices, dict) else {}
+    capture = devices.get("capture")
+    tokens: dict[str, str] = {}
+    if isinstance(devices.get("samplerate"), int):
+        tokens["$samplerate$"] = str(devices["samplerate"])
+    if isinstance(capture, dict) and isinstance(capture.get("channels"), int):
+        tokens["$channels$"] = str(capture["channels"])
+
+    def substitute(value: str) -> str:
+        for token, replacement in tokens.items():
+            value = value.replace(token, replacement)
+        return value
+
+    config_dir = (
+        os.path.dirname(os.path.realpath(config_path))
+        if os.path.exists(config_path)
+        else None
+    )
+    filters = result.get("filters")
+    if isinstance(filters, dict):
+        for definition in filters.values():
+            if not isinstance(definition, dict) or definition.get("type") != "Conv":
+                continue
+            parameters = definition.get("parameters")
+            if not isinstance(parameters, dict) or parameters.get("type") not in (
+                "Raw",
+                "Wav",
+            ):
+                continue
+            filename = parameters.get("filename")
+            if not isinstance(filename, str):
+                continue
+            filename = substitute(filename)
+            if config_dir and not os.path.isabs(filename):
+                candidate = os.path.join(config_dir, filename)
+                if os.path.exists(candidate):
+                    filename = candidate
+            parameters["filename"] = filename
+    pipeline = result.get("pipeline")
+    if isinstance(pipeline, list):
+        for step in pipeline:
+            if not isinstance(step, dict):
+                continue
+            if step.get("type") == "Filter" and isinstance(step.get("names"), list):
+                step["names"] = [
+                    substitute(name) if isinstance(name, str) else name
+                    for name in step["names"]
+                ]
+            elif step.get("type") in ("Mixer", "Processor") and isinstance(
+                step.get("name"), str
+            ):
+                step["name"] = substitute(step["name"])
+    return result
 
 
 def _accepted_config_matches(
@@ -1020,7 +1104,7 @@ def _accepted_config_matches(
     reference = _engine_parsed_config(cdsp, file_path) if trust_file else None
     if reference is None:
         reference = expected
-    return _configs_equivalent(accepted, reference)
+    return _configs_equivalent(accepted, _engine_load_view(reference, file_path))
 
 
 def _await_active_config(
@@ -1056,6 +1140,25 @@ def _await_active_config(
         time.sleep(poll_interval)
 
 
+def _submit_audio_overlay(cdsp: CamillaClient, updated: dict) -> None:
+    """Queue ``updated`` and wait until the engine reports its owned overlay.
+
+    SetConfig only queues the change, so an immediate read can still show the
+    previous graph.  Poll against the same bounded deadline as a reload; a
+    measurement bypass in particular must not report "flat" on the strength of
+    an accepted request alone.
+    """
+    cdsp.config.set_active(updated)
+    poll_interval = max(CONFIG_APPLY_POLL_INTERVAL, 0.01)
+    deadline = time.monotonic() + max(CONFIG_APPLY_TIMEOUT, 0.0)
+    while True:
+        if _audio_overlay_matches(cdsp.config.active() or {}, updated):
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError("CamillaDSP did not confirm the requested audio overlay")
+        time.sleep(poll_interval)
+
+
 def ensure_audio_eq(
     cdsp: CamillaClient,
     *,
@@ -1084,7 +1187,7 @@ def ensure_audio_eq(
             safe_state["preamp_db"] = 0.0
             updated, _preamp = apply_audio_overlay(config, safe_state)
             if not _configs_equivalent(config, updated):
-                cdsp.config.set_active(updated)
+                _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
                 {
                     **status_payload(state, applied=True, effective_preamp=0.0),
@@ -1098,7 +1201,7 @@ def ensure_audio_eq(
             safe_state["loudness"]["enabled"] = False
             updated, preamp = apply_audio_overlay(config, safe_state)
             if not _configs_equivalent(config, updated):
-                cdsp.config.set_active(updated)
+                _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
                 {
                     **status_payload(
@@ -1114,15 +1217,12 @@ def ensure_audio_eq(
     updated, preamp = apply_audio_overlay(config, state)
     changed = not _configs_equivalent(config, updated)
     if changed:
-        cdsp.config.set_active(updated)
+        _submit_audio_overlay(cdsp, updated)
         print(
             f"Audio EQ revision {state['revision']} applied "
             f"({len(state['bands'])} bands, preamp {preamp:+.1f}dB)",
             flush=True,
         )
-        accepted = cdsp.config.active() or {}
-        if not _audio_overlay_matches(accepted, updated):
-            raise RuntimeError("CamillaDSP did not confirm the requested audio overlay")
     _write_audio_eq_status(
         {
             **status_payload(state, applied=True, effective_preamp=preamp),
@@ -1276,7 +1376,12 @@ def apply_config(
         # marker lives in the live config only, so an engine that restarts or
         # reloads comes back without it and every consumer inhibits on its own.
         generation = engine_generation()
-        stamp_engine_generation(cdsp, generation)
+        stamp_engine_generation(
+            cdsp,
+            generation,
+            timeout=CONFIG_APPLY_TIMEOUT,
+            poll_interval=CONFIG_APPLY_POLL_INTERVAL,
+        )
         cdsp.volume.set_main_mute(previous_mute)
         clear_pending_transition(target)
         clear_audio_inhibit(
@@ -1723,6 +1828,7 @@ def main() -> int:
         else None
     )
     probes: dict[str, ProbeRecord] = {}
+    last_arbitration: float | None = None
     toslink_active_timer = 0.0
     toslink_idle_timer = TOSLINK_IDLE_SECONDS
     analog_active_timer = 0.0
@@ -2036,9 +2142,20 @@ def main() -> int:
                     flush=True,
                 )
 
+            # Each observation stands for the time since the previous one, so
+            # a slow pass stretches nothing.  The cap keeps a single stalled
+            # pass (a config apply, a reconnect) from satisfying a silence or
+            # dwell timeout on its own.
+            now = time.monotonic()
+            elapsed = (
+                CHECK_INTERVAL
+                if last_arbitration is None
+                else min(max(now - last_arbitration, 0.0), MAX_ARBITRATION_STEP)
+            )
+            last_arbitration = now
             decision = arbitrate(
-                now=time.monotonic(),
-                elapsed=CHECK_INTERVAL,
+                now=now,
+                elapsed=elapsed,
                 current_source=current_source,
                 last_active=last_active_source,
                 manual_source=manual_source,

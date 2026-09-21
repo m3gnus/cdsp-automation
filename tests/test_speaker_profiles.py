@@ -195,7 +195,9 @@ def test_stamping_falls_back_to_set_active_and_fails_when_it_is_dropped() -> Non
             pass
 
     ignoring = Ignoring("Operator config")
-    speaker_profiles.stamp_engine_generation(engine_client(ignoring), generation)
+    speaker_profiles.stamp_engine_generation(
+        engine_client(ignoring), generation, timeout=0.05, poll_interval=0.01
+    )
     assert ignoring.set_active_calls == 1
     assert (
         speaker_profiles.live_engine_generation(engine_client(ignoring)) == generation
@@ -207,12 +209,48 @@ def test_stamping_falls_back_to_set_active_and_fails_when_it_is_dropped() -> Non
 
     try:
         speaker_profiles.stamp_engine_generation(
-            engine_client(Amnesiac("Operator config")), generation
+            engine_client(Amnesiac("Operator config")),
+            generation,
+            timeout=0.05,
+            poll_interval=0.01,
         )
     except RuntimeError as exc:
         assert "did not retain" in str(exc)
     else:
         raise AssertionError("an engine that dropped the marker was called ready")
+
+
+def test_stamping_waits_for_a_queued_write_instead_of_writing_twice() -> None:
+    """SetConfigValue only queues; a slow engine is not a rejecting one."""
+
+    class Queued(FakeEngineConfig):
+        def __init__(self, description: str, apply_after: int) -> None:
+            super().__init__(description)
+            self.apply_after = apply_after
+            self.pending: object | None = None
+            self.set_value_calls = 0
+
+        def description(self) -> str | None:
+            if self.pending is not None:
+                if self.apply_after <= 0:
+                    self.live["description"] = self.pending
+                    self.pending = None
+                else:
+                    self.apply_after -= 1
+            return super().description()
+
+        def set_value(self, pointer: str, value: object) -> None:
+            self.set_value_calls += 1
+            self.pending = value
+
+    generation = speaker_profiles.new_engine_generation()
+    queued = Queued("Operator config", apply_after=4)
+    speaker_profiles.stamp_engine_generation(
+        engine_client(queued), generation, timeout=5.0, poll_interval=0.01
+    )
+    assert queued.set_value_calls == 1
+    assert queued.set_active_calls == 0
+    assert speaker_profiles.live_engine_generation(engine_client(queued)) == generation
 
 
 def test_malformed_or_foreign_ready_tokens_never_authorize_unmute(

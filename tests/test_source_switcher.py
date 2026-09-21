@@ -4,6 +4,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -14,6 +15,7 @@ from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 
@@ -119,6 +121,42 @@ class ConfigRecoveryTests(unittest.TestCase):
             client.config.file_path.assert_not_called()
             client.volume.set_main_mute.assert_not_called()
         self.assertTrue(self.ready_path.is_file())
+
+    def _assert_no_reload_without_confirmed_mute(self, client: mock.Mock) -> None:
+        recovery = source_switcher.ConfigRecoveryGuard(retry_seconds=10)
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertFalse(recovery.ready(client, 0.0))
+            self.assertFalse(recovery.ready(client, 10.0))
+        client.general.reload.assert_not_called()
+        self.assertIn("could not latch mute", output.getvalue())
+
+    def test_failed_mute_request_blocks_the_recovery_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "streamer.yml")
+            config_path.touch()
+            client = self.client("INACTIVE", None, str(config_path))
+            client.volume.set_main_mute.side_effect = RuntimeError("mute RPC failed")
+            self._assert_no_reload_without_confirmed_mute(client)
+
+    def test_unconfirmed_mute_blocks_the_recovery_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "streamer.yml")
+            config_path.touch()
+            client = self.client("INACTIVE", None, str(config_path))
+            client.volume.main_mute.return_value = False
+            self._assert_no_reload_without_confirmed_mute(client)
+
+    def test_failed_readiness_or_lock_blocks_the_recovery_reload(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory, "streamer.yml")
+            config_path.touch()
+            for name in ("set_audio_inhibit", "audio_control_lock"):
+                client = self.client("INACTIVE", None, str(config_path))
+                with patch.object(
+                    source_switcher, name, side_effect=OSError(f"{name} failed")
+                ):
+                    self._assert_no_reload_without_confirmed_mute(client)
+                client.volume.set_main_mute.assert_not_called()
 
     def test_invalid_remembered_path_is_not_reloaded(self) -> None:
         client = self.client("INACTIVE", None, "/does/not/exist.yml")
@@ -485,6 +523,118 @@ def test_measurement_bypass_strips_user_eq_overlay() -> None:
     assert not any(
         step.get("description") == audio_eq.PIPELINE_DESCRIPTION
         for step in client.config.value["pipeline"]
+    )
+
+
+class QueuedLiveConfig:
+    """SetConfig acknowledges at once but applies after a few reads."""
+
+    def __init__(self, value: dict, apply_after: int = 3) -> None:
+        self.value = value
+        self.pending: dict | None = None
+        self.apply_after = apply_after
+        self.set_active_calls = 0
+
+    def active(self) -> dict:
+        if self.pending is not None:
+            if self.apply_after <= 0:
+                self.value, self.pending = self.pending, None
+            else:
+                self.apply_after -= 1
+        return copy.deepcopy(self.value)
+
+    def set_active(self, value: dict) -> None:
+        self.set_active_calls += 1
+        self.pending = copy.deepcopy(value)
+
+
+def test_eq_overlay_waits_for_a_queued_write_to_apply() -> None:
+    state = audio_eq.default_audio_state()
+    state["bands"][0]["gain"] = 4
+    base = {"devices": {"capture": {"channels": 2}}, "filters": {}, "pipeline": []}
+    live = QueuedLiveConfig(base)
+    client = SimpleNamespace(config=live)
+    statuses: list[dict] = []
+    with (
+        patch.object(switcher, "time", FakeClock()),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", 5.0),
+        patch.object(switcher, "_write_audio_eq_status", side_effect=statuses.append),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        switcher.ensure_audio_eq(
+            client, speaker_id=speaker_profiles.DEFAULT_SPEAKER_ID, state=state
+        )
+    assert live.set_active_calls == 1
+    assert any(name.startswith(audio_eq.FILTER_PREFIX) for name in live.value["filters"])
+    assert statuses[-1]["applied"] is True
+
+
+def test_measurement_bypass_is_not_reported_flat_until_the_engine_is() -> None:
+    state = audio_eq.default_audio_state()
+    state["bands"][0]["gain"] = 4
+    base = {"devices": {"capture": {"channels": 2}}, "filters": {}, "pipeline": []}
+    overlaid, _ = audio_eq.apply_audio_overlay(base, state)
+    # The removal is acknowledged but never applied.
+    live = QueuedLiveConfig(overlaid, apply_after=10**6)
+    client = SimpleNamespace(config=live)
+    statuses: list[dict] = []
+    with (
+        patch.object(switcher, "time", FakeClock()),
+        patch.object(switcher, "CONFIG_APPLY_TIMEOUT", 2.0),
+        patch.object(switcher, "load_profile", return_value={"bypass_user_eq": True}),
+        patch.object(switcher, "_write_audio_eq_status", side_effect=statuses.append),
+    ):
+        with pytest.raises(RuntimeError, match="did not confirm"):
+            switcher.ensure_audio_eq(client, speaker_id="measurement", state=state)
+    assert live.set_active_calls == 1
+    assert statuses == []
+
+
+def test_read_back_accepts_relative_and_tokenized_coefficient_paths(
+    tmp_path: Path,
+) -> None:
+    """A reload resolves these against the config dir; ReadConfigFile does not."""
+    configs = tmp_path / "configs"
+    (configs / "coeffs").mkdir(parents=True)
+    (configs / "coeffs" / "hf_48000.txt").write_text("1.0\n")
+    (configs / "coeffs" / "lf.txt").write_text("1.0\n")
+    config_path = configs / "streamer.yml"
+    on_disk = {
+        "devices": {"samplerate": 48000, "capture": {"type": "Alsa", "channels": 2}},
+        "filters": {
+            "hf": {"type": "Conv", "parameters": {"type": "Raw", "filename": "coeffs/hf_$samplerate$.txt"}},
+            "lf": {"type": "Conv", "parameters": {"type": "Wav", "filename": "coeffs/lf.txt"}},
+            # Not found next to the config, so the engine leaves it relative.
+            "missing": {"type": "Conv", "parameters": {"type": "Raw", "filename": "elsewhere.txt"}},
+        },
+    }
+    config_path.write_text(yaml.safe_dump(on_disk))
+    resolved_dir = os.path.dirname(os.path.realpath(config_path))
+    active = copy.deepcopy(on_disk)
+    active["filters"]["hf"]["parameters"]["filename"] = os.path.join(
+        resolved_dir, "coeffs/hf_48000.txt"
+    )
+    active["filters"]["lf"]["parameters"]["filename"] = os.path.join(
+        resolved_dir, "coeffs/lf.txt"
+    )
+    for parses_files in (True, False):
+        client = SimpleNamespace(
+            config=FakeSwitcherConfig(str(config_path), parses_files=parses_files)
+        )
+        for trust_file in (True, False):
+            assert switcher._accepted_config_matches(
+                client, str(config_path), engine_materialized(active), on_disk,
+                trust_file=trust_file,
+            )
+
+    # Spelling is forgiven; a different coefficient file is not.
+    other = copy.deepcopy(active)
+    other["filters"]["lf"]["parameters"]["filename"] = os.path.join(
+        resolved_dir, "coeffs/hf_48000.txt"
+    )
+    client = SimpleNamespace(config=FakeSwitcherConfig(str(config_path)))
+    assert not switcher._accepted_config_matches(
+        client, str(config_path), engine_materialized(other), on_disk
     )
 
 
@@ -2316,6 +2466,100 @@ def test_switcher_loop_leaves_a_stopped_toslink_for_a_ready_streamer(
     # debounce plus SOURCE_IDLE_TIMEOUT.
     assert waited <= switcher.TOSLINK_IDLE_SECONDS + 3, waited
     assert waited < switcher.IDLE_TIMEOUT
+
+
+def test_switcher_loop_feeds_arbitration_the_measured_interval(
+    tmp_path: Path,
+) -> None:
+    """A slow pass is real time; a stalled one is capped."""
+    ready = tmp_path / "ready.json"
+    path = tmp_path / "toslink.yml"
+    path.write_text("devices: {}\n")
+    generation = speaker_profiles.new_engine_generation()
+    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+    config = FakeSwitcherConfig(
+        str(path), description=speaker_profiles.engine_generation_marker(generation)
+    )
+    client = SimpleNamespace(
+        config=config,
+        volume=FakeSwitcherVolume(mute=False),
+        general=SimpleNamespace(reload=lambda: None, state=lambda: "running"),
+        levels=SimpleNamespace(capture_rms=lambda: [-120.0, -120.0]),
+        is_connected=lambda: True,
+        connect=lambda: None,
+    )
+    clock = SwitcherLoopClock(budget=60.0)
+    # Every meter read costs 2 s, and the third one stalls for a minute.
+    reads = iter([2.0, 2.0, 60.0])
+
+    class SlowMotu:
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def read(self) -> dict[int, tuple[int, int]]:
+            clock.now += next(reads, 2.0)
+            return {12: (0, 0)}
+
+    def fake_apply(_cdsp, *_args, **_kwargs) -> None:
+        speaker_profiles.clear_audio_inhibit(ready, generation=generation)
+
+    elapsed: list[float] = []
+    real_arbitrate = switcher.arbitrate
+
+    def recording_arbitrate(**kwargs):
+        elapsed.append(kwargs["elapsed"])
+        return real_arbitrate(**kwargs)
+
+    guards = [
+        patch.object(switcher, "CamillaClient", lambda *_args: client),
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", ready),
+        patch.object(switcher, "_engine_generation", generation),
+        patch.object(switcher, "TOSLINK_MOTU_METERS", True),
+        patch.object(switcher, "ANALOG_MOTU_METERS", False),
+        patch.object(switcher, "MotuMeterReader", SlowMotu),
+        patch.dict(switcher.CONFIGS, {"toslink": str(path)}, clear=True),
+        patch.object(switcher, "validate_configs"),
+        patch.object(switcher, "require_selected_profile_available"),
+        patch.object(switcher, "ensure_current_speaker_audio_eq"),
+        patch.object(switcher, "read_manual_source", return_value=None),
+        patch.object(
+            switcher,
+            "current_speaker_selection",
+            return_value={"selected": switcher.DEFAULT_SPEAKER_ID, "revision": 0},
+        ),
+        patch.object(
+            switcher,
+            "managed_config_identity",
+            side_effect=lambda current: (
+                (Path(current).stem, switcher.DEFAULT_SPEAKER_ID) if current else None
+            ),
+        ),
+        patch.object(switcher, "is_alsa_active", return_value=False),
+        patch.object(switcher, "is_gadget_available", return_value=False),
+        patch.object(
+            switcher,
+            "resolve_config_target",
+            side_effect=lambda source, *_a, **_k: {"path": str(path)},
+        ),
+        patch.object(switcher, "apply_config", side_effect=fake_apply),
+        patch.object(switcher, "arbitrate", side_effect=recording_arbitrate),
+        patch.object(switcher, "time", clock),
+        contextlib.redirect_stdout(io.StringIO()),
+    ]
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        try:
+            switcher.main()
+        except LoopStop:
+            pass
+
+    assert len(elapsed) >= 3, elapsed
+    step = switcher.CHECK_INTERVAL + 2.0
+    assert elapsed[0] == switcher.CHECK_INTERVAL
+    assert elapsed[1] == pytest.approx(step)
+    assert elapsed[2] == pytest.approx(switcher.MAX_ARBITRATION_STEP)
 
 
 if __name__ == "__main__":

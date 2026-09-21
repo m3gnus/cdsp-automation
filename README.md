@@ -112,9 +112,10 @@ id the source switcher mints for every CamillaDSP connection it makes and
 stamps into the live config's description — plus the applied config path,
 digest, source, speaker, and speaker-selection revision. Every unmute path
 re-reads that description from the CamillaDSP client it already holds and
-refuses unless it still matches the token, so an engine that restarts, reloads,
-or has its config replaced by anyone else is inhibited immediately even though
-the token file is still there. Anything missing, unparseable, or mismatched
+refuses unless it still matches the token, so an engine that restarts or
+reloads from file is inhibited immediately even though the token file is still
+there. (It is a handshake, not a seal: a foreign live-config write that keeps
+the description keeps readiness too - see TECHNICAL.md.) Anything missing, unparseable, or mismatched
 inhibits. While inhibited, AirPlay, Spotify, the browser, and the HID remote
 may mute but cannot unmute. `cdsp-source-switcher.service` is `PartOf=`
 `camilladsp.service`, so restarting the engine restarts the switcher that

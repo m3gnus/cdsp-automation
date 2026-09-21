@@ -328,8 +328,33 @@ def live_engine_generation(client: Any) -> str | None:
         return None
 
 
-def stamp_engine_generation(client: Any, generation: str) -> None:
-    """Mark the live engine instance as verified for this generation."""
+def _await_engine_generation(
+    client: Any, generation: str, *, timeout: float, poll_interval: float
+) -> bool:
+    """Poll until the live engine carries ``generation``, or time runs out."""
+    poll_interval = max(poll_interval, 0.01)
+    deadline = time.monotonic() + max(timeout, 0.0)
+    while True:
+        if live_engine_generation(client) == generation:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
+
+
+def stamp_engine_generation(
+    client: Any,
+    generation: str,
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.25,
+) -> None:
+    """Mark the live engine instance as verified for this generation.
+
+    SetConfigValue and SetConfig only queue the change, so each write is
+    followed by a bounded wait for the marker rather than one immediate read;
+    a merely slow engine must not provoke a second, whole-config write.
+    """
     if not generation:
         raise RuntimeError("cannot stamp an empty engine generation")
     marked = description_with_marker(client.config.description(), generation)
@@ -337,17 +362,23 @@ def stamp_engine_generation(client: Any, generation: str) -> None:
         client.config.set_value("/description", marked)
     except Exception:
         pass
-    if live_engine_generation(client) == generation:
-        return
-    # SetConfigValue was rejected or did not take.  Fall back to a whole-config
-    # write; the switcher is the only live-config writer, so this is safe.
+    else:
+        if _await_engine_generation(
+            client, generation, timeout=timeout, poll_interval=poll_interval
+        ):
+            return
+    # SetConfigValue was rejected, or accepted but never took.  Fall back to a
+    # whole-config write; the switcher is the only live-config writer, so this
+    # is safe.
     config = client.config.active()
     if not config:
         raise RuntimeError("CamillaDSP has no active config to mark ready")
     marked_config = dict(config)
     marked_config["description"] = marked
     client.config.set_active(marked_config)
-    if live_engine_generation(client) != generation:
+    if not _await_engine_generation(
+        client, generation, timeout=timeout, poll_interval=poll_interval
+    ):
         raise RuntimeError("CamillaDSP did not retain the audio-ready marker")
 
 

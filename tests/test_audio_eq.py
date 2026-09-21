@@ -89,7 +89,7 @@ def test_audio_eq_overlay_is_idempotent_and_precedes_crossover() -> None:
     assert reapplied == updated
     assert second_preamp == preamp
     source_switcher = (REPOSITORY / "scripts" / "source_switcher.py").read_text()
-    assert "_audio_overlay_matches(accepted, updated)" in source_switcher
+    assert "_audio_overlay_matches(cdsp.config.active() or {}, updated)" in source_switcher
     assert 'for key in ("inverted", "mute")' in source_switcher
 
 

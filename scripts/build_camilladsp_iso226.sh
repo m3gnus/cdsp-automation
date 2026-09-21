@@ -141,24 +141,48 @@ configs=("$config_dir"/*.yml "$config_dir"/*.yaml)
 if [[ ${#configs[@]} -eq 0 ]]; then
   echo "WARNING: no deployed YAML configs found in $config_dir; candidate config smoke-test skipped." >&2
 fi
-for config in "${configs[@]}"; do
+for config in ${configs[@]+"${configs[@]}"}; do
   "$CANDIDATE" --check "$config"
 done
 
+# Two different copies with two different jobs.  $BACKUP keeps the engine that
+# was here before this helper ever ran, for --uninstall, so it is taken once.
+# The snapshot is this attempt's own: rollback puts back whatever was working
+# a moment ago - on an upgrade that is our previous build *and* its receipt,
+# not the stock engine a saved Iso226 config could no longer load.
+SNAPSHOT="$BUILD_DIR/previous-camilladsp"
+SNAPSHOT_RECEIPT="$BUILD_DIR/previous-iso226-engine.json"
 had_target=false
+had_receipt=false
+created_backup=false
 if [[ -f "$TARGET" ]]; then
   had_target=true
+  cp -p "$TARGET" "$SNAPSHOT"
   if [[ ! -f "$BACKUP" ]]; then
     sudo cp -p "$TARGET" "$BACKUP"
+    created_backup=true
   fi
 fi
+if [[ -f "$CAPABILITY" ]]; then
+  had_receipt=true
+  cp "$CAPABILITY" "$SNAPSHOT_RECEIPT"
+fi
 rollback() {
-  if [[ -f "$BACKUP" ]]; then
-    sudo install -m 0755 "$BACKUP" "$TARGET"
-  elif [[ "$had_target" == false ]]; then
+  if [[ "$had_target" == true ]]; then
+    sudo install -m 0755 "$SNAPSHOT" "$TARGET"
+  else
     sudo rm -f "$TARGET"
   fi
-  sudo rm -f "$CAPABILITY"
+  if [[ "$had_receipt" == true ]]; then
+    sudo install -m 0644 "$SNAPSHOT_RECEIPT" "$CAPABILITY"
+  else
+    sudo rm -f "$CAPABILITY"
+  fi
+  # Nothing of ours was ever installed, so there is nothing to uninstall back
+  # to; a leftover copy would only go stale behind a later stock upgrade.
+  if [[ "$created_backup" == true ]]; then
+    sudo rm -f "$BACKUP"
+  fi
   sudo systemctl restart camilladsp.service || true
 }
 

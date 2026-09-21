@@ -45,10 +45,27 @@ live config's `description` with `SetConfigValue` (falling back to a whole
 config write). The ready token records the same generation next to the applied
 config path, digest, source, speaker and selection revision; consumers compare
 the two with one `GetConfigDescription` on the client they already hold. An
-engine restart, an external reload, a recovery reload, a websocket reconnect,
+engine restart, a reload from file, a recovery reload, a websocket reconnect,
 or any unhandled error in the switcher loop all invalidate readiness, and the
 loop re-applies the selected config through the same muted, verified path
 before audio can return.
+
+The marker is a handshake, not proof of engine identity or config integrity:
+consumers only check the description. A foreign `SetConfig`/`SetConfigValue`
+that keeps the description (for example a routing change made through the
+engine's websocket) keeps readiness, and a marked config saved to disk and
+loaded into another instance carries the marker with it. The switcher assumes
+it is the only writer of the live graph; nothing enforces that.
+
+CamillaDSP answers `SetConfig` and `SetConfigValue` once the change is
+*queued*, not applied. Every live-config write here - reload, EQ overlay
+(including the measurement bypass), readiness stamp - therefore polls for its
+own expected state against `SOURCE_CONFIG_APPLY_TIMEOUT` instead of reading back
+once. The stamp falls back to a whole-config write only when `SetConfigValue`
+was rejected or never took within that deadline. The reload read-back compares
+against the file with the preprocessing a reload applies (`$samplerate$` /
+`$channels$` tokens, relative Conv coefficient paths resolved against the
+canonical config directory), because `ReadConfigFile` skips that step.
 
 ### Volume limits
 
@@ -298,7 +315,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **Current source hold** - If the current source still has confirmed audio, it keeps control even if another source also appears active. The ordered priorities are used only when choosing a new source.
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **MOTU meter detection** - TOSLINK is detected from live MOTU input meter frames instead of being treated as always active
-- **Three-state detection** - A source is *ready* (hardware says the stream is open), *playing* (capture RMS confirms audio), or *probed and found silent*. Capture levels only describe the selected config, so for the streamer and the USB gadget "playing" is simply unknown until the switcher selects them. The arbitration logic lives in one pure function, `source_switcher.arbitrate()`, which takes a snapshot of every source plus the elapsed pass time and returns the decision; `main()` only gathers the snapshot and applies the result.
+- **Three-state detection** - A source is *ready* (hardware says the stream is open), *playing* (capture RMS confirms audio), or *probed and found silent*. Capture levels only describe the selected config, so for the streamer and the USB gadget "playing" is simply unknown until the switcher selects them. The arbitration logic lives in one pure function, `source_switcher.arbitrate()`, which takes a snapshot of every source plus the elapsed pass time and returns the decision; `main()` only gathers the snapshot and applies the result. The elapsed time is the measured monotonic interval since the previous arbitration, capped at five check intervals so one stalled pass (a config apply, a reconnect) cannot satisfy a silence or dwell timeout by itself.
 - **Silent-probe backoff** - Selecting a source to find out whether it is playing costs a full config reload plus a mute/restore, so a probe that hears nothing is remembered. The source is not re-probed for `SOURCE_PROBE_BACKOFF_SECONDS`, growing by `SOURCE_PROBE_BACKOFF_FACTOR` up to `SOURCE_PROBE_BACKOFF_MAX`. Without this, two ready-but-silent inputs alternate forever, because readiness alone requalified each one as soon as the other timed out. Confirmed audio, a manual override, or the hardware genuinely going away and coming back all clear the backoff.
 - **Probe window vs track gap** - `SOURCE_IDLE_TIMEOUT` is the grace a source gets *after its playback has been confirmed*, so a quiet passage or a pause does not lose it. A source that has only ever proved ready gets the much shorter `SOURCE_PROBE_SILENCE_TIMEOUT` instead: there was no music to leave a gap in.
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from a source it has heard playing just because of a quiet passage or pause button
@@ -308,7 +325,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
 - **Keep-last idle behavior** - When all sources are idle, the default is to leave the current config alone. Set `SOURCE_IDLE_MODE=toslink` to restore the older always-fallback behavior.
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
-- **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched
+- **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched. The reload only happens once the engine reads back as muted; if the lock, the token removal, the mute request or its read-back fails, that attempt is skipped
 
 **Priority logic explained:**
 

@@ -319,5 +319,109 @@ class EngineUninstallTests(unittest.TestCase):
             self.assertEqual(self._service_calls(root), "")
 
 
+class EngineInstallRollbackTests(unittest.TestCase):
+    """A failed install must put back what was running a moment ago.
+
+    The toolchain and service are shimmed; the health check fails because the
+    restarted unit never reports as active, which is the rollback path."""
+
+    STOCK = b"stock camilladsp from the distribution\n"
+    PREVIOUS = b"ISO 226 camilladsp from an earlier successful install\n"
+    CANDIDATE = b"ISO 226 camilladsp candidate that fails its health check\n"
+
+    def _receipt(self, payload: bytes) -> str:
+        digest = hashlib.sha256(payload).hexdigest()
+        return (
+            '{"engine":"Iso226","upstream_commit":"05e9cfcd",'
+            f'"binary_sha256":"{digest}","installed_at":1758326400}}\n'
+        )
+
+    def _install(self, root: Path) -> subprocess.CompletedProcess[str]:
+        binaries = root / "bin"
+        binaries.mkdir(exist_ok=True)
+        target = root / "camilladsp"
+        candidate = root / "candidate"
+        candidate.write_bytes(self.CANDIDATE)
+        _shim(binaries, "sudo", 'exec "$@"')
+        _shim(binaries, "sleep", "exit 0")
+        _shim(binaries, "rustc", 'echo "rustc 1.90.0 (shim)"')
+        _shim(
+            binaries,
+            "git",
+            'if [[ "$1" == clone ]]; then mkdir -p "${@: -1}"; fi; exit 0',
+        )
+        _shim(
+            binaries,
+            "cargo",
+            'if [[ "$1" == build ]]; then\n'
+            '  manifest="${@: -1}"; out="$(dirname "$manifest")/target/release"\n'
+            f'  mkdir -p "$out" && cp {candidate} "$out/camilladsp"\n'
+            "fi\nexit 0",
+        )
+        _shim(
+            binaries,
+            "systemctl",
+            f'printf "%s\\n" "$*" >> {root / "systemctl.log"}\n'
+            'case "$1" in\n'
+            f'  cat) echo "ExecStart={target} -p 1234 config.yml" ;;\n'
+            "  show) echo '' ;;\n"
+            "  is-active) exit 3 ;;\n"
+            "esac\nexit 0",
+        )
+        environment = os.environ.copy()
+        environment.update(
+            PATH=f"{binaries}:{environment['PATH']}",
+            HOME=str(root),
+            CDSP_CONFIG_DIR=str(root / "configs"),
+            CDSP_AUTOMATION_CAMILLADSP_TARGET=str(target),
+            CDSP_AUTOMATION_CAMILLADSP_BACKUP=str(root / "camilladsp.pre-iso226"),
+            ISO226_CAPABILITY_PATH=str(root / "iso226-engine.json"),
+        )
+        return subprocess.run(
+            ["bash", str(BUILDER)],
+            capture_output=True,
+            text=True,
+            env=environment,
+            check=False,
+        )
+
+    def test_failed_upgrade_restores_the_previous_build_and_its_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "camilladsp"
+            target.write_bytes(self.PREVIOUS)
+            target.chmod(0o755)
+            backup = root / "camilladsp.pre-iso226"
+            backup.write_bytes(self.STOCK)
+            capability = root / "iso226-engine.json"
+            receipt = self._receipt(self.PREVIOUS)
+            capability.write_text(receipt, encoding="utf-8")
+
+            result = self._install(root)
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("rolling back", result.stderr)
+            self.assertEqual(target.read_bytes(), self.PREVIOUS)
+            self.assertEqual(capability.read_text(encoding="utf-8"), receipt)
+            # The uninstall copy still names the stock engine.
+            self.assertEqual(backup.read_bytes(), self.STOCK)
+
+    def test_failed_first_install_leaves_the_stock_engine_and_no_bookkeeping(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "camilladsp"
+            target.write_bytes(self.STOCK)
+            target.chmod(0o755)
+
+            result = self._install(root)
+
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertEqual(target.read_bytes(), self.STOCK)
+            self.assertFalse((root / "iso226-engine.json").exists())
+            self.assertFalse((root / "camilladsp.pre-iso226").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
