@@ -4,11 +4,8 @@
 from __future__ import annotations
 
 import binascii
-import json
 import os
 import time
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
 import websocket
@@ -26,7 +23,8 @@ CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 CHECK_INTERVAL = float(os.environ.get("MOTU_CHECK_INTERVAL", "1"))
 
-# MOTU UltraLite mk5 clock-source payloads captured from the web UI.
+# MOTU UltraLite mk5 clock-source writes: parameter 11 (kClockSource), index
+# 0, length 1, then the source value - CueMix 5's own encoding (see below).
 CLOCK_PAYLOADS = {
     "internal": "000b0000000103",
     "optical": "000b0000000102",
@@ -37,7 +35,7 @@ CLOCK_PAYLOADS = {
 # lets restarts of this service (or CamillaDSP reconnects) stay silent.
 #
 # This file is a *cache of what we last asked for*, not proof of what the
-# device is doing: the clock can also be changed from the MOTU's own web UI,
+# device is doing: the clock can also be changed from MOTU's CueMix 5 app,
 # and a WebSocket send that did not raise is not evidence that the hardware
 # adopted the value. Where the device can be read back, the read-back wins.
 STATE_PATH = Path(
@@ -45,46 +43,39 @@ STATE_PATH = Path(
 )
 
 
-def _datastore_url(ws_url: str) -> str:
-    """Derive the MOTU AVB datastore URL from the WebSocket URL."""
-    try:
-        parsed = urllib.parse.urlsplit(ws_url)
-        host = parsed.hostname
-    except ValueError:
-        return ""
-    if not host:
-        return ""
-    if ":" in host:  # IPv6 literal
-        host = f"[{host}]"
-    scheme = "https" if parsed.scheme in {"wss", "https"} else "http"
-    return f"{scheme}://{host}/datastore"
-
-
-# The web UI's binary WebSocket is write-only for our purposes; the device
-# publishes its current settings over the plain HTTP datastore document. A
-# deployment whose interface does not serve one simply never gets a read-back,
-# and the daemon falls back to the cached value exactly as it always did.
-# Unset derives the URL from the WebSocket host; set-but-empty is an explicit
-# "this interface has no datastore, stop asking". Without that distinction an
-# empty value fell back to the derived URL, so a USB-only interface such as an
-# UltraLite mk5 -- which answers port 80 but serves no datastore -- could not
-# be told to stop, and logged a failed read-back every retry interval forever.
-_DATASTORE_URL_ENV = os.environ.get("MOTU_DATASTORE_URL")
-MOTU_DATASTORE_URL = (
-    _datastore_url(MOTU_WS_URL)
-    if _DATASTORE_URL_ENV is None
-    else _DATASTORE_URL_ENV.strip()
-)
+# The UltraLite mk5 has no HTTP API: port 80 accepts a connection and closes
+# it without answering any request. Its only control channel is the binary
+# WebSocket on port 1280 that MOTU's CueMix 5 app uses. Every message is
+#
+#   parameter id (u16 BE) | index (u16 BE) | [length (u16 BE), sent only by
+#   the client] | value
+#
+# and on every new connection the device pushes its whole parameter set,
+# unsolicited, before the meter stream starts. The clock source is parameter
+# 11 (CueMix 5 ``kClockSource``, a single byte), so reading it back means
+# connecting, *sending nothing*, and waiting for that one frame. The ids and
+# values below are the ones CueMix 5 itself defines (``dev.js``:
+# ``kClockSource`` id 11; ``kClockSources`` Internal=3, S/PDIF=0, Optical=2),
+# and CLOCK_PAYLOADS above are exactly its write encoding of them.
+#
+# The device serves one WebSocket client at a time: a new connection drops
+# the previous one (the source switcher's meter reader, or a CueMix window),
+# which simply reconnects. So each read-back is a short connection, and a
+# confirmed clock is re-checked rarely.
+MOTU_CLOCK_SOURCE_PARAM = 11
+MOTU_CLOCK_SOURCE_VALUES = {3: "internal", 2: "optical"}
 MOTU_READBACK_TIMEOUT = float(os.environ.get("MOTU_CLOCK_READBACK_TIMEOUT", "3"))
-# How often a *confirmed* clock value is re-checked. It is one small HTTP GET,
-# and it is what notices a clock changed behind our back from the MOTU web UI.
-MOTU_VERIFY_INTERVAL = float(os.environ.get("MOTU_CLOCK_VERIFY_INTERVAL", "60"))
-# How long to wait before asking again after a read-back failed: an interface
-# without the datastore API must not be polled every second forever.
+# How often a *confirmed* clock value is re-checked; this is what notices a
+# clock changed behind our back from CueMix 5.
+MOTU_VERIFY_INTERVAL = float(os.environ.get("MOTU_CLOCK_VERIFY_INTERVAL", "300"))
+# How long to wait before asking again after a read-back failed.
 MOTU_READBACK_RETRY_INTERVAL = float(
     os.environ.get("MOTU_CLOCK_READBACK_RETRY_INTERVAL", "300")
 )
-MOTU_READBACK_MAX_BYTES = 1 << 20
+# The shortest gap between two writes of the same clock source. A read-back
+# that contradicts a write we just made means the device did not take it;
+# writing again at once, every pass, would re-lock (and click) every second.
+MOTU_REWRITE_INTERVAL = float(os.environ.get("MOTU_CLOCK_REWRITE_INTERVAL", "30"))
 
 _next_motu_error_log = 0.0
 
@@ -147,107 +138,57 @@ def set_motu_clock(source: str) -> bool:
                 pass
 
 
-# Our two clock names against the words a MOTU uses for its own sources.
-# Anything the device reports that matches neither is "unknown", so the
-# daemon keeps its hands off a clock it does not understand.
-_CLOCK_NAME_HINTS = (
-    ("internal", "internal"),
-    ("optical", "optical"),
-    ("toslink", "optical"),
-    ("spdif", "optical"),
-    ("s/pdif", "optical"),
-    ("adat", "optical"),
-)
-_CLOCK_CHOICE_KEYS = {
-    "clocksourcestrings",
-    "clocksourcenames",
-    "clocksourcelist",
-    "clocksources",
-}
+def clock_source_value(frame: bytes) -> int | None:
+    """The raw clock-source byte if ``frame`` is the device's clock frame.
 
-
-def _leaf(key: str) -> str:
-    return key.rsplit("/", 1)[-1].lower()
-
-
-def _interpret_clock_name(name: object) -> str | None:
-    if not isinstance(name, str):
-        return None
-    text = name.strip().lower()
-    if not text:
-        return None
-    for hint, clock in _CLOCK_NAME_HINTS:
-        if hint in text:
-            return clock
-    return None
-
-
-def _clock_choices(payload: dict, prefix: str) -> list[str]:
-    """The device's own list of clock-source names, for numeric selections."""
-    for key, value in payload.items():
-        if not isinstance(key, str) or _leaf(key) not in _CLOCK_CHOICE_KEYS:
-            continue
-        key_prefix = key.rsplit("/", 1)[0] if "/" in key else ""
-        if key_prefix != prefix:
-            continue
-        if isinstance(value, list):
-            return [item for item in value if isinstance(item, str)]
-        if isinstance(value, str):
-            separator = ":" if ":" in value else ","
-            return [item for item in value.split(separator) if item]
-    return []
-
-
-def clock_from_datastore(payload: object) -> str | None:
-    """Map a MOTU datastore document to ``internal``/``optical``, or None.
-
-    None means "the document does not tell us", never "the clock is wrong".
+    The device reports a byte parameter as ``id, index, value`` - five bytes,
+    with no length field. Any other frame (other parameters, meters) is None.
     """
-    if not isinstance(payload, dict):
+    if len(frame) != 5:
         return None
-    for key, value in payload.items():
-        if not isinstance(key, str) or _leaf(key) != "clocksource":
-            continue
-        prefix = key.rsplit("/", 1)[0] if "/" in key else ""
-        clock = _interpret_clock_name(value)
-        if clock:
-            return clock
-        # Some firmware reports the selection as an index into the device's
-        # own list of source names.
-        if isinstance(value, bool):
-            continue
-        try:
-            index = int(value)
-        except (TypeError, ValueError):
-            continue
-        choices = _clock_choices(payload, prefix)
-        if 0 <= index < len(choices):
-            clock = _interpret_clock_name(choices[index])
-            if clock:
-                return clock
-    return None
+    param = int.from_bytes(frame[0:2], "big")
+    index = int.from_bytes(frame[2:4], "big")
+    if param != MOTU_CLOCK_SOURCE_PARAM or index != 0:
+        return None
+    return frame[4]
 
 
 def read_motu_clock() -> str | None:
     """Read the clock source the MOTU is *actually* using.
 
-    Returns None when the device cannot be read or reports something we do
-    not recognize. None is "unknown", never "wrong": callers fall back to the
+    Connects to the control WebSocket, sends nothing, and takes the clock
+    source from the state the device pushes to every new client. Returns None
+    when the device cannot be read or reports a source we do not drive
+    (S/PDIF). None is "unknown", never "wrong": callers fall back to the
     cached value rather than forcing an audible re-lock on a guess.
     """
-    if not MOTU_DATASTORE_URL:
-        return None
+    ws = None
+    value = None
     try:
-        request = urllib.request.Request(
-            MOTU_DATASTORE_URL, headers={"Accept": "application/json"}
-        )
-        with urllib.request.urlopen(request, timeout=MOTU_READBACK_TIMEOUT) as response:
-            raw = response.read(MOTU_READBACK_MAX_BYTES)
-        payload = json.loads(raw.decode("utf-8", "replace"))
+        ws = websocket.WebSocket()
+        ws.connect(MOTU_WS_URL, timeout=MOTU_READBACK_TIMEOUT)
+        deadline = time.monotonic() + MOTU_READBACK_TIMEOUT
+        while value is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("no clock-source frame from the device")
+            ws.settimeout(remaining)
+            opcode, data = ws.recv_data()
+            if opcode == websocket.ABNF.OPCODE_BINARY:
+                value = clock_source_value(bytes(data))
     except Exception as exc:
         _log_motu_error(f"MOTU: clock read-back unavailable: {exc}")
         return None
-    return clock_from_datastore(payload)
+    finally:
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+    clock = MOTU_CLOCK_SOURCE_VALUES.get(value)
+    if clock is None:
+        _log_motu_error(f"MOTU: clock source {value} is neither internal nor optical")
+    return clock
 
 
 def current_sample_rate(active_config: object) -> int | None:
@@ -308,12 +249,13 @@ def main() -> int:
     verified = False
     next_readback = 0.0
     next_error_log = 0.0
+    last_write: str | None = None
+    rewrite_not_before = 0.0
     known_path: str | None = None
     known_source: str | None = None
 
     print("MOTU Clock Sync (source identity mode) started", flush=True)
     print(f"MOTU WebSocket: {MOTU_WS_URL}", flush=True)
-    print(f"MOTU read-back: {MOTU_DATASTORE_URL or 'disabled'}", flush=True)
 
     while True:
         try:
@@ -338,7 +280,7 @@ def main() -> int:
             # Only verify when the cache claims there is nothing to do: that
             # is the case where trusting it wrongly leaves the clock wrong,
             # and a clock change that is already due must never wait behind
-            # an HTTP read that a silent device can stall until it times out.
+            # a read-back that a silent device can stall until it times out.
             if desired_clock == last_clock and now >= next_readback:
                 actual = read_motu_clock()
                 if actual is None:
@@ -357,7 +299,11 @@ def main() -> int:
                         persist_clock(actual)
 
             if desired_clock != last_clock:
-                if set_motu_clock(desired_clock):
+                if desired_clock == last_write and now < rewrite_not_before:
+                    # The device just contradicted this very write. Asking
+                    # again every pass would re-lock it every second.
+                    pass
+                elif set_motu_clock(desired_clock):
                     print(
                         f"CamillaDSP source={source}, sample rate={rate} Hz"
                         + ("" if verified else " (clock unconfirmed)"),
@@ -368,6 +314,8 @@ def main() -> int:
                     # that ignored the write is written again instead of being
                     # latched as done.
                     last_clock = desired_clock
+                    last_write = desired_clock
+                    rewrite_not_before = now + MOTU_REWRITE_INTERVAL
                     verified = False
                     next_readback = 0.0
                     persist_clock(desired_clock)

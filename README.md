@@ -361,10 +361,11 @@ managed source identity.
 
 ### Configuration
 
-The installer will prompt for your MOTU's IP address. To find it:
-1. Open MOTU web interface (usually `http://169.254.51.193`)
-2. Go to **Settings → About**
-3. Note the IP address
+The installer will prompt for your MOTU's IP address. To find it, push the
+UltraLite mk5's left front-panel knob to open the device info list; one entry
+is the IP address (a self-assigned `169.254.x.x`, usually `169.254.51.193`
+here). The UltraLite has no web interface: port 80 answers nothing, and all
+control goes over the binary WebSocket on port 1280 that CueMix 5 uses.
 
 To change the IP later, edit `~/camilladsp/cdsp-automation.env`:
 
@@ -382,17 +383,25 @@ The last requested clock choice is persisted at `MOTU_CLOCK_STATE_PATH` so
 service restarts do not send a redundant command that makes the interface
 re-lock and briefly mute. That file is a cache of what was asked for, not
 proof of what the device did: the daemon reads the clock source back from the
-MOTU's HTTP datastore, corrects the cache when the device disagrees (someone
-changed it in the MOTU web UI), and re-sends a command the device never
-applied. An interface that serves no datastore simply never confirms, and the
-daemon falls back to the cached value. Optional keys:
+state the MOTU pushes to every new WebSocket client (it sends nothing to read),
+corrects the cache when the device disagrees (someone changed it in CueMix 5),
+and re-sends a command the device never applied - at most once per
+`MOTU_CLOCK_REWRITE_INTERVAL`, since every write re-locks the clock audibly.
+If the device cannot be read, the daemon falls back to the cached value.
+
+The UltraLite serves one WebSocket client at a time, so each read-back briefly
+displaces the source switcher's meter connection (or an open CueMix 5), which
+reconnects on its own; that is why a confirmed clock is re-checked only every
+few minutes. Optional keys:
 
 ```text
-MOTU_DATASTORE_URL=http://YOUR_MOTU_IP/datastore   # derived from MOTU_WS_URL
 MOTU_CLOCK_READBACK_TIMEOUT=3
-MOTU_CLOCK_VERIFY_INTERVAL=60
+MOTU_CLOCK_VERIFY_INTERVAL=300
 MOTU_CLOCK_READBACK_RETRY_INTERVAL=300
+MOTU_CLOCK_REWRITE_INTERVAL=30
 ```
+
+`MOTU_DATASTORE_URL` is no longer read; an existing line for it can be removed.
 
 
 ---
@@ -778,11 +787,12 @@ Look for error messages about GPIO access or CamillaDSP connection.
 ping 169.254.51.193  # Or your MOTU's IP
 ```
 
-**Check if MOTU web interface is accessible:**
+**Check the MOTU control WebSocket is reachable** (an UltraLite mk5 serves no
+HTTP, so `curl` to port 80 always reports an empty reply; like any client,
+this briefly displaces the source switcher's meter connection):
 
 ```bash
-curl http://169.254.51.193
-# Should return HTML from MOTU
+timeout 2 bash -c '</dev/tcp/169.254.51.193/1280' && echo open
 ```
 
 **Check logs:**
@@ -793,12 +803,13 @@ journalctl -u cdsp-motu-sync -n 100
 
 **For other MOTU models:**
 
-The hex payloads may be different. You'll need to capture them from your MOTU's web UI:
-1. Open Chrome/Firefox Developer Tools (F12)
-2. Go to Network tab, filter by "WS" (WebSocket)
-3. Change clock source in MOTU web UI
-4. Inspect the binary WebSocket message
-5. Update `CLOCK_PAYLOADS` in `clock_sync.py`
+The payloads and read-back values come from MOTU's CueMix 5 app, whose
+unobfuscated JavaScript defines every device parameter (for the UltraLite,
+`dev.js`: `kClockSource` is id 11 with Internal=3, S/PDIF=0, Optical=2). Other
+MOTU gen5 models may differ; check the matching `dev_*.js`, then update
+`CLOCK_PAYLOADS` and `MOTU_CLOCK_SOURCE_VALUES` in `clock_sync.py` together.
+MOTU's AVB interfaces use a different (HTTP datastore) API and are not
+supported.
 
 ### Source Switcher Not Switching
 
