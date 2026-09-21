@@ -741,7 +741,6 @@ ensure_audio_state_storage
             self.assertNotIn("restart camilladsp", calls)
             self.assertNotIn("build_camilladsp_iso226", calls)
             self.assertIn("refresh", calls)
-            self.assertIn("restart cdsp-source-switcher.service", calls)
             self.assertIn("left running untouched", output)
             self.assertIn("menu option 10", output)
 
@@ -1374,12 +1373,67 @@ ensure_audio_state_storage
         body = source.split("update_utilities()", 1)[1].split("\n}", 1)[0]
         self.assertIn("audit_operator_volume_limits", body)
         self.assertLess(
-            body.index("audit_operator_volume_limits"), body.index("restart_all")
+            body.index("audit_operator_volume_limits"), body.index("refresh_installed_units")
         )
         # The audit is advisory: a finding must not abort the update.
         audit = source.split("audit_operator_volume_limits() {", 1)[1].split("\n}", 1)[0]
         self.assertIn("note_skip", audit)
 
+    def test_update_restarts_each_installed_service_exactly_once(self) -> None:
+        """An update must not restart a service twice in quick succession.
+
+        refresh_installed_units already restarts every installed unit through
+        create_unit. A second blanket pass restarted each again ~2 s later, and
+        the source switcher's second start read the first start's temporary
+        validation mute as the listener's setting, leaving playback muted.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            base = root / "site"
+            (base / ".venv" / "bin").mkdir(parents=True)
+            log = root / "calls.log"
+            (base / ".venv" / "bin" / "activate").write_text(
+                "pip() { :; }\ndeactivate() { :; }\n", encoding="utf-8"
+            )
+            (base / "cdsp-automation.env").write_text("", encoding="utf-8")
+            services = [
+                "cdsp-trigger", "cdsp-motu-sync", "cdsp-source-switcher",
+                "airplay-volume-bridge", "cdsp-remote", "cdsp-control-ui",
+            ]
+            listed = "\n".join(f"{s}.service enabled enabled" for s in services)
+            self._run(
+                "\n".join(
+                    [
+                        # every unit reports as installed, and every restart is logged
+                        f"systemctl() {{ if [[ \"$1\" == list-unit-files ]]; then "
+                        f"printf '%s\\n' \"{listed}\" | grep -F \"${{@: -1}}\" || true; "
+                        f"else printf 'systemctl %s\\n' \"$*\" >> {log!s}; fi; }}",
+                        'sudo() { if [[ "$1" == systemctl ]]; then shift; systemctl "$@"; fi; }',
+                        "download_scripts() { :; }",
+                        "migrate_env_defaults() { :; }",
+                        "ensure_audio_state_storage() { :; }",
+                        "ensure_venv() { :; }",
+                        "audit_operator_volume_limits() { :; }",
+                        # faithful to create_unit / install_control_ui: one restart each
+                        'create_unit() { systemctl restart "$3.service"; }',
+                        "install_control_ui() { systemctl restart cdsp-control-ui.service; }",
+                        "migrate_audio_eq_backups() { :; }",
+                        "install_receiver_sudoers() { :; }",
+                        "install_remote_sudoers() { :; }",
+                        "configure_shairport_bridge() { :; }",
+                        "install_spotify_volume_sync() { :; }",
+                        "update_utilities",
+                    ]
+                ),
+                env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
+            )
+            calls = log.read_text(encoding="utf-8").splitlines()
+            restarts = [c for c in calls if c.startswith("systemctl restart ")]
+            for service in services:
+                count = restarts.count(f"systemctl restart {service}.service")
+                self.assertEqual(
+                    count, 1, f"{service} restarted {count} times: {restarts}"
+                )
 
 if __name__ == "__main__":
     unittest.main()

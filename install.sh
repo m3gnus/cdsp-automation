@@ -848,13 +848,6 @@ install_iso226_engine_optional() {
   esac
 }
 
-restart_all() {
-  local service
-  for service in "${CDSP_SERVICES[@]}"; do
-    sudo systemctl restart "${service}.service" || true
-  done
-}
-
 refresh_installed_units() {
   if systemctl list-unit-files --no-legend cdsp-trigger.service 2>/dev/null | grep -q '^cdsp-trigger.service'; then
     create_unit "Trigger Control" trigger.py cdsp-trigger
@@ -1011,8 +1004,13 @@ update_utilities() {
     echo "Run menu option 10 to rebuild it against the downloaded pinned patch."
   fi
   audit_operator_volume_limits
+  # refresh_installed_units already restarts every installed service once:
+  # create_unit does it for each daemon and install_control_ui for the UI.
+  # A second pass here restarted each of them again ~2 s later, and the
+  # source switcher's second start mistook the first start's temporary
+  # validation mute for the listener's setting, so an update left the
+  # output muted. Do not add a blanket restart back.
   refresh_installed_units
-  restart_all
   echo "Update complete. User settings remain in $ENV_FILE."
   print_install_summary
 }
