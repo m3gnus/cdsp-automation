@@ -1477,6 +1477,51 @@ def test_motu_volume_page_starts_from_the_device_and_debounces() -> None:
     assert "mute" not in motu_js.lower() and "/api/camilla" not in motu_js
 
 
+def test_motu_volume_is_finely_adjustable_in_whole_db() -> None:
+    """The MOTU slider spends its travel on the loud end, with exact 1 dB steps.
+
+    Across -100..0 dB a linear slider left -6 -> -3 dB as 3% of its length.
+    The slider now runs over taper positions rather than raw dB, and -1/+1
+    buttons and a number box give exact steps. Every control feeds one entry
+    point, so rapid taps coalesce into a single write through the debounce.
+    """
+    page = web_ui.HTML
+    render = page[
+        page.index("function renderMotu() {") : page.index("function renderMotuCaption() {")
+    ]
+    # The slider holds taper positions, not dB, so it is no longer linear.
+    assert 'id="motuRange" type="range" min="0" max="${TAPER_STEPS}"' in render
+    assert "motuTaper.toPos(shown)" in render
+    # Exact adjustment: 1 dB nudges and a whole-dB number box.
+    assert 'data-motu-nudge="-1"' in render and 'data-motu-nudge="1"' in render
+    assert 'id="motuNum"' in render and 'step="${MOTU_STEP_DB}"' in render
+    # The device only holds whole dB, so no control may offer a finer level.
+    assert "const MOTU_STEP_DB = 1;" in page
+    # One entry point for every control; the old per-slider handler is gone.
+    assert "function motuSetTarget(db, source)" in page
+    assert "motuInput" not in page
+    # A nudge steps from the pending target, which is what lets taps coalesce.
+    assert "(motuTarget ?? motu.volume_db) + MOTU_STEP_DB" in page
+    # The number box acts on change, so typing "-3" never passes through "-".
+    assert 'qs("#motuNum").addEventListener("change"' in page
+
+
+def test_camilla_volume_slider_stays_linear_to_match_the_airplay_mapping() -> None:
+    """The CamillaDSP slider is deliberately NOT tapered.
+
+    The AirPlay bridge maps a sender's volume linearly across -50..0 dB, so a
+    phone slider half-way up and this slider half-way up mean the same level.
+    Tapering this one would break that correspondence; it already has +/-1 dB
+    buttons and a number box for fine adjustment.
+    """
+    page = web_ui.HTML
+    assert (
+        'id="volRange" data-volume type="range" '
+        'min="${Math.min(-50, volMax)}" max="${volMax}"'
+    ) in page
+    assert "volTaper" not in page
+
+
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
     assert "motu_access.py motu_volume.py web_ui.py" in installer

@@ -694,6 +694,43 @@ HTML = r"""<!doctype html>
     const qs = s => document.querySelector(s);
     const qsa = s => Array.from(document.querySelectorAll(s));
     const esc = v => String(v ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
+
+    /* Volume slider taper. A range input is linear, which crams the loud end --
+       where fine adjustment actually matters -- into a sliver: across -100..0 dB
+       the step from -6 to -3 was 3% of the slider. Like a mixing-desk fader,
+       the top TAPER_FINE_DB below the maximum gets TAPER_FINE_FRAC of the
+       travel and the rest of the range shares what is left. Positions run
+       0..TAPER_STEPS for a smooth drag; levels are snapped to the control's own
+       step, so a slider never offers a value the device cannot hold. Every
+       level round-trips exactly (level -> position -> level), so a slider
+       rendered from the device's current level never implies a change. */
+    const TAPER_STEPS = 1000, TAPER_FINE_DB = 24, TAPER_FINE_FRAC = 0.7;
+    function taper(min, max, step) {
+      const snap = db => Math.min(max, Math.max(min, Math.round(db / step) * step));
+      const knee = max - TAPER_FINE_DB;
+      const linear = !(knee > min);
+      const kneePos = TAPER_STEPS * (1 - TAPER_FINE_FRAC);
+      return {
+        toDb(pos) {
+          if (!(max > min)) return min;
+          pos = Math.min(TAPER_STEPS, Math.max(0, Number(pos)));
+          let db;
+          if (linear) db = min + (max - min) * pos / TAPER_STEPS;
+          else if (pos <= kneePos) db = min + (knee - min) * pos / kneePos;
+          else db = knee + (max - knee) * (pos - kneePos) / (TAPER_STEPS - kneePos);
+          return snap(db);
+        },
+        toPos(db) {
+          if (!(max > min)) return 0;
+          db = Math.min(max, Math.max(min, Number(db)));
+          let pos;
+          if (linear) pos = (db - min) / (max - min) * TAPER_STEPS;
+          else if (db <= knee) pos = (db - min) / (knee - min) * kneePos;
+          else pos = kneePos + (db - knee) / (max - knee) * (TAPER_STEPS - kneePos);
+          return Math.round(pos);
+        },
+      };
+    }
     const CLOCK_LOCALE = "en-GB";
     const CLOCK_TIME = { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false };
     const fmtClock = d => d.toLocaleTimeString(CLOCK_LOCALE, CLOCK_TIME);
@@ -1195,6 +1232,10 @@ HTML = r"""<!doctype html>
        allows one device access per window, sending the latest value after. */
     let motu = null, motuTarget = null, motuTimer = null, motuBusy = false, motuWaitUntil = 0;
     const MOTU_DEBOUNCE_MS = 700;
+    // The MOTU main trim is whole dB only (a device limit), so every MOTU control
+    // steps by 1 dB and never offers a finer level it cannot hold.
+    const MOTU_STEP_DB = 1;
+    let motuTaper = null;
     const motuDb = v => v == null ? "unknown" : (v <= -100 ? "−∞" : `${v.toFixed(0)}`);
     function renderMotu() {
       const panel = qs("#motuPanel"), badge = qs("#motuBadge");
@@ -1212,12 +1253,23 @@ HTML = r"""<!doctype html>
         // slider out from under the operator's finger.
         const max = writable ? motu.max_db : motu.volume_db;
         const shown = Math.min(motu.volume_db, max);
+        motuTaper = taper(motu.min_db, max, MOTU_STEP_DB);
+        const dis = writable ? "" : "disabled";
         panel.innerHTML = `<div class="volume">
-            <input id="motuRange" type="range" min="${motu.min_db}" max="${max}" step="1" value="${shown}" ${writable ? "" : "disabled"}>
+            <input id="motuRange" type="range" min="0" max="${TAPER_STEPS}" step="1" value="${motuTaper.toPos(shown)}" ${dis}>
             <div class="val sm" id="motuValue">${motuDb(shown)}<span class="unit"> dB</span></div>
           </div>
-          <div class="row" style="margin-top:10px"><button class="btn sm" id="motuRead">Read again</button></div>`;
-        qs("#motuRange").addEventListener("input", motuInput);
+          <div class="row" style="margin-top:10px">
+            <button class="btn sm" data-motu-nudge="-1" ${dis}>−1 dB</button>
+            <input id="motuNum" class="num" type="number" min="${motu.min_db}" max="${max}" step="${MOTU_STEP_DB}" value="${shown.toFixed(0)}" ${dis}>
+            <button class="btn sm" data-motu-nudge="1" ${dis}>+1 dB</button>
+            <button class="btn sm" id="motuRead">Read again</button>
+          </div>`;
+        qs("#motuRange").addEventListener("input", e => motuSetTarget(motuTaper.toDb(e.target.value), "slider"));
+        // change, not input: typing "-3" passes through "-", which is not a level.
+        qs("#motuNum").addEventListener("change", e => motuSetTarget(Number(e.target.value), "number"));
+        qsa("[data-motu-nudge]").forEach(b => b.addEventListener("click", () =>
+          motuSetTarget((motuTarget ?? motu.volume_db) + MOTU_STEP_DB * Number(b.dataset.motuNudge), "nudge")));
         qs("#motuRead").addEventListener("click", loadMotu);
       }
       renderMotuCaption();
@@ -1244,9 +1296,18 @@ HTML = r"""<!doctype html>
       catch (e) { motu = null; toast(e.message); }
       renderMotu();
     }
-    function motuInput(e) {
-      motuTarget = Number(e.target.value);
-      const label = qs("#motuValue"); if (label) label.innerHTML = `${motuDb(motuTarget)}<span class="unit"> dB</span>`;
+    /* The one way a MOTU level is chosen, from the slider, the number box or
+       the -1/+1 buttons. Nudges step from the pending target when there is one,
+       so three quick +1 taps from -6 dB become a single write of -3 dB. Each
+       control is kept in step with the others, and the write goes through the
+       same debounce and access window as a drag. */
+    function motuSetTarget(db, source) {
+      if (!motu || !motu.known || !motu.writable || !motuTaper || !Number.isFinite(db)) return;
+      db = Math.min(motu.max_db, Math.max(motu.min_db, Math.round(db / MOTU_STEP_DB) * MOTU_STEP_DB));
+      motuTarget = db;
+      if (source !== "slider") { const r = qs("#motuRange"); if (r) r.value = motuTaper.toPos(db); }
+      if (source !== "number") { const n = qs("#motuNum"); if (n) n.value = db.toFixed(0); }
+      const label = qs("#motuValue"); if (label) label.innerHTML = `${motuDb(db)}<span class="unit"> dB</span>`;
       renderMotuCaption();
       clearTimeout(motuTimer);
       motuTimer = setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS, motuWaitUntil - Date.now()));
