@@ -87,7 +87,7 @@ MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 # MOTU main output level, set from the control UI.  It sits after CamillaDSP,
 # so the profile volume limits do not bound it: this ceiling does.  -6 dB is
 # where the device stood when the control was added; raise it deliberately.
-MOTU_MAIN_VOLUME_MAX_DB=-6
+MOTU_MAIN_VOLUME_MAX_DB=0
 # Every MOTU connection besides the switcher's meters (clock writes and
 # read-backs, UI volume) is recorded here.  Read-backs and UI volume accesses
 # keep this far apart from any other one; clock writes never wait.

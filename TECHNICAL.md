@@ -183,8 +183,9 @@ unit that group is `0x03ff`, meaning all ten analog line outputs. So the high
 (Main 1-2), mid (Line 3-4) and low (Line 5-6) crossover pairs always move
 together. A write is refused if the group ever stops covering all of them.
 
-- **Ceiling:** `MOTU_MAIN_VOLUME_MAX_DB` (default `-6`, the level the device
-  was found at). It is enforced server-side, because the MOTU sits after
+- **Ceiling:** `MOTU_MAIN_VOLUME_MAX_DB` (default `0`, the top of the MOTU's
+  main attenuator -- the same range as its front-panel knob). Set it lower to
+  cap the control. It is enforced server-side, because the MOTU sits after
   CamillaDSP and the profile volume limits cannot bound it. An unparseable
   value disables writes.
 - **No jumps:** the page starts the slider from the level the server read off

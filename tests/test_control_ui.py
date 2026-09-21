@@ -1480,6 +1480,6 @@ def test_motu_volume_page_starts_from_the_device_and_debounces() -> None:
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
     assert "motu_access.py motu_volume.py web_ui.py" in installer
-    assert "\nMOTU_MAIN_VOLUME_MAX_DB=-6\n" in installer
+    assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
     assert "\nMOTU_ACCESS_WINDOW_SECONDS=15\n" in installer
     assert "\nMOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock\n" in installer

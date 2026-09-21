@@ -168,8 +168,11 @@ def test_write_encoding_refuses_values_outside_the_trim_range(bad: object) -> No
 # ------------------------------------------------------------------- ceiling
 
 
-def test_default_ceiling_is_the_level_the_device_was_found_at() -> None:
-    assert motu_volume.configured_max_db() == -6.0
+def test_default_ceiling_is_the_full_hardware_range() -> None:
+    """Unset, the control reaches everything the front-panel knob can."""
+    assert motu_volume.configured_max_db() == 0.0
+    assert motu_volume.min_attenuation(0.0) == 0
+    # An explicit ceiling still caps it.
     assert motu_volume.min_attenuation(-6.0) == 6
     # Fractional ceilings round toward quieter, never louder.
     assert motu_volume.min_attenuation(-6.4) == 7
@@ -185,9 +188,9 @@ def test_ceiling_is_enforced_server_side() -> None:
 
     result = volume.set({"volume_db": 0, "expected_db": -6})
 
-    # Already at the -6 dB ceiling: a request for 0 dB writes nothing.
-    assert device.sent == []
-    assert result["volume_db"] == -6.0 and result["written"] is False
+    # Full range by default: from -6 dB, a request for 0 dB is written as asked.
+    assert device.sent == [motu_volume.encode_main_trim_write(0)]
+    assert result["volume_db"] == 0.0 and result["written"] is True
 
     device = Device()
     clock.now += 60  # past the shared access window

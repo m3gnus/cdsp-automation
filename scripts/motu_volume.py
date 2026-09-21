@@ -77,11 +77,11 @@ MAIN_TRIM_MAX_ATTENUATION = 100
 REQUIRED_MAIN_GROUP = 0x03FF
 
 DEFAULT_MOTU_WS_URL = "ws://169.254.51.193:1280"
-# The level the device was found at when this control was added (captured
-# connect dump and a passive live read, both -6 dB). The system has been
-# voiced and its profile volume limits set with the MOTU there, so the default
-# ceiling keeps the control from ever making it louder than it already was.
-DEFAULT_MAX_DB = -6.0
+# The device's own maximum: 0 dB is the top of the MOTU's main attenuator, the
+# same range the front-panel knob already covers, so this control can do
+# nothing the knob cannot. MOTU_MAIN_VOLUME_MAX_DB can still impose a lower
+# ceiling where one is wanted.
+DEFAULT_MAX_DB = 0.0
 # A GET reuses what was last read or written this long before reconnecting.
 DEFAULT_CACHE_SECONDS = 30.0
 READ_TIMEOUT = 3.0
