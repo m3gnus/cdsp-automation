@@ -1332,9 +1332,16 @@ def _output_drain_times(config: object) -> tuple[float, float]:
     return ramp, queued / samplerate
 
 
-def _not_processing(cdsp: CamillaClient) -> bool:
+# States in which CamillaDSP hands the MOTU nothing at all: paused because
+# the input is silent, or not processing.  "starting" (a new config coming
+# up), "stalled" and anything unrecognized are not evidence of idle.
+IDLE_PROCESSING_STATES = frozenset({"paused", "inactive"})
+
+
+def _confirmed_idle(cdsp: CamillaClient) -> bool:
+    """True only for a successfully read, recognized idle state."""
     try:
-        return _processing_state(cdsp) != "running"
+        return _processing_state(cdsp) in IDLE_PROCESSING_STATES
     except Exception:
         return False
 
@@ -1363,16 +1370,18 @@ def _await_output_silence(cdsp: CamillaClient) -> bool:
     deadline = time.monotonic() + queued + max(MOTU_CLOCK_SILENCE_TIMEOUT, 0.0)
     window = max(queued, 0.05)
     while True:
+        # Three outcomes, kept apart: measured silence, confirmed idle, and
+        # unknown.  A failed meter request is unknown - never "empty history".
         try:
-            peaks = list(peak_since(window))
+            peaks: list | None = [float(peak) for peak in peak_since(window)]
         except Exception:
-            peaks = []
-        if peaks and all(float(peak) <= MOTU_CLOCK_SILENT_DB for peak in peaks):
+            peaks = None
+        if peaks and all(peak <= MOTU_CLOCK_SILENT_DB for peak in peaks):
             # The meter sees the chunk as it is handed over; what the device
             # still holds plays out within one more queued-audio span.
             time.sleep(queued)
             return True
-        if not peaks and _not_processing(cdsp):
+        if peaks == [] and _confirmed_idle(cdsp):
             # No chunk was handed to the device in the whole window: a paused
             # (idle) or stopped engine feeds the MOTU nothing at all.  The
             # meter only reports chunks that were played, so its silence is

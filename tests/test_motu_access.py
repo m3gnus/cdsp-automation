@@ -550,3 +550,36 @@ def test_a_ui_volume_access_holds_the_device_only_while_it_runs() -> None:
     assert control.status()["known"] is True
     assert during == [(False, None)]
     assert access.connect_when_idle(lambda: "ws") == (True, "ws")
+
+
+def test_a_deferrable_access_waits_for_one_still_holding_the_device() -> None:
+    """A read-back may hold the MOTU for 7 s, longer than the 5 s window."""
+    clock = FakeClock()
+    readback = access_at(clock)
+    ui = access_at(clock)  # a separate claimant sharing the same record
+    claimed = readback.claim("clock-readback", deferrable=True, hold=7.0)
+    clock.now += 5.1
+    assert ui.retry_after() == pytest.approx(1.9)
+    with pytest.raises(motu_access.AccessDeferred) as deferred:
+        ui.claim("ui-volume", deferrable=True)
+    assert deferred.value.retry_after == pytest.approx(1.9)
+    assert deferred.value.last_kind == "clock-readback"
+    assert ui.connect_when_idle(lambda: "ws")[0] is False
+
+    # Released early: the window (already past) is all that remains.
+    readback.release(claimed)
+    assert ui.retry_after() == 0.0
+    ui.claim("ui-volume", deferrable=True)
+
+    # An abandoned reservation still expires on its own.
+    clock.now += 10.0
+    readback.claim("clock-readback", deferrable=True, hold=7.0)
+    clock.now += 7.01
+    assert ui.retry_after() == 0.0
+    ui.claim("ui-volume", deferrable=True)
+
+    # A clock write keeps its priority over any reservation.
+    clock.now += 10.0
+    readback.claim("clock-readback", deferrable=True, hold=7.0)
+    clock.now += 1.0
+    ui.claim("clock-write", deferrable=False)

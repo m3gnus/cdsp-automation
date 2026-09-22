@@ -182,13 +182,25 @@ class MotuAccess:
         with self._locked(fcntl.LOCK_SH) as handle:
             return self._parse(handle, self._clock())
 
+    def _deferral(self, record: dict[str, Any] | None, now: float) -> float:
+        """Seconds a deferrable access must still wait.
+
+        Both conditions hold at once: the window since the last access, and
+        the span an access still in progress holds the device for (a
+        read-back or UI access may hold it longer than the window).
+        """
+        if record is None:
+            return 0.0
+        allowed_at = max(
+            float(record["monotonic"]) + window_seconds(), self._busy_until(record)
+        )
+        return max(0.0, allowed_at - now)
+
     def retry_after(self) -> float:
         """Seconds until a deferrable access would be allowed."""
-        now = self._clock()
-        at, _kind = self.last_access()
-        if at is None:
-            return 0.0
-        return max(0.0, at + window_seconds() - now)
+        with self._locked(fcntl.LOCK_SH) as handle:
+            now = self._clock()
+            return self._deferral(self._record(handle, now), now)
 
     def claim(self, kind: str, *, deferrable: bool, hold: float = 0.0) -> float:
         """Record an extra access about to be made; return its time.
@@ -204,11 +216,12 @@ class MotuAccess:
         """
         with self._locked(fcntl.LOCK_EX) as handle:
             now = self._clock()
-            at, last_kind = self._parse(handle, now)
-            if deferrable and at is not None:
-                wait = at + window_seconds() - now
+            record = self._record(handle, now)
+            if deferrable:
+                wait = self._deferral(record, now)
                 if wait > 0:
-                    raise AccessDeferred(wait, last_kind)
+                    assert record is not None
+                    raise AccessDeferred(wait, str(record.get("kind") or "unknown"))
             self._write(
                 handle,
                 {

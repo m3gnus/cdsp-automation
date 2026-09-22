@@ -201,7 +201,11 @@ the re-lock. "Silent" is not the mute flag: CamillaDSP ramps mute over
 `queuelimit` processed chunks plus the `target_level` device buffer. The
 switcher waits out the ramp, requires the playback peak meter to read at or
 below `MOTU_CLOCK_SILENT_DB` over the queued-audio window, then lets that span
-drain. If silence is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the
+drain. The meter only reports chunks it played, so an idle engine returns an
+empty history; that counts as silence only when the engine state was also
+read successfully as `Paused` or `Inactive`. A failed or malformed meter
+reading, `Starting`, `Stalled` or an unrecognized state is "unknown" and keeps
+waiting. If silence is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the
 ramp, the clock is not written.
 
 In a source transition that operation runs after the integrity and selection
@@ -296,7 +300,11 @@ inside a source transition the switcher only notices the dropped meters once
 the transition is done, and on the rig that late reconnect landed 70 ms into a
 read-back that had just been let through the reopened window, resetting it
 before the device had sent its clock. A skipped pass costs no backoff; the
-reader connects on the next pass after the access ends.
+reader connects on the next pass after the access ends. Deferrable accesses
+respect the same span: one is allowed only once both the window since the
+last access has passed *and* no access still holds the device, so a UI volume
+access cannot take the device from a read-back that is running past 5 s.
+`retry_after` reports the same condition. Clock writes keep their priority.
 
 **Worst-case meter gap.** A single extra access costs the time the reader
 takes to notice the drop (up to one switcher pass, 1 s plus a 0.2 s read

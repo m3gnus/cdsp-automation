@@ -1401,6 +1401,49 @@ def test_an_idle_engine_counts_as_silent_but_a_running_one_must_meter_it(
     assert events == ["clock:optical"]
 
 
+@pytest.mark.parametrize(
+    ("state", "meter", "authorized"),
+    [
+        ("PAUSED", [], True),        # successful empty history, confirmed idle
+        ("INACTIVE", [], True),      # not processing at all
+        ("STARTING", [], False),     # a new config coming up is not idle
+        ("STALLED", [], False),
+        (None, [], False),           # unrecognized state response
+        ("PAUSED", TimeoutError, False),   # failed measurement is unknown
+        ("PAUSED", ["n/a"], False),  # malformed measurement is unknown
+        ("RUNNING", [], False),
+        ("RUNNING", [-40.0, -1000.0], False),
+        ("RUNNING", [-1000.0, -1000.0], True),  # measured silence
+    ],
+)
+def test_the_silence_gate_needs_measured_silence_or_confirmed_idle(
+    state: str | None, meter: object, authorized: bool
+) -> None:
+    def peak_since(_interval: float):
+        if meter is TimeoutError:
+            raise TimeoutError("meter request timed out")
+        return list(meter)  # type: ignore[arg-type]
+
+    def read_state():
+        if state is None:
+            return None
+        return types.SimpleNamespace(name=state)
+
+    events: list[str] = []
+    cdsp = SimpleNamespace(
+        config=SimpleNamespace(active=lambda: {"devices": {"samplerate": 192000}}),
+        levels=SimpleNamespace(playback_peak_since=peak_since),
+        general=SimpleNamespace(state=read_state),
+    )
+    with (
+        patch.object(switcher, "clock_sync", MotuClockRecorder("internal", events)),
+        patch.object(switcher, "time", FakeClock()),
+        contextlib.redirect_stdout(io.StringIO()),
+    ):
+        assert switcher._set_motu_clock_muted(cdsp, "optical") is authorized
+    assert events == (["clock:optical"] if authorized else [])
+
+
 def reconciler_client(
     tmp_path: Path, events: list[str], *, mute: bool = False
 ) -> tuple[SimpleNamespace, str]:
