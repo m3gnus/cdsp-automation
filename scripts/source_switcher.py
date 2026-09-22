@@ -52,6 +52,7 @@ from speaker_profiles import (
     audio_control_lock,
     audio_inhibit_active,
     clear_audio_inhibit,
+    discard_mute_request,
     new_engine_generation,
     normalize_volume_limit,
     read_profile_audio_state,
@@ -59,6 +60,7 @@ from speaker_profiles import (
     set_audio_inhibit,
     speaker_selection_lock,
     stamp_engine_generation,
+    take_mute_request,
     operator_config_for_source,
 )
 
@@ -689,6 +691,17 @@ def validate_config_file(path: Path) -> None:
         raise ValueError(f"CamillaDSP rejected {path.name}: {message}")
 
 
+def capture_restore_mute(cdsp: CamillaClient) -> bool:
+    """Read the listener's live mute state as the value a transition restores.
+
+    Caller holds the audio-control lock.  The live flag already includes any
+    earlier listener mute request, so a pending one is dropped here; only a
+    request made after this capture may override it at restore time.
+    """
+    discard_mute_request(AUDIO_READY_PATH)
+    return bool(cdsp.volume.main_mute())
+
+
 def _processing_state(cdsp: CamillaClient) -> str:
     """Normalize pycamilladsp enum and string representations."""
     state = cdsp.general.state()
@@ -742,7 +755,7 @@ class ConfigRecoveryGuard:
             with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
                 set_audio_inhibit(AUDIO_READY_PATH)
                 if self.restore_mute is None:
-                    self.restore_mute = bool(cdsp.volume.main_mute())
+                    self.restore_mute = capture_restore_mute(cdsp)
                 cdsp.volume.set_main_mute(True)
                 if not bool(cdsp.volume.main_mute()):
                     raise RuntimeError("engine did not report mute after the request")
@@ -1198,6 +1211,42 @@ def _await_active_config(
         time.sleep(poll_interval)
 
 
+def _await_reload(
+    cdsp: CamillaClient,
+    file_path: str,
+    settle_time: float,
+    *,
+    timeout: float | None = None,
+    poll_interval: float | None = None,
+) -> None:
+    """Wait for a reloaded engine to run the requested file, or fail closed.
+
+    ``settle_time`` is only a grace period before the first look.  An engine
+    still reporting Starting then keeps getting polled until the apply deadline,
+    the same allowance the active-config read-back gets, instead of being rolled
+    back on the strength of one early read.
+    """
+    if timeout is None:
+        timeout = CONFIG_APPLY_TIMEOUT
+    if poll_interval is None:
+        poll_interval = CONFIG_APPLY_POLL_INTERVAL
+    poll_interval = max(poll_interval, 0.01)
+    deadline = time.monotonic() + max(timeout, settle_time, 0.0)
+    time.sleep(settle_time)
+    while True:
+        state = _processing_state(cdsp)
+        running = state in {"running", "paused"}
+        if running and same_config(cdsp.config.file_path(), file_path):
+            return
+        if time.monotonic() >= deadline:
+            if not running:
+                raise RuntimeError(
+                    f"CamillaDSP did not reach a safe running state: {state}"
+                )
+            raise RuntimeError("CamillaDSP did not retain the requested config path")
+        time.sleep(poll_interval)
+
+
 def _submit_audio_overlay(cdsp: CamillaClient, updated: dict) -> None:
     """Queue ``updated`` and wait until the engine reports its owned overlay.
 
@@ -1532,7 +1581,7 @@ def apply_config(
             audio_guard_entered = True
         set_audio_inhibit(AUDIO_READY_PATH)
         previous_mute = (
-            bool(cdsp.volume.main_mute())
+            capture_restore_mute(cdsp)
             if restore_mute is None
             else bool(restore_mute)
         )
@@ -1566,12 +1615,7 @@ def apply_config(
         previous_clock = _switch_motu_clock(cdsp, target)
         cdsp.config.set_file_path(file_path)
         cdsp.general.reload()
-        time.sleep(settle_time)
-        state = _processing_state(cdsp)
-        if state not in {"running", "paused"}:
-            raise RuntimeError(f"CamillaDSP did not reach a safe running state: {state}")
-        if not same_config(cdsp.config.file_path(), file_path):
-            raise RuntimeError("CamillaDSP did not retain the requested config path")
+        _await_reload(cdsp, file_path, settle_time)
         if target:
             expected = target.get("expected_config")
             if expected is not None:
@@ -1639,6 +1683,10 @@ def apply_config(
             timeout=CONFIG_APPLY_TIMEOUT,
             poll_interval=CONFIG_APPLY_POLL_INTERVAL,
         )
+        # A listener who muted after previous_mute was captured -- between
+        # recovery retries, say -- asked for silence more recently than it.
+        if take_mute_request(AUDIO_READY_PATH):
+            previous_mute = True
         cdsp.volume.set_main_mute(previous_mute)
         clear_pending_transition(target)
         clear_audio_inhibit(
@@ -2047,7 +2095,7 @@ def arbitrate(
 def mute_for_startup_validation(cdsp: CamillaClient) -> bool:
     """Capture desired mute, then fail closed before any startup validation."""
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        restore_mute = bool(cdsp.volume.main_mute())
+        restore_mute = capture_restore_mute(cdsp)
         cdsp.volume.set_main_mute(True)
     return restore_mute
 
@@ -2177,7 +2225,7 @@ def main() -> int:
                     restore_mute = (
                         startup_restore_mute
                         if startup_restore_mute is not None
-                        else bool(cdsp.volume.main_mute())
+                        else capture_restore_mute(cdsp)
                     )
                     cdsp.volume.set_main_mute(True)
                     target = resolve_config_target(
@@ -2216,7 +2264,7 @@ def main() -> int:
                     restore_mute = (
                         startup_restore_mute
                         if startup_restore_mute is not None
-                        else bool(cdsp.volume.main_mute())
+                        else capture_restore_mute(cdsp)
                     )
                     set_audio_inhibit(AUDIO_READY_PATH)
                     cdsp.volume.set_main_mute(True)

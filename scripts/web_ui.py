@@ -43,6 +43,8 @@ from speaker_profiles import (
     DEFAULT_SPEAKER_ID,
     audio_control_lock,
     audio_inhibit_active,
+    discard_mute_request,
+    note_mute_request,
     operator_configs_for_speaker,
     read_profile_audio_state,
     read_speaker_selection,
@@ -1809,7 +1811,9 @@ def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
                 muted = payload["muted"]
                 if not isinstance(muted, bool):
                     raise ValueError("muted must be true or false")
-                if not muted:
+                if muted:
+                    note_mute_request(AUDIO_READY_PATH)
+                else:
                     require_audio_unmute_allowed(AUDIO_READY_PATH, client)
 
             if target_volume is not None:
@@ -2257,6 +2261,9 @@ def select_speaker(raw: Any) -> dict[str, Any]:
         # succeeded, while both the audio and selection locks are held.
         set_audio_inhibit(AUDIO_READY_PATH)
         with camilla_client() as client:
+            # A fresh capture of the live flag supersedes any mute request
+            # still pending from an earlier transition.
+            discard_mute_request(AUDIO_READY_PATH)
             restore_mute = bool(client.volume.main_mute())
             atomic_write_json(
                 SPEAKER_TRANSITION_PATH,

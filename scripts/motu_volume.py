@@ -454,7 +454,14 @@ class MotuMainVolume:
                         f"not {attenuation_to_db(expected_att):.0f} dB; nothing written"
                     )
                 if target != state.attenuation:
-                    ws.send(encode_main_trim_write(target), opcode=OPCODE_BINARY)
+                    try:
+                        ws.send(encode_main_trim_write(target), opcode=OPCODE_BINARY)
+                    except Exception as exc:
+                        # The frame may or may not have reached the device, so
+                        # neither the old level nor the new one is known. Never
+                        # resend on a guess; a later read settles it.
+                        self._forget(f"MOTU main volume write outcome unknown: {exc}")
+                        raise MotuVolumeError(self._error) from None
                     print(
                         f"MOTU main volume {attenuation_to_db(state.attenuation):.0f} dB"
                         f" -> {attenuation_to_db(target):.0f} dB",

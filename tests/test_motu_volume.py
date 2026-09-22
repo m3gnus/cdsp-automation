@@ -33,10 +33,11 @@ def connect_dump() -> list[bytes]:
 class ReplaySocket:
     """A WebSocket stand-in replaying captured device frames, recording sends."""
 
-    def __init__(self, frames: list[bytes]) -> None:
+    def __init__(self, frames: list[bytes], send_error: Exception | None = None) -> None:
         self.frames = list(frames)
         self.sent: list[bytes] = []
         self.closed = False
+        self.send_error = send_error
 
     def connect(self, *_args: object, **_kwargs: object) -> None:
         pass
@@ -51,6 +52,9 @@ class ReplaySocket:
 
     def send(self, payload: bytes, *_args: object, **_kwargs: object) -> None:
         self.sent.append(payload)
+        if self.send_error is not None:
+            # Recorded first: the frame may well have reached the device.
+            raise self.send_error
 
     def close(self) -> None:
         self.closed = True
@@ -67,15 +71,21 @@ class FakeClock:
 class Device:
     """Hands out one ReplaySocket per connection and remembers them all."""
 
-    def __init__(self, frames: list[bytes] | None = None, fail: bool = False) -> None:
+    def __init__(
+        self,
+        frames: list[bytes] | None = None,
+        fail: bool = False,
+        send_error: Exception | None = None,
+    ) -> None:
         self.frames = connect_dump() if frames is None else frames
         self.fail = fail
+        self.send_error = send_error
         self.sockets: list[ReplaySocket] = []
 
     def connect(self, _url: str, _timeout: float) -> ReplaySocket:
         if self.fail:
             raise OSError("no route to host")
-        ws = ReplaySocket(self.frames)
+        ws = ReplaySocket(self.frames, self.send_error)
         self.sockets.append(ws)
         return ws
 
@@ -282,6 +292,29 @@ def test_a_level_changed_on_the_device_is_reported_not_overwritten() -> None:
     assert device.sent == []
     status = volume.status()
     assert status["volume_db"] == -6.0 and status["confirmed"] is True
+
+
+def test_a_write_whose_send_fails_leaves_the_level_unknown_not_confirmed() -> None:
+    """The send raised after the frame may have reached the device: the
+    pre-write reading is no longer known to hold, and nothing is resent."""
+    device = Device(send_error=ConnectionResetError("connection reset by peer"))
+    clock = FakeClock()
+    access = motu_access.MotuAccess(clock=clock)
+    volume = motu_volume.MotuMainVolume(connect=device.connect, clock=clock, access=access)
+
+    with pytest.raises(motu_volume.MotuVolumeError) as failed:
+        volume.set({"volume_db": -20, "expected_db": -6})
+    assert "outcome unknown" in str(failed.value)
+    assert device.sent == [motu_volume.encode_main_trim_write(20)]
+    assert device.sockets[0].closed is True
+
+    # The reservation was released, and the cached -6 dB is not served as
+    # confirmed: inside the window the answer is "unknown".
+    status = volume.status()
+    assert status["known"] is False
+    assert status["volume_db"] is None and status["confirmed"] is False
+    assert "outcome unknown" in status["reason"]
+    assert len(device.sockets) == 1 and len(device.sent) == 1
 
 
 def test_main_group_missing_a_speaker_output_refuses_the_write() -> None:

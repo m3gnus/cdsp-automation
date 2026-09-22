@@ -18,6 +18,7 @@ from audio_eq import read_audio_state, reset_tone_bands, update_tone_band
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     audio_control_lock,
+    note_mute_request,
     read_speaker_selection,
     require_audio_unmute_allowed,
     resolve_profile_audio_path,
@@ -261,6 +262,8 @@ def toggle_mute() -> None:
             is_muted = client.volume.main_mute()
             if is_muted:
                 require_audio_unmute_allowed(AUDIO_READY_PATH, client)
+            else:
+                note_mute_request(AUDIO_READY_PATH)
             client.volume.set_main_mute(not is_muted)
         print(f"Mute: {'ON' if not is_muted else 'OFF'}", flush=True)
     except Exception as exc:

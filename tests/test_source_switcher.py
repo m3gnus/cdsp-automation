@@ -353,6 +353,25 @@ class FakeSwitcherGeneral:
         return next(self.states)
 
 
+class StagedSwitcherGeneral:
+    """Engine states per reload: ``stages[n]`` is read after reload n+1.
+
+    Each stage's last state repeats, so a poll sees an engine that stays put
+    until the next reload rather than one that walks on by itself.
+    """
+
+    def __init__(self, stages: list[list[str]]) -> None:
+        self.stages = [list(stage) for stage in stages]
+        self.reloads = 0
+
+    def reload(self) -> None:
+        self.reloads += 1
+
+    def state(self) -> str:
+        stage = self.stages[min(self.reloads, len(self.stages)) - 1]
+        return stage.pop(0) if len(stage) > 1 else stage[0]
+
+
 def test_managed_config_identity_rejects_filename_spoofing(tmp_path: Path) -> None:
     spoof = tmp_path / "streamer--partymeh.yml"
     spoof.write_text("devices: {}\n")
@@ -916,7 +935,7 @@ def test_speaker_config_switch_rolls_back_and_latches_mute_on_failure(
     client = SimpleNamespace(
         config=FakeSwitcherConfig(str(previous)),
         volume=FakeSwitcherVolume(),
-        general=FakeSwitcherGeneral(["stalled", "ProcessingState.Paused"]),
+        general=StagedSwitcherGeneral([["stalled"], ["ProcessingState.Paused"]]),
     )
     target = {
         "speaker": "partymeh",
@@ -931,7 +950,7 @@ def test_speaker_config_switch_rolls_back_and_latches_mute_on_failure(
         patch.object(switcher, "CONFIG_DIR", str(tmp_path)),
         patch.object(switcher, "validate_config_file"),
         patch.object(switcher, "_write_speaker_status", side_effect=statuses.append),
-        patch.object(switcher.time, "sleep"),
+        patch.object(switcher, "time", FakeClock()),
     ):
         try:
             switcher.apply_config(client, str(target_path), target=target)
@@ -2177,7 +2196,7 @@ def test_failed_transition_status_leaves_the_controls_failing_closed(
     client = SimpleNamespace(
         config=FakeSwitcherConfig(str(previous)),
         volume=FakeSwitcherVolume(),
-        general=FakeSwitcherGeneral(["stalled", "ProcessingState.Paused"]),
+        general=StagedSwitcherGeneral([["stalled"], ["ProcessingState.Paused"]]),
     )
     target = {
         "speaker": "partymeh",
@@ -2193,7 +2212,7 @@ def test_failed_transition_status_leaves_the_controls_failing_closed(
         patch.object(switcher, "SPEAKER_STATUS_PATH", status_path),
         patch.object(switcher, "validate_config_file"),
         patch.object(switcher, "ensure_audio_eq"),
-        patch.object(switcher.time, "sleep"),
+        patch.object(switcher, "time", FakeClock()),
         contextlib.redirect_stdout(io.StringIO()),
     ):
         try:
@@ -3160,6 +3179,181 @@ def test_a_boot_that_needed_recovery_restores_the_listeners_mute_state(
     assert reloaded, "recovery never reloaded"
     assert restores and restores[0] is False, restores
     assert client.volume.mute is False
+
+
+def _transition_fixture(tmp_path: Path, general: object, *, mute: bool = False):
+    previous = tmp_path / "streamer.yml"
+    target_path = tmp_path / "streamer--partymeh.yml"
+    previous.write_text("devices: {}\n")
+    target_path.write_text("devices: {}\n")
+    client = SimpleNamespace(
+        config=FakeSwitcherConfig(str(previous)),
+        volume=FakeSwitcherVolume(mute=mute),
+        general=general,
+    )
+    target = {
+        "speaker": "partymeh",
+        "source": "streamer",
+        "digest": switcher.config_digest({"devices": {}}),
+        "max_volume_db": -6,
+    }
+    guards = [
+        patch.object(switcher, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
+        patch.object(switcher, "AUDIO_READY_PATH", tmp_path / "ready.json"),
+        patch.object(switcher, "validate_config_file"),
+        patch.object(switcher, "ensure_audio_eq"),
+        patch.object(switcher, "_write_speaker_status"),
+        contextlib.redirect_stdout(io.StringIO()),
+    ]
+    return client, target, target_path, guards
+
+
+def test_an_engine_still_starting_after_the_settle_time_is_waited_for(
+    tmp_path: Path,
+) -> None:
+    """Starting past the settle grace but Running inside the apply deadline
+    is a slow transition, not a failed one: no rollback, sound returns."""
+    clock = FakeClock()
+    client, target, target_path, guards = _transition_fixture(
+        tmp_path,
+        StagedSwitcherGeneral([["starting"] * 5 + ["running"]]),
+    )
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        stack.enter_context(patch.object(switcher, "time", clock))
+        switcher.apply_config(client, str(target_path), settle_time=1.5, target=target)
+    assert client.general.reloads == 1
+    assert client.config.path == str(target_path)
+    assert client.volume.mute is False
+    assert (tmp_path / "ready.json").is_file()
+    assert clock.now - 1000.0 < switcher.CONFIG_APPLY_TIMEOUT
+
+
+def test_an_engine_that_never_leaves_starting_fails_closed_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    client, target, target_path, guards = _transition_fixture(
+        tmp_path,
+        StagedSwitcherGeneral([["starting"], ["running"]]),
+    )
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        stack.enter_context(patch.object(switcher, "time", clock))
+        with pytest.raises(RuntimeError, match="safe running state: starting"):
+            switcher.apply_config(
+                client, str(target_path), settle_time=1.5, target=target
+            )
+    # Rolled back only once the full apply allowance had run out.
+    assert client.general.reloads == 2
+    assert clock.slept[0] == 1.5
+    assert sum(clock.slept[1:-1]) >= switcher.CONFIG_APPLY_TIMEOUT - 1.5
+    assert client.volume.mute is True
+    assert not (tmp_path / "ready.json").exists()
+
+
+def test_a_listener_mute_between_recovery_attempts_survives_the_restore(
+    tmp_path: Path,
+) -> None:
+    """Recovery captured "unmuted" and carries it across retries.  A listener
+    who mutes from the control UI after a failed attempt asked for silence
+    more recently than that capture; the eventual success must not undo it."""
+    clock = FakeClock()
+    client, target, target_path, guards = _transition_fixture(
+        tmp_path,
+        StagedSwitcherGeneral([["stalled"], ["running"], ["running"]]),
+        mute=False,
+    )
+    (tmp_path / "ready.json").unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def ui_client():
+        yield client
+
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        stack.enter_context(patch.object(switcher, "time", clock))
+        stack.enter_context(
+            patch.object(web_ui, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock")
+        )
+        stack.enter_context(
+            patch.object(web_ui, "AUDIO_READY_PATH", tmp_path / "ready.json")
+        )
+        stack.enter_context(patch.object(web_ui, "camilla_client", ui_client))
+        stack.enter_context(patch.object(web_ui, "camilla_status", return_value={}))
+
+        # Recovery's capture, before its own safety mute.
+        restore_mute = switcher.mute_for_startup_validation(client)
+        assert restore_mute is False
+
+        with pytest.raises(RuntimeError):
+            switcher.apply_config(
+                client, str(target_path), target=target, restore_mute=restore_mute
+            )
+        assert client.volume.mute is True
+
+        web_ui.set_camilla_volume({"muted": True})
+        # Unmuting stays refused while inhibited, as before.
+        with pytest.raises(RuntimeError, match="inhibited"):
+            web_ui.set_camilla_volume({"muted": False})
+
+        switcher.apply_config(
+            client, str(target_path), target=target, restore_mute=restore_mute
+        )
+
+    assert (tmp_path / "ready.json").is_file()
+    assert client.volume.mute is True
+    assert not speaker_profiles.mute_request_path(tmp_path / "ready.json").exists()
+
+
+def test_a_mute_request_older_than_the_capture_does_not_hold_the_restore(
+    tmp_path: Path,
+) -> None:
+    """The live capture already includes any earlier request; a leftover
+    file from a transition that never finished must not keep a later,
+    unmuted listener silent."""
+    client, target, target_path, guards = _transition_fixture(
+        tmp_path, StagedSwitcherGeneral([["running"]]), mute=False
+    )
+    ready = tmp_path / "ready.json"
+    speaker_profiles.note_mute_request(ready)
+    assert speaker_profiles.mute_request_path(ready).exists()
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        stack.enter_context(patch.object(switcher, "time", FakeClock()))
+        switcher.apply_config(client, str(target_path), target=target)
+    assert client.volume.mute is False
+    assert not speaker_profiles.mute_request_path(ready).exists()
+
+
+def test_mute_requests_are_recorded_only_while_readiness_is_dropped(
+    tmp_path: Path,
+) -> None:
+    ready = tmp_path / "ready.json"
+    speaker_profiles.clear_audio_inhibit(
+        ready, generation=speaker_profiles.new_engine_generation()
+    )
+    speaker_profiles.note_mute_request(ready)
+    assert not speaker_profiles.mute_request_path(ready).exists()
+
+    speaker_profiles.set_audio_inhibit(ready)
+    speaker_profiles.note_mute_request(ready)
+    assert speaker_profiles.take_mute_request(ready) is True
+    assert speaker_profiles.take_mute_request(ready) is False
+
+    # No runtime directory: no switcher is running to hold a restore value.
+    speaker_profiles.note_mute_request(tmp_path / "absent" / "ready.json")
+    assert not (tmp_path / "absent").exists()
+
+
+def test_every_mute_writer_records_a_request_while_inhibited() -> None:
+    for name in ("web_ui.py", "cdsp_remote.py", "airplay_volume_bridge.py"):
+        source = (REPOSITORY / "scripts" / name).read_text()
+        assert "note_mute_request(AUDIO_READY_PATH)" in source, name
 
 
 if __name__ == "__main__":

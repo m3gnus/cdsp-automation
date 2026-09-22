@@ -38,6 +38,22 @@ validate/reload/verify → overlay → stamp the engine generation → restore
 requested mute → publish ready.
 Rollback always re-inhibits and asserts mute before loading the previous graph.
 
+The "requested mute" is the listener's state captured *before* the transition's
+own safety mute, and recovery can carry it across several failed attempts. A
+listener who mutes in between only sets a flag the switcher already set, so
+every mute writer (control UI, remote, AirPlay/Spotify bridge) that mutes while
+the ready token is absent also leaves `mute-request.json` beside the token.
+The switcher drops that file whenever it captures the live mute state (the
+capture already includes it) and takes it at restore time, so a mute requested
+after the capture keeps the restored output muted. Unmuting while inhibited is
+refused, as before.
+
+After a reload, `SOURCE_SETTLE_TIME` (default 2 s; 1.5 s for the USB gadget) is only a grace period
+before the first look. The engine is then polled until it reports Running or
+Paused on the requested file, within the same `SOURCE_CONFIG_APPLY_TIMEOUT`
+(measured from the reload) as the active-config read-back, so a slow Starting
+phase is not mistaken for a failure and rolled back.
+
 Readiness is scoped to one CamillaDSP *instance*, not to the boot. CamillaDSP
 4.1.3 exposes no process id over its websocket, so the switcher synthesizes an
 engine generation, rotates it on every (re)connection, and writes it into the
@@ -250,6 +266,9 @@ together. A write is refused if the group ever stops covering all of them.
   the device, and shows `unknown` with no slider when the device cannot be
   read. Every write names the level it replaces and is refused (409) if the
   device reports anything else, for example after the front-panel knob moved.
+- **Uncertain writes:** a send that raises may still have reached the
+  device, so the cached level is forgotten (`unknown`, 503) rather than kept
+  as confirmed, and nothing is resent; the next permitted read settles it.
 - **One client:** the browser debounces the slider and sends only the latest
   value once the shared access window reopens. Inside the window the server
   answers 429 with `retry_after`. The next section covers the window.

@@ -1420,6 +1420,19 @@ def test_motu_volume_unknown_device_is_reported_and_writes_are_refused() -> None
     assert device.sent == []
 
 
+def test_motu_volume_failed_send_is_unavailable_with_an_unknown_level() -> None:
+    with _motu_device(send_error=ConnectionResetError("reset")) as (device, _clock):
+        handler = _post(
+            "/api/motu/volume",
+            body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
+        )
+        handler.do_POST()
+    assert handler.status == HTTPStatus.SERVICE_UNAVAILABLE
+    motu = handler.response_body()["motu"]
+    assert motu["known"] is False and motu["confirmed"] is False
+    assert len(device.sent) == 1
+
+
 def test_motu_volume_burst_is_answered_429_with_retry_after() -> None:
     with _motu_device() as (device, clock):
         first = _post(

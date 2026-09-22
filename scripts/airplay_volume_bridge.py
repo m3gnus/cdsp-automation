@@ -191,6 +191,7 @@ def set_mapped_volume(
     # beside that callback copy.
     from speaker_profiles import (
         audio_control_lock,
+        note_mute_request,
         require_audio_unmute_allowed,
         volume_ceiling,
     )
@@ -201,7 +202,9 @@ def set_mapped_volume(
     ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
     capped_db = min(mapped_db, ceiling)
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        if not muted:
+        if muted:
+            note_mute_request(AUDIO_READY_PATH)
+        else:
             require_audio_unmute_allowed(AUDIO_READY_PATH, client)
         client.volume.set_main_volume(capped_db)
         client.volume.set_main_mute(muted)

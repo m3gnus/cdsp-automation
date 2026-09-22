@@ -448,6 +448,55 @@ def require_audio_unmute_allowed(path: Path, client: Any) -> None:
         raise RuntimeError("audio output is inhibited until a verified config is active")
 
 
+# ---------------------------------------------------------------------------
+# Listener mute requests during a transition
+#
+# While readiness is dropped the switcher holds the listener's mute state from
+# before its own safety mute, and restores it once a config is verified -- which
+# may be several retries later.  A control that mutes in between only changes the
+# engine's flag, which the switcher's own mute already set, so the request would
+# be lost and the restore would unmute over it.  The engine flag cannot carry the
+# distinction; this file does.
+#
+# Every write and read happens under the audio-control lock.  The switcher
+# discards the file whenever it captures the live mute state (the capture already
+# includes any earlier request) and takes it at the moment it restores, so only a
+# request made after the capture can survive to the restore.
+# ---------------------------------------------------------------------------
+
+
+def mute_request_path(ready_path: Path) -> Path:
+    return Path(ready_path).with_name("mute-request.json")
+
+
+def note_mute_request(ready_path: Path) -> None:
+    """Record an explicit listener mute accepted while readiness is dropped.
+
+    Only needed while the ready token is absent: that is the only time the
+    switcher holds a mute state to restore.  A missing runtime directory means
+    no switcher is running, so nothing holds one either.
+    """
+    if audio_ready_generation(ready_path) is not None:
+        return
+    path = mute_request_path(ready_path)
+    if not path.parent.is_dir():
+        return
+    atomic_write_json(path, {"version": 1, "muted": True, "requested_at": time.time()})
+
+
+def discard_mute_request(ready_path: Path) -> None:
+    mute_request_path(ready_path).unlink(missing_ok=True)
+
+
+def take_mute_request(ready_path: Path) -> bool:
+    """Consume a pending listener mute request; True if there was one."""
+    try:
+        mute_request_path(ready_path).unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
 def update_speaker_selection(
     path: Path,
     speaker_id: str,
