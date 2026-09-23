@@ -16,19 +16,10 @@ MARKER="${CDSP_AUTOMATION_LIBRESPOT_MARKER:-/var/lib/cdsp-automation/librespot-v
 MARKER_FORMAT="cdsp-volume-sync/2"
 BUILD_FEATURES="alsa-backend,native-tls,with-avahi"
 
-# Artifact names an earlier release compiled a single site's name into.  The
-# name is assembled from fragments so the literal never appears in this
-# repository; every comparison against it is exact, so drop-ins, binaries and
-# sockets this tool did not create are never touched.
-LEGACY_TAG="ug""lan"
-LEGACY_TARGET="${CDSP_AUTOMATION_LEGACY_LIBRESPOT_TARGET:-/usr/local/bin/librespot-$LEGACY_TAG}"
-LEGACY_DROPIN="$DROPIN_DIR/$LEGACY_TAG-volume-sync.conf"
-
 : "${SPOTIFY_VOLUME_COMMAND_SOCKET_PATH:=/run/raspotify/cdsp-volume.sock}"
 : "${SPOTIFY_ALSA_DEVICE:=}"
 : "${VOLUME_SYNC_GROUP:=audio}"
 COMMAND_SOCKET="$SPOTIFY_VOLUME_COMMAND_SOCKET_PATH"
-LEGACY_COMMAND_SOCKET="/run/raspotify/$LEGACY_TAG-volume.sock"
 ACK_SOCKET="${AIRPLAY_VOLUME_SOCKET_PATH:-/run/airplay-volume-bridge/input.sock}"
 
 BUILD_DIR=""
@@ -36,7 +27,6 @@ deployment_started=false
 deployment_complete=false
 had_target=false
 had_dropin=false
-had_legacy_dropin=false
 
 validate_settings() {
   # Allowlists, so whitespace, quotes, $, backticks and systemd's % specifier
@@ -131,11 +121,6 @@ rollback() {
   else
     sudo rm -f "$DROPIN"
   fi
-  # The superseded drop-in comes back only while the binary it names still
-  # exists: the legacy pair is never dismantled before the new one is healthy.
-  if [[ "$had_legacy_dropin" == true ]]; then
-    sudo install -m 0644 "$BUILD_DIR/previous-legacy-dropin" "$LEGACY_DROPIN"
-  fi
   sudo systemctl daemon-reload
   sudo systemctl restart raspotify.service || true
 }
@@ -154,7 +139,6 @@ cleanup() {
 
 uninstall() {
   sudo rm -f "$DROPIN" "$TARGET" "$MARKER"
-  sudo rm -f "$LEGACY_DROPIN" "$LEGACY_TARGET"
   sudo systemctl daemon-reload
   sudo systemctl restart raspotify.service
 }
@@ -201,8 +185,7 @@ main() {
     rebuild=false
   fi
   if [[ "$rebuild" == false ]] &&
-     [[ -f "$DROPIN" ]] && cmp -s "$dropin_candidate" "$DROPIN" &&
-     [[ ! -e "$LEGACY_DROPIN" && ! -e "$LEGACY_TARGET" ]]; then
+     [[ -f "$DROPIN" ]] && cmp -s "$dropin_candidate" "$DROPIN"; then
     echo "Spotify volume sync is already current (patch and receiver unchanged)."
     warn_about_unknown_device
     exit 0
@@ -235,10 +218,6 @@ main() {
     had_dropin=true
     cp -p "$DROPIN" "$BUILD_DIR/previous-dropin"
   fi
-  if [[ -f "$LEGACY_DROPIN" ]]; then
-    had_legacy_dropin=true
-    cp -p "$LEGACY_DROPIN" "$BUILD_DIR/previous-legacy-dropin"
-  fi
 
   deployment_started=true
   if [[ -n "$candidate" ]]; then
@@ -247,10 +226,6 @@ main() {
   fi
   sudo install -d -m 0755 "$DROPIN_DIR"
   sudo install -m 0644 "$dropin_candidate" "$DROPIN"
-  # systemd applies drop-ins in filename order and the last ExecStart= wins, so
-  # the superseded file has to go before the reload or it would keep launching
-  # the old receiver.  Its binary and socket stay until the new pair is healthy.
-  sudo rm -f "$LEGACY_DROPIN"
   sudo systemctl daemon-reload
   sudo systemctl restart airplay-volume-bridge.service raspotify.service
   sleep 3
@@ -264,14 +239,6 @@ main() {
     exit 1
   fi
   deployment_complete=true
-  # Both services proved healthy on the new pair; only now is the superseded
-  # receiver removed.
-  if [[ "$LEGACY_TARGET" != "$TARGET" ]]; then
-    sudo rm -f "$LEGACY_TARGET"
-  fi
-  if [[ "$LEGACY_COMMAND_SOCKET" != "$COMMAND_SOCKET" ]]; then
-    sudo rm -f "$LEGACY_COMMAND_SOCKET"
-  fi
   write_marker "$digest"
   warn_about_unknown_device
   echo "Installed bidirectional Spotify Connect volume sync through CamillaDSP."

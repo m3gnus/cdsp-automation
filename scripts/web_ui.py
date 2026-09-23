@@ -184,20 +184,6 @@ SPOTIFY_VOLUME_DROPIN_PATH = Path(
 # Name shown in the page title and header; the installer publishes a neutral
 # default and a deployment can override it in the env file.
 SITE_NAME = os.environ.get("SITE_NAME", "CamillaDSP")
-# The artifact names an earlier release compiled one site's name into, kept so
-# this read-only status view does not report "not configured" between the
-# script update and the service reconfiguration.  Assembled from fragments so
-# the literal never appears in this repository; matching is exact.
-_LEGACY_TAG = "ug" "lan"
-AIRPLAY_CONFIG_MARKERS = (
-    "CDSP-AIRPLAY-BEGIN",
-    f"{_LEGACY_TAG.upper()}-AIRPLAY-BEGIN",
-)
-SPOTIFY_RECEIVER_NAMES = ("librespot-cdsp", f"librespot-{_LEGACY_TAG}")
-SPOTIFY_SOCKET_ENV_NAMES = (
-    "CDSP_SPOTIFY_VOLUME_SOCKET",
-    f"{_LEGACY_TAG.upper()}_SPOTIFY_VOLUME_SOCKET",
-)
 ISO226_CAPABILITY_PATH = Path(
     os.environ.get(
         "ISO226_CAPABILITY_PATH", "/var/lib/cdsp-automation/iso226-engine.json"
@@ -2332,7 +2318,7 @@ def audio_eq_payload() -> dict[str, Any]:
     try:
         shairport = SHAIRPORT_CONFIG_PATH.read_text(encoding="utf-8")
         configured = (
-            any(marker in shairport for marker in AIRPLAY_CONFIG_MARKERS)
+            "CDSP-AIRPLAY-BEGIN" in shairport
             and 'ignore_volume_control = "yes"' in shairport
             and "airplay_volume_bridge.py --notify" in shairport
         )
@@ -2343,10 +2329,10 @@ def audio_eq_payload() -> dict[str, Any]:
     try:
         spotify_dropin = SPOTIFY_VOLUME_DROPIN_PATH.read_text(encoding="utf-8")
         spotify_configured = (
-            any(name in spotify_dropin for name in SPOTIFY_RECEIVER_NAMES)
+            "librespot-cdsp" in spotify_dropin
             and "LIBRESPOT_VOLUME_CTRL=fixed" in spotify_dropin
             and "--notify-spotify" in spotify_dropin
-            and any(name in spotify_dropin for name in SPOTIFY_SOCKET_ENV_NAMES)
+            and "CDSP_SPOTIFY_VOLUME_SOCKET" in spotify_dropin
         )
     except OSError:
         spotify_configured = False

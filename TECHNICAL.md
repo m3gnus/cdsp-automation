@@ -501,8 +501,6 @@ through the source switcher's owned `cdsp_ui_eq_*` overlay. The remote adjusts
 the reserved low/high shelf bands. Source configs must not add separate
 `Bass`, `Treble`, `Loudness`, or `Iso226` stages because those would stack with
 the owned overlay; legacy stages are stripped when a config becomes active.
-Filters written under this tool's earlier owned prefix are stripped by the same
-pass, so a config recomposed after an update carries only the current names.
 
 ---
 
@@ -595,8 +593,8 @@ All four utilities run as systemd services with these benefits:
 - **Easy control** - Standard `systemctl start/stop/restart` commands
 
 Current units are enabled from `multi-user.target`. On update, the installer
-removes the pre-2026-07 `/lib/systemd/system` fragments and rebuilds enablement
-with `systemctl reenable`, removing stale `default.target.wants` links.
+rebuilds enablement with `systemctl reenable`, removing stale
+`default.target.wants` links.
 CamillaDSP's own unit must not specify `After=default.target` or
 `After=graphical.target`; either creates a boot ordering cycle when the service
 is enabled from that target.

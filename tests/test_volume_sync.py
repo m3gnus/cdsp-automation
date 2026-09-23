@@ -19,9 +19,6 @@ import web_ui
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPT = REPOSITORY / "scripts" / "airplay_volume_bridge.py"
 BUILDER = REPOSITORY / "scripts" / "build_librespot_volume_sync.sh"
-# The receiver name an earlier release compiled one site's name into, assembled
-# from fragments so the literal never appears in this repository.
-LEGACY_TAG = "ug" "lan"
 spec = importlib.util.spec_from_file_location("volume_sync", SCRIPT)
 assert spec and spec.loader
 volume_sync = importlib.util.module_from_spec(spec)
@@ -250,8 +247,7 @@ class VolumeSyncTests(unittest.TestCase):
             self.assertEqual(result.stdout, "", setting)
             self.assertIn("ExecStart", result.stderr + "ExecStart")
 
-    def test_rollback_restores_a_working_superseded_receiver_pair(self) -> None:
-        """The old drop-in only ever comes back while its binary still exists."""
+    def test_rollback_removes_a_new_receiver_pair_and_spares_other_dropins(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             dropin_dir = root / "raspotify.service.d"
@@ -259,26 +255,18 @@ class VolumeSyncTests(unittest.TestCase):
             build = root / "build"
             build.mkdir()
             target = root / "librespot-cdsp"
-            legacy_target = root / "librespot-legacy"
-            legacy_dropin = dropin_dir / f"{LEGACY_TAG}-volume-sync.conf"
             unrelated = dropin_dir / "10-operator.conf"
             log = root / "systemctl.log"
 
             target.write_text("new receiver\n", encoding="utf-8")
-            legacy_target.write_text("old receiver\n", encoding="utf-8")
-            legacy_dropin.write_text("ExecStart=/old\n", encoding="utf-8")
             unrelated.write_text("[Service]\n", encoding="utf-8")
             (dropin_dir / "cdsp-volume-sync.conf").write_text(
                 "ExecStart=/new\n", encoding="utf-8"
-            )
-            (build / "previous-legacy-dropin").write_text(
-                "ExecStart=/old\n", encoding="utf-8"
             )
 
             command = f"""
 set -euo pipefail
 export CDSP_AUTOMATION_LIBRESPOT_TARGET={target!s}
-export CDSP_AUTOMATION_LEGACY_LIBRESPOT_TARGET={legacy_target!s}
 export CDSP_AUTOMATION_RASPOTIFY_DROPIN_DIR={dropin_dir!s}
 source {BUILDER!s}
 systemctl() {{ printf 'systemctl %s\\n' "$*" >> {log!s}; }}
@@ -291,15 +279,10 @@ sudo() {{
 BUILD_DIR={build!s}
 had_target=false
 had_dropin=false
-had_legacy_dropin=true
 rollback
 """
             subprocess.run(["bash", "-c", command], check=True, env=os.environ.copy())
 
-            self.assertEqual(
-                legacy_dropin.read_text(encoding="utf-8"), "ExecStart=/old\n"
-            )
-            self.assertTrue(legacy_target.is_file())
             self.assertFalse(target.exists())
             self.assertFalse((dropin_dir / "cdsp-volume-sync.conf").exists())
             self.assertTrue(unrelated.is_file())
@@ -348,25 +331,16 @@ if marker_matches "different"; then echo "any-digest-accepted" >> {log!s}; else 
                     marker.read_text(encoding="utf-8").startswith("cdsp-volume-sync/2 ")
             )
 
-    def test_uninstall_removes_both_receiver_generations(self) -> None:
+    def test_uninstall_removes_the_receiver(self) -> None:
         builder = BUILDER.read_text(encoding="utf-8")
         uninstall = builder.split("uninstall() {", 1)[1].split("\n}", 1)[0]
         self.assertIn('sudo rm -f "$DROPIN" "$TARGET" "$MARKER"', uninstall)
-        self.assertIn('sudo rm -f "$LEGACY_DROPIN" "$LEGACY_TARGET"', uninstall)
 
-    def test_superseded_artifacts_are_removed_only_after_both_services_pass(
-        self,
-    ) -> None:
-        """Ordering is the whole safety property of the migration."""
+    def test_deployment_completes_only_after_both_services_pass(self) -> None:
         builder = BUILDER.read_text(encoding="utf-8")
-        remove_legacy_dropin = builder.index('sudo rm -f "$LEGACY_DROPIN"')
-        reload_units = builder.index("sudo systemctl daemon-reload\n  sudo systemctl restart airplay-volume-bridge.service")
         health_check = builder.index("Patched librespot did not become healthy.")
         complete = builder.index("deployment_complete=true")
-        remove_legacy_target = builder.index('sudo rm -f "$LEGACY_TARGET"')
-        self.assertLess(remove_legacy_dropin, reload_units)
         self.assertLess(health_check, complete)
-        self.assertLess(complete, remove_legacy_target)
         self.assertIn(
             "systemctl is-active --quiet airplay-volume-bridge.service", builder
         )

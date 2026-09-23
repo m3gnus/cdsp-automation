@@ -837,19 +837,12 @@ def test_site_name_is_published_escaped_and_defaults_to_a_neutral_value() -> Non
     assert escaped.stdout.strip() == "False"
 
 
-def test_receiver_status_recognizes_both_marker_generations(tmp_path: Path) -> None:
-    """The UI must not report "not configured" between update and reconfigure."""
-    legacy_tag = "ug" "lan"
+def test_receiver_status_recognizes_the_configured_receivers(tmp_path: Path) -> None:
     dropin = tmp_path / "volume-sync.conf"
     shairport = tmp_path / "shairport-sync.conf"
 
     for marker, receiver, socket_env in (
         ("CDSP", "librespot-cdsp", "CDSP_SPOTIFY_VOLUME_SOCKET"),
-        (
-            legacy_tag.upper(),
-            f"librespot-{legacy_tag}",
-            f"{legacy_tag.upper()}_SPOTIFY_VOLUME_SOCKET",
-        ),
     ):
         shairport.write_text(
             f"// {marker}-AIRPLAY-BEGIN\n"
@@ -887,10 +880,8 @@ def test_receiver_status_recognizes_both_marker_generations(tmp_path: Path) -> N
         assert payload["volume_bridge"]["spotify_configured"] is True, receiver
 
 
-def test_backup_directory_default_left_the_retired_state_tree() -> None:
+def test_backup_directory_default_is_under_the_state_tree() -> None:
     assert str(web_ui.AUDIO_EQ_BACKUP_DIR) == "/var/lib/cdsp-automation/audio-eq-backups"
-    source = (REPOSITORY / "scripts" / "web_ui.py").read_text(encoding="utf-8")
-    assert "/var/lib/installation" not in source
 
 
 def _apply_web_volume(status_path: Path, payload: dict) -> tuple[list[float], float]:

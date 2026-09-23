@@ -16,12 +16,6 @@ import speaker_profiles
 REPOSITORY = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPOSITORY / "scripts"
 
-# The names this tool wrote before it was made site-neutral.  Assembled from
-# fragments so the literal never appears in this repository.
-LEGACY_TAG = "ug" "lan"
-LEGACY_UI_PREFIX = f"{LEGACY_TAG}_ui_eq_"
-LEGACY_STEREO_PREFIX = f"{LEGACY_TAG}_stereo_eq_"
-
 # Opens an existing lock the way every daemon does — O_RDWR, no O_CREAT — so a
 # lock left unopenable by its creator fails here instead of hanging.
 LOCK_PROBE = """
@@ -283,22 +277,17 @@ def test_iso226_patch_is_pinned_tested_and_fader_linked() -> None:
     )
 
 
-def test_legacy_reference_phon_above_the_iso_limit_is_clamped_not_rejected() -> None:
-    """An install saved before the 90 phon limit must keep loading its whole state."""
+def test_reference_phon_is_limited_to_the_iso_range() -> None:
     state = audio_eq.default_audio_state()
-    state["loudness"]["reference_phon"] = 95
-    normalized = audio_eq.normalize_audio_state(state)
-    assert normalized["loudness"]["reference_phon"] == audio_eq.ISO226_MAX_PHON
-    # Values inside the range are untouched, and nonsense is still rejected.
     state["loudness"]["reference_phon"] = 75
     assert audio_eq.normalize_audio_state(state)["loudness"]["reference_phon"] == 75
-    state["loudness"]["reference_phon"] = 120
+    state["loudness"]["reference_phon"] = audio_eq.ISO226_MAX_PHON + 1
     try:
         audio_eq.normalize_audio_state(state)
     except ValueError as exc:
         assert "reference phon" in str(exc)
     else:
-        raise AssertionError("reference phon above the legacy range must be rejected")
+        raise AssertionError("reference phon above the ISO range must be rejected")
 
 
 def test_expanded_eq_types_are_validated_and_gainless_filters_omit_gain() -> None:
@@ -418,112 +407,6 @@ def test_audio_state_strict_booleans_versions_and_headroom_range() -> None:
     }
     normalized = audio_eq.normalize_audio_state(legacy)
     assert "stereo" not in normalized
-
-    # Config-side counterpart: overlay composition must also strip the filters
-    # and pipeline step that the retired program left in generated configs.
-    retired = LEGACY_STEREO_PREFIX + "01_low"
-    stale = {
-        "devices": {"capture": {"channels": 2}},
-        "filters": {
-            retired: {"type": "Biquad", "parameters": {}},
-            "keep_me": {"type": "Gain", "parameters": {"gain": -3}},
-        },
-        "pipeline": [
-            {
-                "type": "Filter",
-                "channels": [0, 1],
-                "names": [retired],
-                "description": (
-                    f"{LEGACY_TAG.upper()} stereo system EQ (owned by source switcher)"
-                ),
-            },
-            {"type": "Filter", "channels": [0, 1], "names": ["keep_me"]},
-        ],
-    }
-    cleaned, _preamp = audio_eq.apply_audio_overlay(
-        stale, audio_eq.default_audio_state()
-    )
-    assert retired not in cleaned["filters"]
-    assert "keep_me" in cleaned["filters"]
-    assert not [
-        step
-        for step in cleaned["pipeline"]
-        if "stereo system EQ" in str(step.get("description", ""))
-        or any(
-            str(name).startswith(LEGACY_STEREO_PREFIX)
-            for name in step.get("names", [])
-        )
-    ]
-
-
-def test_overlay_migrates_the_previous_owned_prefix_and_spares_lookalikes() -> None:
-    """A live config written by an earlier release converges on one apply.
-
-    The switcher recomposes the overlay whenever a config becomes active, so
-    the prefix rename needs no installer step reaching into CamillaDSP.  Filters
-    that merely resemble the owned naming must survive: matching is by exact
-    prefix, never by shape.
-    """
-    legacy_band = LEGACY_UI_PREFIX + "01_low"
-    legacy_preamp = LEGACY_UI_PREFIX + "preamp"
-    config = {
-        "devices": {"capture": {"channels": 2}},
-        "filters": {
-            legacy_band: {"type": "Biquad", "parameters": {}},
-            legacy_preamp: {"type": "Gain", "parameters": {"gain": -4}},
-            "room_ui_eq_01_low": {"type": "Biquad", "parameters": {}},
-            "house_curve": {"type": "Conv", "parameters": {}},
-        },
-        "pipeline": [
-            {
-                "type": "Filter",
-                "channels": [0, 1],
-                "names": [legacy_band, legacy_preamp],
-                "description": (
-                    f"{LEGACY_TAG.upper()} user EQ (owned by source switcher)"
-                ),
-            },
-            {
-                "type": "Filter",
-                "channels": [0, 1],
-                "names": ["room_ui_eq_01_low", "house_curve"],
-            },
-        ],
-    }
-    updated, _preamp = audio_eq.apply_audio_overlay(
-        config, audio_eq.default_audio_state()
-    )
-
-    assert not [
-        name for name in updated["filters"] if name.startswith(LEGACY_UI_PREFIX)
-    ]
-    assert updated["filters"]["room_ui_eq_01_low"] == {
-        "type": "Biquad",
-        "parameters": {},
-    }
-    assert "house_curve" in updated["filters"]
-    owned = [
-        step
-        for step in updated["pipeline"]
-        if step.get("description") == audio_eq.PIPELINE_DESCRIPTION
-    ]
-    assert len(owned) == 1
-    assert all(name.startswith(audio_eq.FILTER_PREFIX) for name in owned[0]["names"])
-    unrelated = next(
-        step for step in updated["pipeline"] if "house_curve" in step.get("names", [])
-    )
-    assert unrelated["names"] == ["room_ui_eq_01_low", "house_curve"]
-
-    # And what the switcher then asserts about CamillaDSP's read-back: the
-    # recomposed config is accepted, the pre-migration one is not.
-    if "camilladsp" not in sys.modules:
-        stub = types.ModuleType("camilladsp")
-        stub.CamillaClient = object
-        sys.modules["camilladsp"] = stub
-    from scripts import source_switcher
-
-    assert source_switcher._audio_overlay_matches(updated, updated)
-    assert not source_switcher._audio_overlay_matches(config, updated)
 
 
 def test_audio_state_reports_the_installed_unity_linear_airplay_path() -> None:

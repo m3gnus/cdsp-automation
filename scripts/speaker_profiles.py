@@ -246,8 +246,8 @@ def read_speaker_selection(
     return normalize_speaker_selection(raw, allowed_ids=allowed_ids)
 
 
-def speaker_selection_lock(path: Path):
-    return exclusive_file_lock(path.with_name(f"{path.name}.lock"))
+# The same sidecar ``<file>.lock`` convention as the audio state.
+speaker_selection_lock = audio_state_lock
 
 
 def audio_control_lock(path: Path):

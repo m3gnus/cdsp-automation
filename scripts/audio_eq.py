@@ -17,25 +17,6 @@ from typing import Any
 STATE_VERSION = 3
 FILTER_PREFIX = "cdsp_ui_eq_"
 PIPELINE_DESCRIPTION = "CDSP user EQ (owned by source switcher)"
-# Names this tool wrote before it was made site-neutral, plus the retired
-# secondary "stereo" program (Bird speakers on capture 2-3).  The site name is
-# assembled from fragments so the literal never appears in this repository.
-# Matching is by exact prefix, so a config's own filters are never claimed;
-# these entries exist only so overlay composition can clean out what earlier
-# releases left behind, which is what migrates a live config.
-_LEGACY_TAG = "ug" "lan"
-_LEGACY_FILTER_PREFIXES = (f"{_LEGACY_TAG}_ui_eq_", f"{_LEGACY_TAG}_stereo_eq_")
-_LEGACY_DESCRIPTIONS = (
-    f"{_LEGACY_TAG.upper()} user EQ (owned by source switcher)",
-    f"{_LEGACY_TAG.upper()} stereo system EQ (owned by source switcher)",
-)
-OWNED_FILTER_PREFIXES = (FILTER_PREFIX,) + _LEGACY_FILTER_PREFIXES
-OWNED_DESCRIPTIONS = (PIPELINE_DESCRIPTION,) + _LEGACY_DESCRIPTIONS
-
-
-def is_owned_filter_name(name: object) -> bool:
-    """True for a filter this tool owns, under its current or earlier names."""
-    return str(name).startswith(OWNED_FILTER_PREFIXES)
 GAIN_FILTER_TYPES = {"Peaking", "Lowshelf", "Highshelf"}
 ALLOWED_TYPES = GAIN_FILTER_TYPES | {"Lowpass", "Highpass", "Bandpass", "Notch"}
 MAX_BANDS = 16
@@ -255,13 +236,10 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
             "enabled": _boolean(
                 loudness_in.get("enabled", False), "loudness enabled"
             ),
-            # State written before the engine adopted the ISO validity limit may
-            # carry up to 100. Clamp rather than reject, so an existing install
-            # keeps loading its EQ instead of failing the whole state read.
-            "reference_phon": min(
-                _number(
-                    loudness_in.get("reference_phon", 80), "reference phon", 40, 100
-                ),
+            "reference_phon": _number(
+                loudness_in.get("reference_phon", 80),
+                "reference phon",
+                40,
                 ISO226_MAX_PHON,
             ),
             "reference_volume_db": _number(
@@ -415,6 +393,11 @@ def effective_preamp_db(state: dict[str, Any]) -> float:
     return round(min(manual, -positive), 4)
 
 
+def is_owned_filter_name(name: object) -> bool:
+    """True for a filter this tool owns."""
+    return str(name).startswith(FILTER_PREFIX)
+
+
 def _strip_overlay(config: dict[str, Any]) -> dict[str, Any]:
     updated = copy.deepcopy(config)
     filters = updated.setdefault("filters", {})
@@ -439,7 +422,7 @@ def _strip_overlay(config: dict[str, Any]) -> dict[str, Any]:
     pipeline: list[dict[str, Any]] = []
     for original in updated.get("pipeline", []):
         step = copy.deepcopy(original)
-        if step.get("description") in OWNED_DESCRIPTIONS:
+        if step.get("description") == PIPELINE_DESCRIPTION:
             continue
         names = step.get("names")
         if isinstance(names, list):

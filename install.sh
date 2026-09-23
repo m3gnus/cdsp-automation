@@ -32,7 +32,6 @@ if [[ ! "$INSTALL_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then
   exit 1
 fi
 SYSTEMD_UNIT_DIR="${CDSP_AUTOMATION_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
-LEGACY_UNIT_DIR="${CDSP_AUTOMATION_LEGACY_UNIT_DIR:-/lib/systemd/system}"
 SUDOERS_DIR="${CDSP_AUTOMATION_SUDOERS_DIR:-/etc/sudoers.d}"
 SYSTEMCTL_BIN="${CDSP_AUTOMATION_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 VISUDO_BIN="${CDSP_AUTOMATION_VISUDO_BIN:-/usr/sbin/visudo}"
@@ -52,14 +51,6 @@ SPOTIFY_DROPIN_PATH="$RASPOTIFY_DROPIN_DIR/cdsp-volume-sync.conf"
 SPOTIFY_COMMAND_SOCKET_DEFAULT="/run/raspotify/cdsp-volume.sock"
 AUDIO_EQ_BACKUP_DEFAULT="/var/lib/cdsp-automation/audio-eq-backups"
 ISO226_CAPABILITY_DEFAULT="/var/lib/cdsp-automation/iso226-engine.json"
-# Paths an earlier release compiled a single site's name into, and the retired
-# state tree it used.  The name is assembled from fragments so the literal never
-# appears in this repository; every comparison against it is exact, so files
-# this installer did not create are never rewritten or removed.
-LEGACY_TAG="ug""lan"
-LEGACY_SPOTIFY_DROPIN="$RASPOTIFY_DROPIN_DIR/$LEGACY_TAG-volume-sync.conf"
-LEGACY_SPOTIFY_SOCKET="/run/raspotify/$LEGACY_TAG-volume.sock"
-LEGACY_AUDIO_EQ_BACKUP_DIR="/var/lib/installation/audio-eq-backups"
 
 CDSP_SERVICES=(
   cdsp-trigger
@@ -301,34 +292,6 @@ ensure_source_switcher() {
   note_dependency "Source Switcher: installed because $component requires it (give it its source configs in $CONFIGS_DIR, or it will not run)"
 }
 
-# Move settings this installer used to hard-code onto their neutral names.
-# Only the exact historical defaults are rewritten, so a value the operator
-# chose is always preserved.
-migrate_env_defaults() {
-  local socket dropin device
-  ensure_env_file
-  socket="$(get_env_value SPOTIFY_VOLUME_COMMAND_SOCKET_PATH)"
-  if [[ "$socket" == "$LEGACY_SPOTIFY_SOCKET" ]]; then
-    set_env_value SPOTIFY_VOLUME_COMMAND_SOCKET_PATH "$SPOTIFY_COMMAND_SOCKET_DEFAULT"
-  fi
-  dropin="$(get_env_value SPOTIFY_VOLUME_DROPIN_PATH)"
-  if [[ "$dropin" == "$LEGACY_SPOTIFY_DROPIN" ]]; then
-    set_env_value SPOTIFY_VOLUME_DROPIN_PATH "$SPOTIFY_DROPIN_PATH"
-  fi
-  # Lift the output device out of the drop-in this installer generated, so the
-  # site's PCM name survives in the env file while the repository stops naming
-  # it.  Only that one file is read; an unrelated drop-in is never consulted.
-  if [[ -z "$(get_env_value SPOTIFY_ALSA_DEVICE)" && -f "$LEGACY_SPOTIFY_DROPIN" ]]; then
-    device="$(grep -oE -- '--device[= ][^ ]+' "$LEGACY_SPOTIFY_DROPIN" | head -n 1 || true)"
-    device="${device#--device}"
-    device="${device#[= ]}"
-    if [[ -n "$device" ]]; then
-      set_env_value SPOTIFY_ALSA_DEVICE "$device"
-      echo "Kept the existing Spotify output device as SPOTIFY_ALSA_DEVICE=$device"
-    fi
-  fi
-}
-
 ensure_venv() {
   if [[ ! -d "$VENV_DIR" ]]; then
     echo "Creating virtualenv at $VENV_DIR"
@@ -406,7 +369,6 @@ download_scripts() {
 prepare_install() {
   install_dependencies
   download_scripts
-  migrate_env_defaults
   ensure_audio_state_storage
 }
 
@@ -479,32 +441,6 @@ ensure_audio_state_storage() {
   done
 }
 
-# The EQ snapshots are the UI's only undo for persisted audio state, and
-# retention is per selected speaker, so a multi-profile deployment can hold well
-# over the per-prefix limit.  Copy them forward, never move: the source stays
-# untouched, and an existing destination file is always preferred.
-migrate_audio_eq_backups() {
-  local destination file name copied=0
-  destination="$(get_env_value AUDIO_EQ_BACKUP_DIR)"
-  : "${destination:=$AUDIO_EQ_BACKUP_DEFAULT}"
-  # Only the move this installer performs is migrated; a custom location is a
-  # deliberate choice and is left alone.
-  [[ "$destination" == "$AUDIO_EQ_BACKUP_DEFAULT" ]] || return 0
-  [[ -d "$LEGACY_AUDIO_EQ_BACKUP_DIR" && -d "$destination" ]] || return 0
-  for file in "$LEGACY_AUDIO_EQ_BACKUP_DIR"/*.json; do
-    [[ -f "$file" ]] || continue
-    name="$(basename "$file")"
-    if [[ ! -e "$destination/$name" ]]; then
-      sudo install -m 0640 -o "$INSTALL_USER" -g "$INSTALL_GROUP" "$file" "$destination/$name"
-      copied=$((copied + 1))
-    fi
-  done
-  if [[ "$copied" -gt 0 ]]; then
-    echo "Copied $copied EQ backup snapshot(s) into $destination." >&2
-  fi
-  echo "Note: EQ backups now live in $destination; $LEGACY_AUDIO_EQ_BACKUP_DIR was left untouched." >&2
-}
-
 create_unit() {
   local name="$1"
   local script="$2"
@@ -574,7 +510,6 @@ WantedBy=multi-user.target
 EOL
   sudo install -m 0644 "$unit_file" "${SYSTEMD_UNIT_DIR}/${sysname}.service"
   rm -f "$unit_file"
-  sudo rm -f "${LEGACY_UNIT_DIR}/${sysname}.service"
   sudo systemctl daemon-reload
   sudo systemctl reenable "${sysname}.service"
   sudo systemctl restart "${sysname}.service"
@@ -881,14 +816,11 @@ refresh_installed_units() {
     install_remote_sudoers
     create_unit "Remote Control" cdsp_remote.py cdsp-remote
   fi
-  if [[ -f "$SPOTIFY_DROPIN_PATH" || -f "$LEGACY_SPOTIFY_DROPIN" ]]; then
+  if [[ -f "$SPOTIFY_DROPIN_PATH" ]]; then
     install_spotify_volume_sync || note_skip "Spotify volume sync: FAILED (see the build output above)"
   fi
   if systemctl list-unit-files --no-legend cdsp-control-ui.service 2>/dev/null | grep -q '^cdsp-control-ui.service'; then
     install_control_ui
-    # After the UI restarted on the new environment, so the process that owns
-    # the old directory can no longer write to it.
-    migrate_audio_eq_backups
   fi
 }
 
@@ -903,33 +835,11 @@ show_status() {
   done
 }
 
-# Both the configured directories and the historical defaults, deduplicated: an
-# operator may well have installed under one and be uninstalling under another,
-# and rm -f on a path that holds no unit costs nothing.
-unit_search_dirs() {
-  local dir existing known
-  local seen=()
-  for dir in "$SYSTEMD_UNIT_DIR" "$LEGACY_UNIT_DIR" /etc/systemd/system /lib/systemd/system; do
-    [[ -n "$dir" ]] || continue
-    known=false
-    for existing in ${seen[@]+"${seen[@]}"}; do
-      if [[ "$existing" == "$dir" ]]; then
-        known=true
-      fi
-    done
-    if [[ "$known" == false ]]; then
-      seen+=("$dir")
-    fi
-  done
-  printf '%s\n' ${seen[@]+"${seen[@]}"}
-}
-
+# Both the configured directory and the default one: an operator may have
+# installed under one and be uninstalling under another, and rm -f on a path
+# that holds no unit costs nothing.
 remove_unit_file() {
-  local name="$1" dir
-  while IFS= read -r dir; do
-    [[ -n "$dir" ]] || continue
-    sudo rm -f "$dir/$name"
-  done < <(unit_search_dirs)
+  sudo rm -f "$SYSTEMD_UNIT_DIR/$1" "/etc/systemd/system/$1"
 }
 
 uninstall_all() {
@@ -994,7 +904,6 @@ update_utilities() {
   reset_install_notes
   echo "Updating utilities (scripts + pycamilladsp)..."
   download_scripts
-  migrate_env_defaults
   ensure_audio_state_storage
   ensure_venv
   source "$VENV_DIR/bin/activate"

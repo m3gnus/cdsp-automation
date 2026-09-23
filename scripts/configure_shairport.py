@@ -13,30 +13,14 @@ from pathlib import Path
 
 
 MARKER_PREFIX = "CDSP"
-# Releases before the installer was made site-neutral prefixed these markers
-# with one deployment's name.  It is assembled from fragments so the literal
-# never appears in this repository.  Recognition stays exact: a marker block
-# this tool did not write is never claimed, and every write uses MARKER_PREFIX,
-# so an existing config migrates the first time it is configured.
-_LEGACY_MARKER_PREFIX = "UG" "LAN"
 
 
 def _marker(tag: str) -> str:
     return f"// {MARKER_PREFIX}-{tag}"
 
 
-def _legacy_form(marker: str) -> str:
-    return marker.replace(f"// {MARKER_PREFIX}-", f"// {_LEGACY_MARKER_PREFIX}-", 1)
-
-
-def _marker_forms(marker: str) -> tuple[str, str]:
-    return marker, _legacy_form(marker)
-
-
 def _block_pattern(begin: str, end: str) -> re.Pattern[str]:
-    begins = "|".join(re.escape(form) for form in _marker_forms(begin))
-    ends = "|".join(re.escape(form) for form in _marker_forms(end))
-    return re.compile(rf"\n?(?:{begins})\n.*?(?:{ends})\n?", re.DOTALL)
+    return re.compile(rf"\n?{re.escape(begin)}\n.*?{re.escape(end)}\n?", re.DOTALL)
 
 
 GENERAL_KEYS = ("ignore_volume_control", "run_this_when_volume_is_set")
@@ -100,18 +84,16 @@ def _update_block(
         raise ValueError(f"{block} block is not balanced")
 
     key_pattern = re.compile(r"^\s*(" + "|".join(keys) + r")\s*=")
-    begin_forms = _marker_forms(begin)
-    end_forms = _marker_forms(end_marker)
     original_values: list[str] = []
     body: list[str] = []
     in_managed = False
     encoded_original = None
     for line in lines[start + 1 : end]:
         stripped = line.strip()
-        if stripped in begin_forms:
+        if stripped == begin:
             in_managed = True
             continue
-        if stripped in end_forms:
+        if stripped == end_marker:
             in_managed = False
             continue
         if in_managed:

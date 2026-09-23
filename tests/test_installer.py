@@ -10,9 +10,6 @@ from pathlib import Path
 
 REPOSITORY = Path(__file__).resolve().parents[1]
 INSTALLER = REPOSITORY / "install.sh"
-# The name earlier releases compiled into generated artifacts, assembled from
-# fragments so the literal never appears in this repository.
-LEGACY_TAG = "ug" "lan"
 
 
 class InstallerUnitTests(unittest.TestCase):
@@ -35,16 +32,13 @@ class InstallerUnitTests(unittest.TestCase):
         self.assertIn("deployment_complete=true", builder)
         self.assertIn("CDSP_SPOTIFY_VOLUME_ACK_SOCKET", builder)
 
-    def test_create_unit_migrates_legacy_enablement_and_creates_runtime_dir(self) -> None:
+    def test_create_unit_enables_the_unit_and_creates_runtime_dir(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             home = root / "home"
             unit_dir = root / "etc-systemd"
-            legacy_dir = root / "lib-systemd"
             home.mkdir()
             unit_dir.mkdir()
-            legacy_dir.mkdir()
-            (legacy_dir / "cdsp-source-switcher.service").touch()
             log_path = root / "systemctl.log"
 
             command = f"""
@@ -52,7 +46,6 @@ set -euo pipefail
 export HOME={home!s}
 export USER=tester
 export CDSP_AUTOMATION_SYSTEMD_UNIT_DIR={unit_dir!s}
-export CDSP_AUTOMATION_LEGACY_UNIT_DIR={legacy_dir!s}
 source {INSTALLER!s}
 systemctl() {{ printf '%s\\n' "$*" >> {log_path!s}; }}
 sudo() {{
@@ -76,7 +69,6 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             # the switcher stopped whenever the engine fails.
             self.assertIn("PartOf=camilladsp.service", unit)
             self.assertNotIn("BindsTo=", unit)
-            self.assertFalse((legacy_dir / "cdsp-source-switcher.service").exists())
 
             calls = log_path.read_text(encoding="utf-8").splitlines()
             self.assertIn("daemon-reload", calls)
@@ -726,7 +718,6 @@ ensure_audio_state_storage
                         f'systemctl() {{ printf "systemctl %s\\n" "$*" >> {log!s}; }}',
                         'sudo() { if [[ "$1" == systemctl ]]; then shift; systemctl "$@"; fi; }',
                         "download_scripts() { :; }",
-                        "migrate_env_defaults() { :; }",
                         "ensure_audio_state_storage() { :; }",
                         "ensure_venv() { :; }",
                         f'install_iso226_engine() {{ printf "ENGINE-REBUILT\\n" >> {log!s}; }}',
@@ -770,24 +761,15 @@ ensure_audio_state_storage
             self.assertIn("status=0", output)
             self.assertFalse(sentinel.exists())
 
-    def test_update_path_migrates_env_receivers_and_backups_in_order(self) -> None:
-        """The whole deployed-Pi migration, in the order it actually happens."""
+    def test_update_path_refreshes_installed_units_in_order(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             base = root / "site"
             base.mkdir()
             dropin_dir = root / "raspotify.service.d"
             dropin_dir.mkdir()
-            legacy_dropin = dropin_dir / f"{LEGACY_TAG}-volume-sync.conf"
-            legacy_dropin.write_text(
-                f"ExecStart=/usr/local/bin/librespot-{LEGACY_TAG} --device site_main\n",
-                encoding="utf-8",
-            )
-            env_file = base / "cdsp-automation.env"
-            env_file.write_text(
-                f"SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/{LEGACY_TAG}-volume.sock\n"
-                "SPOTIFY_ALSA_DEVICE=\n",
-                encoding="utf-8",
+            (dropin_dir / "cdsp-volume-sync.conf").write_text(
+                "ExecStart=/usr/local/bin/librespot-cdsp\n", encoding="utf-8"
             )
             log = root / "order.log"
 
@@ -804,8 +786,6 @@ ensure_audio_state_storage
                         "configure_shairport_bridge() { record shairport; }",
                         "install_spotify_volume_sync() { record spotify; }",
                         "install_control_ui() { record ui; }",
-                        "migrate_audio_eq_backups() { record backups; }",
-                        "migrate_env_defaults",
                         "refresh_installed_units",
                     ]
                 ),
@@ -815,12 +795,6 @@ ensure_audio_state_storage
                     "CDSP_AUTOMATION_RASPOTIFY_DROPIN_DIR": str(dropin_dir),
                 },
             )
-            values = env_file.read_text(encoding="utf-8")
-            self.assertIn(
-                "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/cdsp-volume.sock",
-                values,
-            )
-            self.assertIn("SPOTIFY_ALSA_DEVICE=site_main", values)
             steps = log.read_text(encoding="utf-8").split()
             self.assertEqual(
                 steps,
@@ -835,86 +809,16 @@ ensure_audio_state_storage
                     "unit:cdsp-remote",
                     "spotify",
                     "ui",
-                    "backups",
                 ],
             )
 
-    def test_env_migration_moves_only_the_exact_historical_defaults(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            base = root / "site"
-            dropin_dir = root / "raspotify.service.d"
-            dropin_dir.mkdir(parents=True)
-            base.mkdir()
-            legacy_dropin = dropin_dir / f"{LEGACY_TAG}-volume-sync.conf"
-            legacy_dropin.write_text(
-                f"[Service]\nExecStart=\n"
-                f"ExecStart=/usr/local/bin/librespot-{LEGACY_TAG} --device site_main\n",
-                encoding="utf-8",
-            )
-            (dropin_dir / "10-operator.conf").write_text(
-                "[Service]\nExecStart=/opt/other --device operator_pcm\n",
-                encoding="utf-8",
-            )
-            env_file = base / "cdsp-automation.env"
-            env_file.write_text(
-                f"SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/{LEGACY_TAG}-volume.sock\n"
-                f"SPOTIFY_VOLUME_DROPIN_PATH={legacy_dropin}\n"
-                "SPOTIFY_ALSA_DEVICE=\n",
-                encoding="utf-8",
-            )
-
-            self._run(
-                "migrate_env_defaults\nmigrate_env_defaults",
-                env={
-                    "HOME": str(root),
-                    "CDSP_AUTOMATION_BASE_DIR": str(base),
-                    "CDSP_AUTOMATION_RASPOTIFY_DROPIN_DIR": str(dropin_dir),
-                },
-            )
-            values = env_file.read_text(encoding="utf-8")
-            self.assertIn(
-                "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/cdsp-volume.sock",
-                values,
-            )
-            self.assertIn(
-                f"SPOTIFY_VOLUME_DROPIN_PATH={dropin_dir}/cdsp-volume-sync.conf", values
-            )
-            # Lifted out of this installer's own drop-in, never the operator's.
-            self.assertIn("SPOTIFY_ALSA_DEVICE=site_main", values)
-            self.assertNotIn("operator_pcm", values)
-            self.assertEqual(values.count("SPOTIFY_ALSA_DEVICE="), 1)
-
-    def test_env_migration_preserves_operator_chosen_values(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            base = root / "site"
-            base.mkdir()
-            env_file = base / "cdsp-automation.env"
-            env_file.write_text(
-                "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/custom.sock\n"
-                "SPOTIFY_VOLUME_DROPIN_PATH=/etc/systemd/system/raspotify.service.d/99-mine.conf\n"
-                "SPOTIFY_ALSA_DEVICE=default\n",
-                encoding="utf-8",
-            )
-            self._run(
-                "migrate_env_defaults",
-                env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
-            )
-            values = env_file.read_text(encoding="utf-8")
-            self.assertIn(
-                "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/custom.sock", values
-            )
-            self.assertIn("99-mine.conf", values)
-            self.assertIn("SPOTIFY_ALSA_DEVICE=default", values)
-
-    def test_refresh_rebuilds_spotify_sync_from_either_dropin_generation(self) -> None:
+    def test_refresh_rebuilds_spotify_sync_from_the_installed_dropin(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         refresh = installer.split("refresh_installed_units()", 1)[1].split(
             "show_status()", 1
         )[0]
         self.assertIn(
-            '[[ -f "$SPOTIFY_DROPIN_PATH" || -f "$LEGACY_SPOTIFY_DROPIN" ]]', refresh
+            '[[ -f "$SPOTIFY_DROPIN_PATH" ]]', refresh
         )
         # Exact names only: no glob may claim an administrator's own drop-in.
         self.assertNotIn("*volume-sync.conf", installer)
@@ -1025,7 +929,6 @@ ensure_audio_state_storage
                 "HOME": str(root),
                 "CDSP_AUTOMATION_BASE_DIR": str(base),
                 "CDSP_AUTOMATION_SYSTEMD_UNIT_DIR": str(unit_dir),
-                "CDSP_AUTOMATION_LEGACY_UNIT_DIR": str(root / "legacy"),
             }
             self._run(body, env=environment)
             unit = (unit_dir / "airplay-volume-bridge.service").read_text(
@@ -1042,22 +945,20 @@ ensure_audio_state_storage
             self.assertNotIn("SupplementaryGroups", unit)
             self.assertIn("group 'studio' does not exist", missing)
 
-    def test_uninstall_removes_both_sudoers_files_and_sweeps_unit_directories(
+    def test_uninstall_removes_both_sudoers_files_and_the_unit_files(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             unit_dir = root / "units"
-            legacy_dir = root / "legacy-units"
             sudoers = root / "sudoers.d"
-            for path in (unit_dir, legacy_dir, sudoers):
+            for path in (unit_dir, sudoers):
                 path.mkdir()
             units = [f"{name}.service" for name in
                      ("cdsp-trigger", "cdsp-motu-sync", "cdsp-source-switcher",
                       "cdsp-remote", "airplay-volume-bridge", "cdsp-control-ui")]
             for name in units:
                 (unit_dir / name).write_text("[Unit]\n", encoding="utf-8")
-                (legacy_dir / name).write_text("[Unit]\n", encoding="utf-8")
             (sudoers / "cdsp-automation").write_text("rule\n", encoding="utf-8")
             (sudoers / "cdsp-automation-receivers").write_text("rule\n", encoding="utf-8")
             (unit_dir / "unrelated.service").write_text("[Unit]\n", encoding="utf-8")
@@ -1075,28 +976,14 @@ ensure_audio_state_storage
                     "HOME": str(root),
                     "CDSP_AUTOMATION_BASE_DIR": str(root / "site"),
                     "CDSP_AUTOMATION_SYSTEMD_UNIT_DIR": str(unit_dir),
-                    "CDSP_AUTOMATION_LEGACY_UNIT_DIR": str(legacy_dir),
                     "CDSP_AUTOMATION_SUDOERS_DIR": str(sudoers),
                 },
             )
             for name in units:
                 self.assertFalse((unit_dir / name).exists(), name)
-                self.assertFalse((legacy_dir / name).exists(), name)
             self.assertTrue((unit_dir / "unrelated.service").exists())
             self.assertFalse((sudoers / "cdsp-automation").exists())
             self.assertFalse((sudoers / "cdsp-automation-receivers").exists())
-
-    def test_unit_search_dirs_deduplicates_configured_and_default_paths(self) -> None:
-        output = self._run(
-            "unit_search_dirs",
-            env={
-                "CDSP_AUTOMATION_SYSTEMD_UNIT_DIR": "/etc/systemd/system",
-                "CDSP_AUTOMATION_LEGACY_UNIT_DIR": "/lib/systemd/system",
-            },
-        )
-        self.assertEqual(
-            output.split(), ["/etc/systemd/system", "/lib/systemd/system"]
-        )
 
     def test_default_env_publishes_the_backup_directory_and_site_name(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1115,87 +1002,6 @@ ensure_audio_state_storage
                 "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/cdsp-volume.sock",
                 rendered,
             )
-
-    def test_backup_migration_copies_without_clobbering_and_keeps_the_source(
-        self,
-    ) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            base = root / "site"
-            base.mkdir()
-            destination = root / "audio-eq-backups"
-            destination.mkdir()
-            source = root / "old-backups"
-            source.mkdir()
-            for name, payload in (
-                ("audio-eq-kantarellen-1.json", "one"),
-                ("audio-eq-partymeh-2.json", "two"),
-                ("audio-eq-kantarellen-3.json", "stale"),
-            ):
-                (source / name).write_text(payload, encoding="utf-8")
-            (destination / "audio-eq-kantarellen-3.json").write_text(
-                "newer", encoding="utf-8"
-            )
-            (base / "cdsp-automation.env").write_text(
-                f"AUDIO_EQ_BACKUP_DIR={destination}\n", encoding="utf-8"
-            )
-
-            output = self._run(
-                "\n".join(
-                    [
-                        f'AUDIO_EQ_BACKUP_DEFAULT={destination!s}',
-                        f'LEGACY_AUDIO_EQ_BACKUP_DIR={source!s}',
-                        'sudo() { local a=(); shift; while [[ $# -gt 0 ]]; do case "$1" in -o|-g) shift 2 ;; *) a+=("$1"); shift ;; esac; done; command install "${a[@]}"; }',
-                        "migrate_audio_eq_backups",
-                    ]
-                ),
-                env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
-            )
-            self.assertEqual(
-                (destination / "audio-eq-kantarellen-1.json").read_text(
-                    encoding="utf-8"
-                ),
-                "one",
-            )
-            self.assertEqual(
-                (destination / "audio-eq-partymeh-2.json").read_text(encoding="utf-8"),
-                "two",
-            )
-            # An existing destination file always wins, and nothing is moved.
-            self.assertEqual(
-                (destination / "audio-eq-kantarellen-3.json").read_text(
-                    encoding="utf-8"
-                ),
-                "newer",
-            )
-            self.assertEqual(len(list(source.glob("*.json"))), 3)
-            self.assertIn("Copied 2 EQ backup snapshot(s)", output)
-            self.assertIn("left untouched", output)
-
-    def test_backup_migration_respects_a_custom_destination(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            base = root / "site"
-            base.mkdir()
-            destination = root / "elsewhere"
-            destination.mkdir()
-            source = root / "old-backups"
-            source.mkdir()
-            (source / "audio-eq-default-1.json").write_text("x", encoding="utf-8")
-            (base / "cdsp-automation.env").write_text(
-                f"AUDIO_EQ_BACKUP_DIR={destination}\n", encoding="utf-8"
-            )
-            self._run(
-                "\n".join(
-                    [
-                        f'LEGACY_AUDIO_EQ_BACKUP_DIR={source!s}',
-                        "sudo() { command \"$@\"; }",
-                        "migrate_audio_eq_backups",
-                    ]
-                ),
-                env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
-            )
-            self.assertEqual(list(destination.glob("*.json")), [])
 
     def test_docs_describe_the_control_ui_security_posture_the_code_has(self) -> None:
         """The documented posture drifting from the code is how an operator
@@ -1345,7 +1151,8 @@ ensure_audio_state_storage
         offenders = [
             name
             for name in tracked
-            if token
+            if (REPOSITORY / name).is_file()
+            and token
             in (REPOSITORY / name)
             .read_text(encoding="utf-8", errors="ignore")
             .lower()
@@ -1410,14 +1217,12 @@ ensure_audio_state_storage
                         f"else printf 'systemctl %s\\n' \"$*\" >> {log!s}; fi; }}",
                         'sudo() { if [[ "$1" == systemctl ]]; then shift; systemctl "$@"; fi; }',
                         "download_scripts() { :; }",
-                        "migrate_env_defaults() { :; }",
                         "ensure_audio_state_storage() { :; }",
                         "ensure_venv() { :; }",
                         "audit_operator_volume_limits() { :; }",
                         # faithful to create_unit / install_control_ui: one restart each
                         'create_unit() { systemctl restart "$3.service"; }',
                         "install_control_ui() { systemctl restart cdsp-control-ui.service; }",
-                        "migrate_audio_eq_backups() { :; }",
                         "install_receiver_sudoers() { :; }",
                         "install_remote_sudoers() { :; }",
                         "configure_shairport_bridge() { :; }",
