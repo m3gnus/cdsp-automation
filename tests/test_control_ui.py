@@ -1195,7 +1195,10 @@ def test_token_comparison_uses_a_constant_time_primitive() -> None:
 def test_state_change_from_a_foreign_origin_is_refused() -> None:
     """Origin is checked with or without a token: a LAN browser is otherwise a
     confused deputy for anyone who can serve it a page."""
-    with patch.dict(os.environ, _environment_without("INSTALLATION_UI_TOKEN"), clear=True):
+    with (
+        patch.dict(os.environ, _environment_without("INSTALLATION_UI_TOKEN"), clear=True),
+        patch.object(web_ui.socket, "gethostname", return_value="pi"),
+    ):
         foreign = _post(origin="http://attacker.example")
         with patch.object(web_ui, "turn_amps_off") as amps:
             foreign.do_POST()
@@ -1211,7 +1214,8 @@ def test_state_change_from_a_foreign_origin_is_refused() -> None:
         amps.assert_called_once()
 
 
-def test_origin_matching_handles_absent_null_and_default_ports() -> None:
+def test_origin_matching_handles_absent_null_and_default_ports(monkeypatch) -> None:
+    monkeypatch.setattr(web_ui.socket, "gethostname", lambda: "pi")
     same_site = web_ui.origin_is_same_site
     # No Origin at all is a non-browser client (curl, a shell script): allowed,
     # so scripted callers that worked before still work.
@@ -1226,6 +1230,13 @@ def test_origin_matching_handles_absent_null_and_default_ports() -> None:
     assert same_site("http://evil.example", "pi.local:8088") is False
     assert same_site("not-a-url", "pi.local:8088") is False
     assert same_site("http://pi.local:8088", "") is False
+    # DNS rebinding: a foreign name re-pointed at the Pi sends a matching
+    # Origin and Host, so the Host itself must name this machine.
+    assert same_site("http://attacker.example:8088", "attacker.example:8088") is False
+    assert same_site("http://192.168.1.94:8088", "192.168.1.94:8088") is True
+    assert same_site("http://[fe80::1]:8088", "[fe80::1]:8088") is True
+    assert same_site("http://localhost:8088", "localhost:8088") is True
+    assert same_site("http://pi:8088", "pi:8088") is True
 
 
 def test_oversized_body_is_refused_rather_than_buffered() -> None:

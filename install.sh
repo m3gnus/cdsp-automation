@@ -623,7 +623,9 @@ install_remote_sudoers() {
 # Allow the remote control service to perform only its documented actions.
 $INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
 EOF
-  sudo "$VISUDO_BIN" -cf "$tmp"
+  # Explicit checks: these helpers also run on the left of `||`, where set -e
+  # is off and a rejected file would otherwise still be installed.
+  sudo "$VISUDO_BIN" -cf "$tmp" || { rm -f "$tmp"; return 1; }
   sudo install -m 0440 "$tmp" "$SUDOERS_DIR/cdsp-automation"
   rm -f "$tmp"
 }
@@ -643,7 +645,9 @@ install_receiver_sudoers() {
 # Allow the AirPlay volume bridge to hand playback between the receivers.
 $INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN start shairport-sync.service, $SYSTEMCTL_BIN stop shairport-sync.service, $SYSTEMCTL_BIN start raspotify.service, $SYSTEMCTL_BIN stop raspotify.service
 EOF
-  sudo "$VISUDO_BIN" -cf "$tmp"
+  # Explicit checks: these helpers also run on the left of `||`, where set -e
+  # is off and a rejected file would otherwise still be installed.
+  sudo "$VISUDO_BIN" -cf "$tmp" || { rm -f "$tmp"; return 1; }
   sudo install -m 0440 "$tmp" "$SUDOERS_DIR/cdsp-automation-receivers"
   rm -f "$tmp"
 }
@@ -698,7 +702,7 @@ configure_shairport_bridge() {
     echo "Shairport Sync config not found at $shairport_config; script installed, config unchanged."
     return 0
   fi
-  sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" "$shairport_config" "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify"
+  sudo /usr/bin/python3 "$SCRIPTS_DIR/configure_shairport.py" "$shairport_config" "/usr/bin/python3 /usr/local/libexec/airplay_volume_bridge.py --notify" || return 1
   # The reason is printed first and unconditionally: under set -e a bare
   # --remove could otherwise take the installer down before it was ever said.
   if command -v shairport-sync >/dev/null && ! sudo timeout 10 shairport-sync --displayConfig >/dev/null; then
@@ -725,8 +729,8 @@ install_airplay_volume_bridge() {
   sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
   # Before create_unit, which starts the daemon: a bridge that comes up without
   # its receiver authorization cannot hand playback over.
-  install_receiver_sudoers
-  create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon
+  install_receiver_sudoers || return 1
+  create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon || return 1
   configure_shairport_bridge
 }
 

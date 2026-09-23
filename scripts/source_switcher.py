@@ -60,7 +60,7 @@ from speaker_profiles import (
     set_audio_inhibit,
     speaker_selection_lock,
     stamp_engine_generation,
-    take_mute_request,
+    mute_request_path,
     operator_config_for_source,
 )
 
@@ -408,8 +408,10 @@ class MotuMeterReader:
                 break
             except Exception as exc:
                 self.close()
-                self.log_error(f"MOTU meter read failed: {exc}")
-                self.forgive_coordinated_kick()
+                # A drop a recorded access explains is expected every clock
+                # read-back; only an unexplained one is worth an error line.
+                if not self.forgive_coordinated_kick():
+                    self.log_error(f"MOTU meter read failed: {exc}")
                 break
 
             # MOTU meter frames are binary. A text frame here is never a valid
@@ -433,7 +435,7 @@ class MotuMeterReader:
         return self.last_pairs
 
 
-    def forgive_coordinated_kick(self) -> None:
+    def forgive_coordinated_kick(self) -> bool:
         """Reconnect on the next pass when a recorded MOTU access explains
         the drop, instead of after the SOURCE_MOTU_CONNECT_RETRY_SECONDS
         backoff.
@@ -445,17 +447,18 @@ class MotuMeterReader:
         ~10 s by another (a UI volume change, then a clock write for a switch
         to TOSLINK) keeps the meters dark ~10 s and TOSLINK drops. Each
         recorded access forgives at most one drop, and an unexplained drop (or
-        an unreadable record) keeps the backoff.
+        an unreadable record) keeps the backoff. Returns whether it forgave.
         """
         try:
             at, kind = self.access.last_access()
         except AccessUnavailable:
-            return
+            return False
         if at is None or at < self.connected_at or at == self.forgiven_access:
-            return
+            return False
         self.forgiven_access = at
         self.next_connect_attempt = time.monotonic()
         print(f"MOTU meters displaced by a {kind} access; reconnecting", flush=True)
+        return True
 
 
 def meter_pairs_active(
@@ -694,11 +697,11 @@ def validate_config_file(path: Path) -> None:
 def capture_restore_mute(cdsp: CamillaClient) -> bool:
     """Read the listener's live mute state as the value a transition restores.
 
-    Caller holds the audio-control lock.  The live flag already includes any
-    earlier listener mute request, so a pending one is dropped here; only a
-    request made after this capture may override it at restore time.
+    Caller holds the audio-control lock.  A pending listener mute request is
+    left alone: this capture may yet be replaced by an older one (a speaker
+    change's transition file), and the request is consumed only once the
+    restore has actually been applied.
     """
-    discard_mute_request(AUDIO_READY_PATH)
     return bool(cdsp.volume.main_mute())
 
 
@@ -1685,9 +1688,12 @@ def apply_config(
         )
         # A listener who muted after previous_mute was captured -- between
         # recovery retries, say -- asked for silence more recently than it.
-        if take_mute_request(AUDIO_READY_PATH):
+        # Consumed only after the mute call succeeded, so a failed attempt
+        # cannot lose the request and let a retry unmute over it.
+        if mute_request_path(AUDIO_READY_PATH).exists():
             previous_mute = True
         cdsp.volume.set_main_mute(previous_mute)
+        discard_mute_request(AUDIO_READY_PATH)
         clear_pending_transition(target)
         clear_audio_inhibit(
             AUDIO_READY_PATH,

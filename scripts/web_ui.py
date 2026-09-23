@@ -6,9 +6,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import math
 import os
+import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -2041,7 +2044,12 @@ def _backup_file(
         backup_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         (backup_dir / f"{prefix}-{stamp}.json").write_bytes(path.read_bytes())
-        old = sorted(backup_dir.glob(f"{prefix}-*.json"))
+        # Filtered on the stamp's shape: a speaker id may itself contain
+        # "-", so "audio-eq-sub-*" would also match "audio-eq-sub-2-...".
+        stamped = re.compile(re.escape(prefix) + r"-\d{8}-\d{6}\.json")
+        old = sorted(
+            p for p in backup_dir.glob(f"{prefix}-*.json") if stamped.fullmatch(p.name)
+        )
         for extra in old[:-keep]:
             extra.unlink(missing_ok=True)
     except OSError:
@@ -2481,11 +2489,29 @@ def origin_is_same_site(origin: str, host_header: str) -> bool:
     parsed = urllib.parse.urlsplit(origin)
     if parsed.scheme.lower() not in DEFAULT_SCHEME_PORTS or not parsed.netloc:
         return False
-    if not (host_header or "").strip():
+    if not (host_header or "").strip() or not host_names_this_pi(host_header):
         return False
     return normalize_authority(parsed.netloc, parsed.scheme) == normalize_authority(
         host_header, "http"
     )
+
+
+def host_names_this_pi(host_header: str) -> bool:
+    """True for an IP literal, localhost, or this machine's own name.
+
+    Origin == Host alone is beaten by DNS rebinding: a page on a name the
+    attacker re-points at the Pi sends matching values for both.
+    """
+    host = normalize_authority(host_header, "http")
+    host = host.rsplit(":", 1)[0] if not host.endswith("]") else host
+    host = host.strip("[]")
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    own = socket.gethostname().lower()
+    return host in {"localhost", own, f"{own}.local"}
 
 
 def presented_token(headers: Any) -> str:
@@ -2598,13 +2624,23 @@ class Handler(BaseHTTPRequestHandler):
             camilla = camilla_status()
             if "error" not in camilla:
                 camilla["signal_db"] = camilla_levels().get("signal_db")
+            # An unreadable speaker selection must not blank the whole page:
+            # the services panel is how the operator recovers from it.
+            try:
+                source = source_status(camilla)
+            except Exception as exc:
+                source = {"error": str(exc)}
+            try:
+                speaker = speaker_payload()
+            except Exception as exc:
+                speaker = {"error": str(exc)}
             self.send_json(
                 {
                     "time": time.time(),
                     "services": services,
                     "camilla": camilla,
-                    "source": source_status(camilla),
-                    "speaker": speaker_payload(),
+                    "source": source,
+                    "speaker": speaker,
                     "remote": remote_status(services),
                 }
             )

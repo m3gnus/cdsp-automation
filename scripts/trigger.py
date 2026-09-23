@@ -51,22 +51,22 @@ async def relay_control(stop: asyncio.Event, manual_off: asyncio.Event) -> None:
 
     try:
         while not stop.is_set():
+            # Handled before touching CamillaDSP, so a manual off works even
+            # while it is unreachable. Audio still present must not undo it on
+            # the next poll; the first silent reading re-arms the trigger.
+            if manual_off.is_set():
+                manual_off.clear()
+                GPIO.output(POWER_GPIO, GPIO.LOW)
+                relay_on = False
+                silence_seconds = 0.0
+                suppress_current_audio = True
+                print("Manual request - relay OFF", flush=True)
             try:
                 if not cdsp.is_connected():
                     cdsp.connect()
                     print("Connected to CamillaDSP", flush=True)
 
                 playing = music_is_playing(cdsp.levels.capture_rms())
-
-                if manual_off.is_set():
-                    manual_off.clear()
-                    GPIO.output(POWER_GPIO, GPIO.LOW)
-                    relay_on = False
-                    silence_seconds = 0.0
-                    # If audio is still present, do not undo the manual command
-                    # on the next 200 ms poll. Silence re-arms normal triggering.
-                    suppress_current_audio = playing
-                    print("Manual request - relay OFF", flush=True)
 
                 if suppress_current_audio and not playing:
                     suppress_current_audio = False

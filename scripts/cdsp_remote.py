@@ -593,7 +593,6 @@ def main() -> int:
 
     remote_device = find_remote_device()
     grab_device(remote_device)
-    connect_to_camilladsp()
 
     try:
         client = ensure_cdsp_connected()

@@ -133,6 +133,10 @@ class MotuAccess:
                 raise AccessUnavailable(f"MOTU access record {self.path}: {exc}") from None
             try:
                 yield handle
+            except OSError as exc:
+                # A full or failing disk mid-write is the same "record
+                # unusable" every caller already handles.
+                raise AccessUnavailable(f"MOTU access record {self.path}: {exc}") from None
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 

@@ -43,10 +43,11 @@ own safety mute, and recovery can carry it across several failed attempts. A
 listener who mutes in between only sets a flag the switcher already set, so
 every mute writer (control UI, remote, AirPlay/Spotify bridge) that mutes while
 the ready token is absent also leaves `mute-request.json` beside the token.
-The switcher drops that file whenever it captures the live mute state (the
-capture already includes it) and takes it at restore time, so a mute requested
-after the capture keeps the restored output muted. Unmuting while inhibited is
-refused, as before.
+The switcher consumes that file only after the restore's final mute call has
+succeeded, so a mute requested after any capture keeps the restored output
+muted, even when the restore uses an older captured value (a speaker change's
+transition file) or its first attempt fails. A leftover request can only err
+toward silence. Unmuting while inhibited is refused, as before.
 
 After a reload, `SOURCE_SETTLE_TIME` (default 2 s; 1.5 s for the USB gadget) is only a grace period
 before the first look. The engine is then polled until it reports Running or

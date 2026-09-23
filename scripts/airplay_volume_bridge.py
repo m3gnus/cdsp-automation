@@ -199,9 +199,11 @@ def set_mapped_volume(
     # A network sender's 100% maps onto VOLUME_MAX_DB, which knows nothing
     # about the speaker profile in service. The ceiling the switcher verified
     # wins, so a capped profile cannot be overdriven from a phone either.
-    ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
-    capped_db = min(mapped_db, ceiling)
+    # Read it under the lock: the switcher publishes a new ceiling only while
+    # holding it, so a value read before could belong to the old profile.
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+        ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
+        capped_db = min(mapped_db, ceiling)
         if muted:
             note_mute_request(AUDIO_READY_PATH)
         else:

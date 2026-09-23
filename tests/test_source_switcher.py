@@ -3309,25 +3309,65 @@ def test_a_listener_mute_between_recovery_attempts_survives_the_restore(
     assert not speaker_profiles.mute_request_path(tmp_path / "ready.json").exists()
 
 
-def test_a_mute_request_older_than_the_capture_does_not_hold_the_restore(
+def test_a_mute_request_survives_a_capture_the_restore_does_not_use(
     tmp_path: Path,
 ) -> None:
-    """The live capture already includes any earlier request; a leftover
-    file from a transition that never finished must not keep a later,
-    unmuted listener silent."""
+    """A speaker change restores the web UI's older transition-file value, not
+    the switcher's own capture; a listener mute made in between must still win."""
     client, target, target_path, guards = _transition_fixture(
-        tmp_path, StagedSwitcherGeneral([["running"]]), mute=False
+        tmp_path, StagedSwitcherGeneral([["running"]]), mute=True
     )
     ready = tmp_path / "ready.json"
+    speaker_profiles.set_audio_inhibit(ready)
     speaker_profiles.note_mute_request(ready)
-    assert speaker_profiles.mute_request_path(ready).exists()
     with contextlib.ExitStack() as stack:
         for guard in guards:
             stack.enter_context(guard)
         stack.enter_context(patch.object(switcher, "time", FakeClock()))
-        switcher.apply_config(client, str(target_path), target=target)
-    assert client.volume.mute is False
+        # The switcher's capture of the live flag, then thrown away in favour
+        # of the transition file's restore_mute=False.
+        assert switcher.capture_restore_mute(client) is True
+        assert speaker_profiles.mute_request_path(ready).exists()
+        switcher.apply_config(
+            client, str(target_path), target=target, restore_mute=False
+        )
+    assert client.volume.mute is True
     assert not speaker_profiles.mute_request_path(ready).exists()
+
+
+def test_a_failed_final_mute_keeps_the_request_for_the_retry(
+    tmp_path: Path,
+) -> None:
+    client, target, target_path, guards = _transition_fixture(
+        tmp_path, StagedSwitcherGeneral([["running"], ["running"]]), mute=True
+    )
+    ready = tmp_path / "ready.json"
+    speaker_profiles.set_audio_inhibit(ready)
+    speaker_profiles.note_mute_request(ready)
+    real_set = client.volume.set_main_mute
+    calls = {"n": 0}
+
+    def flaky(value: bool) -> None:
+        # Fail only the restore call that follows the transition's own mute.
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("rpc timeout")
+        real_set(value)
+
+    client.volume.set_main_mute = flaky
+    with contextlib.ExitStack() as stack:
+        for guard in guards:
+            stack.enter_context(guard)
+        stack.enter_context(patch.object(switcher, "time", FakeClock()))
+        with pytest.raises(RuntimeError):
+            switcher.apply_config(
+                client, str(target_path), target=target, restore_mute=False
+            )
+        assert speaker_profiles.mute_request_path(ready).exists()
+        switcher.apply_config(
+            client, str(target_path), target=target, restore_mute=False
+        )
+    assert client.volume.mute is True
 
 
 def test_mute_requests_are_recorded_only_while_readiness_is_dropped(
@@ -3342,8 +3382,7 @@ def test_mute_requests_are_recorded_only_while_readiness_is_dropped(
 
     speaker_profiles.set_audio_inhibit(ready)
     speaker_profiles.note_mute_request(ready)
-    assert speaker_profiles.take_mute_request(ready) is True
-    assert speaker_profiles.take_mute_request(ready) is False
+    assert speaker_profiles.mute_request_path(ready).exists()
 
     # No runtime directory: no switcher is running to hold a restore value.
     speaker_profiles.note_mute_request(tmp_path / "absent" / "ready.json")

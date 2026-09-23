@@ -488,15 +488,6 @@ def discard_mute_request(ready_path: Path) -> None:
     mute_request_path(ready_path).unlink(missing_ok=True)
 
 
-def take_mute_request(ready_path: Path) -> bool:
-    """Consume a pending listener mute request; True if there was one."""
-    try:
-        mute_request_path(ready_path).unlink()
-    except FileNotFoundError:
-        return False
-    return True
-
-
 def update_speaker_selection(
     path: Path,
     speaker_id: str,
