@@ -302,7 +302,6 @@ if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; 
                         f"AUDIO_EQ_PATH={state}/audio-eq.json",
                         f"AUDIO_CONTROL_LOCK_PATH={state}/audio-control.lock",
                         f"SPEAKER_SELECTION_PATH={state}/speaker-selection.json",
-                        f"SPEAKER_TRANSITION_PATH={state}/speaker-transition.json",
                         f"SPEAKER_AUDIO_DIR={state}/speaker-audio",
                         f"SPEAKER_PROFILE_DIR={etc}/speaker-profiles",
                         f"SOURCE_BASE_DIR={etc}/source-bases",
@@ -527,7 +526,7 @@ ensure_audio_state_storage
                 "Source Switcher: installed because Remote Control requires it", output
             )
 
-    def test_dependency_explains_the_unmute_and_tone_consequences_to_the_operator(
+    def test_dependency_explains_the_ceiling_and_tone_consequences_to_the_operator(
         self,
     ) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -542,9 +541,8 @@ ensure_audio_state_storage
                 ),
                 env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
             )
-            self.assertIn("audio-ready token that allows an", output)
-            self.assertIn("persisted Bass/Treble/EQ edits", output)
-            self.assertIn("could never unmute", output)
+            self.assertIn("persisted Bass/Treble/EQ and speaker", output)
+            self.assertIn("fail-safe ceiling", output)
             # Installing the switcher is not the same as configuring it.
             self.assertIn("give it its source configs", output)
             # A pulled-in dependency is not a skipped or failed component.
@@ -631,7 +629,7 @@ ensure_audio_state_storage
         )
         menu = self._run("print_menu")
         self.assertIn("Options 5, 8 and 11 also install option 4", menu)
-        self.assertIn("permit an unmute", menu)
+        self.assertIn("applies tone/EQ and speaker changes", menu)
         # Every dependent routes through the one helper.
         for component in (
             "install_remote()",
@@ -649,8 +647,7 @@ ensure_audio_state_storage
         )
         self.assertNotIn("designed to work together or independently", technical)
         for text, label in ((readme, "README"), (technical, "TECHNICAL")):
-            self.assertIn("require_audio_unmute_allowed", text, label)
-            self.assertIn("audio-ready token", text, label)
+            self.assertNotIn("audio-ready token", text, label)
         self.assertIn("each require **Source Switcher**", readme)
         self.assertIn("Each requires the Source Switcher", technical)
 

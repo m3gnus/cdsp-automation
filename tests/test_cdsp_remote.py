@@ -257,5 +257,32 @@ class RemoteVolumeCeilingTests(unittest.TestCase):
         self.assertEqual(self.raise_volume(-100.0), -90.0)
 
 
+    def test_mute_toggle_waits_for_a_transition_holding_the_lock(self) -> None:
+        import threading
+
+        state = {"muted": True}
+        client = SimpleNamespace(
+            volume=SimpleNamespace(
+                main_mute=lambda: state["muted"],
+                set_main_mute=lambda value: state.update(muted=value),
+            )
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "audio.lock"
+            with (
+                mock.patch.object(cdsp_remote, "AUDIO_CONTROL_LOCK_PATH", lock_path),
+                mock.patch.object(
+                    cdsp_remote, "ensure_cdsp_connected", return_value=client
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                with speaker_profiles.audio_control_lock(lock_path):
+                    toggle = threading.Thread(target=cdsp_remote.toggle_mute)
+                    toggle.start()
+                    toggle.join(0.3)
+                    self.assertTrue(state["muted"])
+                toggle.join(5)
+        self.assertFalse(state["muted"])
+
 if __name__ == "__main__":
     unittest.main()

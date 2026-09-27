@@ -512,40 +512,24 @@ def test_spotify_tracker_deadlines_use_monotonic_time(tmp_path: Path) -> None:
     assert given == [mono] * len(given)
 
 
-def test_spotify_mirror_pauses_before_reading_a_transition_mute(
+def test_bridge_writes_and_mirror_reads_wait_for_the_audio_control_lock(
     tmp_path: Path,
 ) -> None:
-    class Volume:
-        def __init__(self) -> None:
-            self.reads = 0
+    """A config transition holds the lock; the bridge waits it out."""
+    import threading
 
-        def main_volume(self) -> float:
-            self.reads += 1
-            return -50.0
+    import speaker_profiles
 
-        def main_mute(self) -> bool:
-            self.reads += 1
-            return True
-
-    volume = Volume()
-    client = SimpleNamespace(volume=volume)
-    with (
-        patch.object(
-            volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"
-        ),
-        patch.object(volume_sync, "AUDIO_READY_PATH", tmp_path / "missing.json"),
-    ):
-        assert volume_sync.read_mirrorable_camilla_volume(client) is None
-    assert volume.reads == 0
-
-
-def test_airplay_cannot_unmute_while_config_transition_is_inhibited(
-    tmp_path: Path,
-) -> None:
     class Volume:
         def __init__(self) -> None:
             self.mute = True
             self.volume = -40.0
+
+        def main_volume(self) -> float:
+            return self.volume
+
+        def main_mute(self) -> bool:
+            return self.mute
 
         def set_main_volume(self, value: float) -> None:
             self.volume = value
@@ -554,21 +538,35 @@ def test_airplay_cannot_unmute_while_config_transition_is_inhibited(
             self.mute = value
 
     client = SimpleNamespace(volume=Volume())
-    ready = tmp_path / "ready.json"
+    lock_path = tmp_path / "audio.lock"
+    results: list[object] = []
     with (
-        patch.object(
-            volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"
-        ),
-        patch.object(volume_sync, "AUDIO_READY_PATH", ready),
+        patch.object(volume_sync, "AUDIO_CONTROL_LOCK_PATH", lock_path),
+        patch.object(volume_sync, "SPEAKER_STATUS_PATH", tmp_path / "status.json"),
+        patch.object(volume_sync, "STATUS_PATH", tmp_path / "bridge-status.json"),
     ):
-        try:
-            volume_sync.set_client_volume(client, -10)
-        except RuntimeError as exc:
-            assert "inhibited" in str(exc)
-        else:
-            raise AssertionError("AirPlay unmuted an inhibited output")
-    assert client.volume.mute is True
-    assert client.volume.volume == -40.0
+        with speaker_profiles.audio_control_lock(lock_path):
+            writer = threading.Thread(
+                target=lambda: results.append(
+                    volume_sync.set_client_volume(client, -30)
+                )
+            )
+            reader = threading.Thread(
+                target=lambda: results.append(
+                    volume_sync.read_mirrorable_camilla_volume(client)
+                )
+            )
+            writer.start()
+            reader.start()
+            writer.join(0.3)
+            reader.join(0.3)
+            assert results == []
+            assert client.volume.mute is True
+            assert client.volume.volume == -40.0
+        writer.join(5)
+        reader.join(5)
+    assert len(results) == 2
+    assert client.volume.mute is False
 
 
 def test_network_sender_volume_is_capped_by_the_applied_profile(
@@ -588,24 +586,14 @@ def test_network_sender_volume_is_capped_by_the_applied_profile(
         def set_main_mute(self, value: bool) -> None:
             self.mute = value
 
-    ready = tmp_path / "ready.json"
-    # Readiness is bound to a live engine instance, so the bridge only reaches
-    # the volume writer when the token and the engine name the same generation.
-    generation = speaker_profiles.new_engine_generation()
-    speaker_profiles.clear_audio_inhibit(ready, generation=generation)
-    marker = speaker_profiles.engine_generation_marker(generation)
     status = tmp_path / "speaker-profile-status.json"
 
     def send(setter, argument):
-        client = SimpleNamespace(
-            volume=Volume(),
-            config=SimpleNamespace(description=lambda: marker),
-        )
+        client = SimpleNamespace(volume=Volume())
         with (
             patch.object(
                 volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"
             ),
-            patch.object(volume_sync, "AUDIO_READY_PATH", ready),
             patch.object(volume_sync, "SPEAKER_STATUS_PATH", status),
             patch.object(volume_sync, "STATUS_PATH", tmp_path / "bridge-status.json"),
         ):

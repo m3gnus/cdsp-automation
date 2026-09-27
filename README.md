@@ -62,7 +62,7 @@ chmod +x install.sh
 - The installer uses `sudo` where required, so you do not need to run the whole script as root
 - Choose option **1** to install all utilities at once, or install them
   individually - but note that options 5, 8 and 11 also install the source
-  switcher, which they require in order to unmute or apply tone changes
+  switcher, which they require for their volume ceiling and tone changes
 
 ## Audio control architecture
 
@@ -105,21 +105,19 @@ operator's responsibility.
 The repository's `speaker-profile.example.yml` is deliberately disabled and
 fully muted; `source-base.example.yml` shows the capture-only boundary.
 
-All master-volume writers share `AUDIO_CONTROL_LOCK_PATH`. `AUDIO_READY_PATH`
-is absent by default and is written only as the final commit of a verified
-transition. It is not a bare flag: it names the *engine generation* — a random
-id the source switcher mints for every CamillaDSP connection it makes and
-stamps into the live config's description — plus the applied config path,
-digest, source, speaker, and speaker-selection revision. Every unmute path
-re-reads that description from the CamillaDSP client it already holds and
-refuses unless it still matches the token, so an engine that restarts or
-reloads from file is inhibited immediately even though the token file is still
-there. (It is a handshake, not a seal: a foreign live-config write that keeps
-the description keeps readiness too - see TECHNICAL.md.) Anything missing, unparseable, or mismatched
-inhibits. While inhibited, AirPlay, Spotify, the browser, and the HID remote
-may mute but cannot unmute. `cdsp-source-switcher.service` is `PartOf=`
-`camilladsp.service`, so restarting the engine restarts the switcher that
-re-verifies it.
+All master-volume and mute writers share `AUDIO_CONTROL_LOCK_PATH`. The
+source switcher holds that lock for a whole config switch: it mutes, reloads,
+checks that the engine runs the new file, re-applies the EQ overlay, and then
+puts back the listener's previous mute state. AirPlay, Spotify, the browser
+and the HID remote take the same lock around every volume or mute write, so a
+change made mid-switch simply waits until the switch is done. A switch that
+fails rolls back to the previous config and stays muted. At startup, and
+whenever it reconnects to CamillaDSP, the switcher mutes and re-applies the
+current config before restoring the mute state it found.
+`cdsp-source-switcher.service` is `PartOf=` `camilladsp.service`, so
+restarting the engine restarts the switcher too. (An engine that crashes and
+restarts by itself is caught when the switcher's websocket reconnects; until
+then a control could unmute it briefly.)
 
 The all-utilities install also:
 
@@ -625,11 +623,11 @@ The installer menu provides these options:
     also installs option 4, which it requires)
 
 Options 5, 8 and 11 install the source switcher when it is missing, because
-the components they install cannot unmute without it. The switcher is the only
-writer of the audio-ready token that permits an unmute, and the only thing that
-applies persisted Bass/Treble/EQ edits to the running engine, so installing any
-of them alone would produce a remote, bridge or UI that can never unmute and
-whose tone edits go nowhere. Each run says so before it acts, and lists the
+the components they install depend on it. The switcher is the only thing that
+applies persisted Bass/Treble/EQ and speaker changes to the running engine,
+and the only publisher of the volume ceiling the controls honour, so installing
+any of them alone would produce a remote, bridge or UI stuck at the fail-safe
+ceiling whose edits go nowhere. Each run says so before it acts, and lists the
 switcher under "Also installed, because the components you chose require it"
 in its closing summary. Installing the switcher does not give it its source
 configs - you still have to create them, or its service will not run.
@@ -879,23 +877,17 @@ journalctl -u cdsp-source-switcher -n 100 | grep "MOTU connected"
 
 **Some of them.** Trigger control is genuinely standalone.
 The remote, the AirPlay/Spotify volume bridge and the web control UI are not:
-they all ask `require_audio_unmute_allowed()` for permission before unmuting,
-and only the source switcher ever grants it by publishing the audio-ready
-token. The switcher is also the only thing that applies a persisted
-Bass/Treble/EQ edit to the running engine. So:
+they take their volume ceiling from the speaker-profile status only the source
+switcher publishes (without it they hold the fail-safe ceiling), and the
+switcher is the only thing that applies a persisted Bass/Treble/EQ or speaker
+change to the running engine. So:
 
 - Install only **Trigger Control** for amp power management
 - Install only **Source Switcher** for config switching and MOTU clock control
 - **Remote Control**, **AirPlay + Spotify Volume Sync** and the **Web Control
   UI** each require **Source Switcher**. The installer adds it for you rather
-  than leaving you with a component that can never unmute and whose tone edits
-  are never applied
+  than leaving you with a component whose edits are never applied
 - Install any combination of the above; shared writers use the audio-control lock
-
-The ready token is a JSON document carrying the generation of the engine it was
-verified against, so writing one by hand is not a way around this - and the
-check is what stops audio being unmuted against an unverified engine, so it is
-never relaxed.
 
 ---
 

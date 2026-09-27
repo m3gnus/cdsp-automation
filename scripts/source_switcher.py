@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import glob
 import hashlib
@@ -18,7 +19,6 @@ try:
 except ImportError:
     websocket = None
 
-import yaml
 from camilladsp import CamillaClient
 from audio_eq import (
     FILTER_PREFIX,
@@ -45,17 +45,10 @@ from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
     audio_control_lock,
-    audio_inhibit_active,
-    clear_audio_inhibit,
-    discard_mute_request,
-    new_engine_generation,
     normalize_volume_limit,
     read_profile_audio_state,
     read_speaker_selection,
-    set_audio_inhibit,
     speaker_selection_lock,
-    stamp_engine_generation,
-    mute_request_path,
     operator_config_for_source,
 )
 
@@ -117,8 +110,8 @@ PROBE_BACKOFF_MAX = max(
 SETTLE_TIME = float(os.environ.get("SOURCE_SETTLE_TIME", "2.0"))
 # SetConfig/Reload acknowledge that a change was queued, not that the
 # processing controller finished applying it. SETTLE_TIME remains the grace
-# period before the first state read; the read-back of the applied config is
-# then polled until it converges or this bounded deadline expires.
+# period before the first state read; the engine is then polled until it runs
+# the requested file (or an EQ write shows up) or this bounded deadline expires.
 CONFIG_APPLY_TIMEOUT = float(os.environ.get("SOURCE_CONFIG_APPLY_TIMEOUT", "10.0"))
 CONFIG_APPLY_POLL_INTERVAL = float(
     os.environ.get("SOURCE_CONFIG_APPLY_POLL_INTERVAL", "0.25")
@@ -234,12 +227,6 @@ SPEAKER_STATUS_PATH = Path(
         "/run/cdsp-source-switcher/speaker-profile-status.json",
     )
 )
-SPEAKER_TRANSITION_PATH = Path(
-    os.environ.get(
-        "SPEAKER_TRANSITION_PATH",
-        "/var/lib/cdsp-automation/speaker-transition.json",
-    )
-)
 CAMILLA_BINARY = os.environ.get("CAMILLA_BINARY", "camilladsp")
 CONFIG_VALIDATE_TIMEOUT = float(os.environ.get("CONFIG_VALIDATE_TIMEOUT", "10"))
 # CamillaDSP's own ceiling, and therefore the ceiling for anything that
@@ -248,11 +235,6 @@ DEFAULT_VOLUME_LIMIT_DB = 0.0
 AUDIO_CONTROL_LOCK_PATH = Path(
     os.environ.get(
         "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
-AUDIO_READY_PATH = Path(
-    os.environ.get(
-        "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
     )
 )
 
@@ -265,23 +247,6 @@ CONFIGS = {
 
 _iso226_capability_result = False
 _iso226_capability_next_check = 0.0
-
-# Readiness generation for the CamillaDSP connection this process currently
-# holds.  Rotated on every (re)connection, so a token minted for an earlier
-# engine instance — or by an earlier switcher run — never authorizes unmuting.
-_engine_generation = ""
-
-
-def rotate_engine_generation() -> str:
-    """Start a new readiness generation; every older token stops counting."""
-    global _engine_generation
-    _engine_generation = new_engine_generation()
-    return _engine_generation
-
-
-def engine_generation() -> str:
-    return _engine_generation or rotate_engine_generation()
-
 
 def iso226_capability_available() -> bool:
     """Verify the marker hash against the executable of the live service."""
@@ -694,38 +659,6 @@ def speaker_audio_state(speaker_id: str) -> dict:
     )
 
 
-def pending_transition_mute(selection: dict) -> bool | None:
-    try:
-        value = json.loads(SPEAKER_TRANSITION_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(value, dict) or value.get("version") != 1:
-        return None
-    restore_mute = value.get("restore_mute")
-    if (
-        value.get("revision") != selection.get("revision")
-        or value.get("selected") != selection.get("selected")
-        or not isinstance(restore_mute, bool)
-    ):
-        return None
-    return restore_mute
-
-
-def clear_pending_transition(target: dict | None) -> None:
-    if not target:
-        return
-    try:
-        value = json.loads(SPEAKER_TRANSITION_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return
-    if (
-        isinstance(value, dict)
-        and value.get("revision") == target.get("selection_revision")
-        and value.get("selected") == target.get("speaker")
-    ):
-        SPEAKER_TRANSITION_PATH.unlink(missing_ok=True)
-
-
 def require_selected_profile_available(
     cdsp: CamillaClient,
     selected_speaker: str,
@@ -752,7 +685,6 @@ def require_selected_profile_available(
                 f"selected speaker profile {selected_speaker!r} became unavailable: "
                 f"{selected_entry.get('reason') or 'unknown reason'}"
             )
-            set_audio_inhibit(AUDIO_READY_PATH)
             cdsp.volume.set_main_mute(True)
             _write_speaker_status(
                 {
@@ -825,17 +757,6 @@ def validate_config_file(path: Path) -> None:
         raise ValueError(f"CamillaDSP rejected {path.name}: {message}")
 
 
-def capture_restore_mute(cdsp: CamillaClient) -> bool:
-    """Read the listener's live mute state as the value a transition restores.
-
-    Caller holds the audio-control lock.  A pending listener mute request is
-    left alone: this capture may yet be replaced by an older one (a speaker
-    change's transition file), and the request is consumed only once the
-    restore has actually been applied.
-    """
-    return bool(cdsp.volume.main_mute())
-
-
 def _processing_state(cdsp: CamillaClient) -> str:
     """Normalize pycamilladsp enum and string representations."""
     state = cdsp.general.state()
@@ -855,16 +776,6 @@ class ConfigRecoveryGuard:
         self.next_attempt = 0.0
         self.next_log = 0.0
         self.last_message: str | None = None
-        # The listener's mute state from before recovery first muted, for
-        # startup validation to restore.  Read back after our own mute it
-        # would always say "muted", and a boot that needed recovery would
-        # come back silent for good.
-        self.restore_mute: bool | None = None
-
-    def take_restore_mute(self) -> bool | None:
-        """Hand over (once) the mute state recovery found, if it muted."""
-        value, self.restore_mute = self.restore_mute, None
-        return value
 
     def _log(self, message: str, now: float) -> None:
         if message != self.last_message or now >= self.next_log:
@@ -872,24 +783,17 @@ class ConfigRecoveryGuard:
             self.last_message = message
             self.next_log = now + self.log_seconds
 
-    def _inhibit(self, cdsp: CamillaClient, now: float) -> bool:
+    def _mute(self, cdsp: CamillaClient, now: float) -> bool:
         """Latch muted before recovery so the reload cannot become audible.
 
         A remembered config that failed to activate has never been through the
-        verified apply path.  Dropping readiness here makes the main loop treat
-        the recovered graph exactly like an intentional transition: muted,
-        re-resolved, re-validated and re-stamped before anything may unmute.
-
-        Dropping the token only stops cooperating controls from unmuting; it
-        does not mute the engine.  So the mute is read back, and any failure
-        -- lock, token, request or read-back -- returns False, which the caller
-        must treat as "do not reload".
+        verified apply path; the main loop re-applies it muted afterwards.  The
+        listener's own mute state was already captured when the switcher
+        connected, so this only mutes.  The mute is read back, and any failure
+        returns False, which the caller must treat as "do not reload".
         """
         try:
             with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-                set_audio_inhibit(AUDIO_READY_PATH)
-                if self.restore_mute is None:
-                    self.restore_mute = capture_restore_mute(cdsp)
                 cdsp.volume.set_main_mute(True)
                 if not bool(cdsp.volume.main_mute()):
                     raise RuntimeError("engine did not report mute after the request")
@@ -906,7 +810,7 @@ class ConfigRecoveryGuard:
             self.next_log = 0.0
             self.last_message = None
             return True
-        muted = self._inhibit(cdsp, now)
+        muted = self._mute(cdsp, now)
         if now < self.next_attempt:
             return False
         self.next_attempt = now + self.retry_seconds
@@ -974,20 +878,19 @@ def resolve_config_target(
         if not path.is_file():
             raise FileNotFoundError(path)
         audio_state = speaker_audio_state(speaker_id)
-        expected_config = load_yaml_mapping(path, f"legacy {source} config")
+        legacy_config = load_yaml_mapping(path, f"legacy {source} config")
         return {
             "path": str(path),
             "digest": _file_digest(path),
             "source": source,
             "speaker": speaker_id,
             "max_volume_db": 0.0,
-            "volume_limit_db": _legacy_volume_limit(expected_config),
+            "volume_limit_db": _legacy_volume_limit(legacy_config),
             "bypass_user_eq": False,
             "legacy": True,
             "capabilities": {},
             "selection_revision": selection_revision,
             "audio_state": audio_state,
-            "expected_config": expected_config,
         }
 
     catalog = speaker_catalog()
@@ -1003,18 +906,18 @@ def resolve_config_target(
     operator_filename = operator_config_for_source(speaker_id, source)
     if operator_filename:
         path = Path(CONFIG_DIR) / operator_filename
-        expected_config = load_yaml_mapping(path, f"operator config {speaker_id}")
+        operator_config = load_yaml_mapping(path, f"operator config {speaker_id}")
         # An operator config is the operator's artifact, so the profile cap is
         # verified here instead of being compiled in. Rejecting the transition
         # is the fail-closed answer: the alternative is going live on a config
         # nothing downstream can hold below the profile's limit.
         effective_limit = require_config_volume_limit(
-            expected_config, profile, label=f"operator config {path.name}"
+            operator_config, profile, label=f"operator config {path.name}"
         )
         validate_config_file(path)
         return {
             "path": str(path),
-            "digest": config_digest(expected_config),
+            "digest": config_digest(operator_config),
             "source": source,
             "speaker": speaker_id,
             "max_volume_db": profile["max_volume_db"],
@@ -1025,7 +928,6 @@ def resolve_config_target(
             "capabilities": profile["capabilities"],
             "selection_revision": selection_revision,
             "audio_state": speaker_audio_state(speaker_id),
-            "expected_config": expected_config,
         }
     source_base = load_yaml_mapping(
         SOURCE_BASE_DIR / f"{source}.yml", f"source base {source}"
@@ -1058,7 +960,6 @@ def resolve_config_target(
         "capabilities": profile["capabilities"],
         "selection_revision": selection_revision,
         "audio_state": audio_state,
-        "expected_config": compiled,
     }
 
 
@@ -1187,164 +1088,6 @@ def _configs_equivalent(actual: dict, expected: dict) -> bool:
     return _without_null_fields(actual) == _without_null_fields(expected)
 
 
-def _engine_parsed_config(cdsp: CamillaClient, captured: dict) -> dict | None:
-    """Return the engine's own parse of the captured config, or None.
-
-    Normalization approach: let the engine define it.  Handing the engine the
-    *captured* mapping (ReadConfig) yields its deserialization with defaults
-    filled in, so the read-back comparison needs no allowlist of optional
-    fields that would drift with every upstream release.
-
-    It must be the captured mapping, never a fresh read of the file: an
-    operator file edited between the integrity check and the reload would
-    otherwise be parsed, loaded and then verified against itself.  ReadConfig
-    does not run the filename-aware validation a reload does (token
-    substitution, relative coefficient paths); ``_engine_load_view`` adds that.
-
-    Older pycamilladsp clients (and engines that reject the request) have no
-    such call; the caller then falls back to structural null-stripping.
-    """
-    parser = getattr(getattr(cdsp, "config", None), "parse_yaml", None)
-    if parser is None:
-        return None
-    try:
-        parsed = parser(yaml.safe_dump(captured, sort_keys=False))
-    except Exception:
-        return None
-    return parsed if isinstance(parsed, dict) else None
-
-
-def _engine_load_view(config: dict, config_path: str) -> dict:
-    """Apply the preprocessing CamillaDSP performs when it loads ``config_path``.
-
-    Neither the engine's ReadConfigFile nor our own YAML read does this, but a
-    reload validates the file *with its filename*, which (pinned upstream
-    ``validate_config``) first substitutes ``$samplerate$``/``$channels$`` in
-    Conv filenames and pipeline step names, then rewrites a relative Conv
-    filename to ``<canonical config dir>/<filename>`` when that file exists.
-    The active config therefore names ``/.../configs/coeffs/hf.txt`` where the
-    file says ``coeffs/hf.txt``.  Mirror exactly that, so the comparison stays
-    strict about which coefficient file is loaded without tripping over how it
-    was spelled.
-    """
-    result = copy.deepcopy(config)
-    devices = result.get("devices")
-    devices = devices if isinstance(devices, dict) else {}
-    capture = devices.get("capture")
-    tokens: dict[str, str] = {}
-    if isinstance(devices.get("samplerate"), int):
-        tokens["$samplerate$"] = str(devices["samplerate"])
-    if isinstance(capture, dict) and isinstance(capture.get("channels"), int):
-        tokens["$channels$"] = str(capture["channels"])
-
-    def substitute(value: str) -> str:
-        for token, replacement in tokens.items():
-            value = value.replace(token, replacement)
-        return value
-
-    config_dir = (
-        os.path.dirname(os.path.realpath(config_path))
-        if os.path.exists(config_path)
-        else None
-    )
-    filters = result.get("filters")
-    if isinstance(filters, dict):
-        for definition in filters.values():
-            if not isinstance(definition, dict) or definition.get("type") != "Conv":
-                continue
-            parameters = definition.get("parameters")
-            if not isinstance(parameters, dict) or parameters.get("type") not in (
-                "Raw",
-                "Wav",
-            ):
-                continue
-            filename = parameters.get("filename")
-            if not isinstance(filename, str):
-                continue
-            filename = substitute(filename)
-            if config_dir and not os.path.isabs(filename):
-                candidate = os.path.join(config_dir, filename)
-                if os.path.exists(candidate):
-                    filename = candidate
-            parameters["filename"] = filename
-    pipeline = result.get("pipeline")
-    if isinstance(pipeline, list):
-        for step in pipeline:
-            if not isinstance(step, dict):
-                continue
-            if step.get("type") == "Filter" and isinstance(step.get("names"), list):
-                step["names"] = [
-                    substitute(name) if isinstance(name, str) else name
-                    for name in step["names"]
-                ]
-            elif step.get("type") in ("Mixer", "Processor") and isinstance(
-                step.get("name"), str
-            ):
-                step["name"] = substitute(step["name"])
-    return result
-
-
-def _reference_config(cdsp: CamillaClient, file_path: str, expected: dict) -> dict:
-    """What the engine should report after loading ``file_path``.
-
-    Built only from ``expected`` -- the mapping captured (and, for managed
-    targets, digest-checked) at resolve time -- so whatever is on disk now
-    has no say in what counts as correct.  ``file_path`` only supplies the
-    directory relative coefficient paths resolve against.
-    """
-    reference = _engine_parsed_config(cdsp, expected)
-    if reference is None:
-        reference = expected
-    return _engine_load_view(reference, file_path)
-
-
-def _matches_reference(accepted: object, reference: dict) -> bool:
-    if not isinstance(accepted, dict) or not accepted:
-        return False
-    return _configs_equivalent(accepted, reference)
-
-
-def _accepted_config_matches(
-    cdsp: CamillaClient,
-    file_path: str,
-    accepted: object,
-    expected: dict,
-) -> bool:
-    """Compare an accepted read-back against the captured configuration."""
-    return _matches_reference(accepted, _reference_config(cdsp, file_path, expected))
-
-
-def _await_active_config(
-    cdsp: CamillaClient,
-    file_path: str,
-    expected: dict,
-    *,
-    timeout: float | None = None,
-    poll_interval: float | None = None,
-) -> None:
-    """Poll until the engine reports the requested config, or fail closed.
-
-    A single read after a fixed sleep races the asynchronous application of a
-    queued config. Poll against a bounded deadline instead; on timeout raise,
-    which leaves the caller's rollback and latched mute intact.
-    """
-    if timeout is None:
-        timeout = CONFIG_APPLY_TIMEOUT
-    if poll_interval is None:
-        poll_interval = CONFIG_APPLY_POLL_INTERVAL
-    poll_interval = max(poll_interval, 0.01)
-    reference = _reference_config(cdsp, file_path, expected)
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
-        if _matches_reference(cdsp.config.active(), reference):
-            return
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                "CamillaDSP active config differs from requested config"
-            )
-        time.sleep(poll_interval)
-
-
 def _await_reload(
     cdsp: CamillaClient,
     file_path: str,
@@ -1355,10 +1098,11 @@ def _await_reload(
 ) -> None:
     """Wait for a reloaded engine to run the requested file, or fail closed.
 
-    ``settle_time`` is only a grace period before the first look.  An engine
-    still reporting Starting then keeps getting polled until the apply deadline,
-    the same allowance the active-config read-back gets, instead of being rolled
-    back on the strength of one early read.
+    This is the whole post-reload check: the engine reports Running or Paused
+    on the requested config path within the apply deadline.  The file itself
+    was checked by ``validate_config_file`` (and, for managed targets, its
+    digest) before the reload.  ``settle_time`` is only a grace period before
+    the first look, so a slow Starting phase is not rolled back.
     """
     if timeout is None:
         timeout = CONFIG_APPLY_TIMEOUT
@@ -1657,8 +1401,9 @@ class ClockReconciler:
     (the MOTU is not connected).  The correction is its own small muted
     transaction under the audio-control lock -- mute, wait for silence,
     write, settle, restore the previous mute -- and is attempted at most once
-    per MOTU_CLOCK_RETRY_SECONDS.  It never runs while readiness is withheld:
-    whatever transition is pending will set the clock itself.
+    per MOTU_CLOCK_RETRY_SECONDS.  The main loop only runs it once a config
+    has been applied on the current connection: a pending transition sets
+    the clock itself.
     """
 
     def __init__(self) -> None:
@@ -1675,10 +1420,6 @@ class ClockReconciler:
             return
         self.next_attempt = now + MOTU_CLOCK_RETRY_SECONDS
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-            if audio_inhibit_active(
-                AUDIO_READY_PATH, cdsp, generation=engine_generation()
-            ):
-                return
             previous_mute = bool(cdsp.volume.main_mute())
             cdsp.volume.set_main_mute(True)
             try:
@@ -1688,6 +1429,17 @@ class ClockReconciler:
                 cdsp.volume.set_main_mute(previous_mute)
 
 
+def _require_selection_unchanged(target: dict | None, moment: str) -> None:
+    if not target or target.get("selection_revision") is None:
+        return
+    current_selection = current_speaker_selection()
+    if (
+        current_selection["selected"] != target["speaker"]
+        or current_selection["revision"] != target["selection_revision"]
+    ):
+        raise RuntimeError(f"speaker selection changed {moment}")
+
+
 def apply_config(
     cdsp: CamillaClient,
     file_path: str,
@@ -1695,218 +1447,133 @@ def apply_config(
     *,
     target: dict | None = None,
     restore_mute: bool | None = None,
-    audio_lock_held: bool = False,
 ) -> None:
-    """Apply a prevalidated config while muted; latch mute on uncertainty."""
+    """Switch configs muted, under the audio-control lock.
+
+    Mute, reload, check the engine runs the new file, re-apply the EQ overlay,
+    then put back ``restore_mute`` -- the listener's mute state, by default
+    the live one read here before muting.  Every other volume/mute writer
+    takes the same lock, so none of them can act mid-transition.  On any
+    failure the previous config is reloaded and the engine is left muted.
+    """
     if not os.path.exists(file_path):
         raise FileNotFoundError(file_path)
     validate_config_file(Path(file_path))
     config_name = os.path.basename(file_path)
     print(f">>> Switching to: {config_name}", flush=True)
     previous_path = cdsp.config.file_path()
-    try:
-        previous_expected = load_yaml_mapping(
-            Path(previous_path), "previous config"
-        ) if previous_path else None
-    except (OSError, ValueError):
-        previous_expected = None
-    audio_guard = None
-    audio_guard_entered = False
-    try:
-        if not audio_lock_held:
-            audio_guard = audio_control_lock(AUDIO_CONTROL_LOCK_PATH)
-            audio_guard.__enter__()
-            audio_guard_entered = True
-        set_audio_inhibit(AUDIO_READY_PATH)
-        previous_mute = (
-            capture_restore_mute(cdsp)
-            if restore_mute is None
-            else bool(restore_mute)
-        )
+    with contextlib.ExitStack() as locks:
+        locks.enter_context(audio_control_lock(AUDIO_CONTROL_LOCK_PATH))
+        if restore_mute is None:
+            restore_mute = bool(cdsp.volume.main_mute())
         previous_volume = float(cdsp.volume.main_volume())
         cdsp.volume.set_main_mute(True)
-    except Exception:
-        if audio_guard_entered:
-            assert audio_guard is not None
-            audio_guard.__exit__(None, None, None)
-        raise
-    selection_guard = None
-    selection_guard_entered = False
-    previous_clock: str | None = None
-    try:
-        if target and target.get("selection_revision") is not None:
-            selection_guard = speaker_selection_lock(SPEAKER_SELECTION_PATH)
-            selection_guard.__enter__()
-            selection_guard_entered = True
-        if target and not target.get("legacy", False):
-            label = "operator config" if target.get("operator_config") else "generated config"
-            on_disk = load_yaml_mapping(Path(file_path), label)
-            if config_digest(on_disk) != target["digest"]:
-                raise RuntimeError(f"{label} integrity check failed")
-        if target and target.get("selection_revision") is not None:
-            current_selection = current_speaker_selection()
-            if (
-                current_selection["selected"] != target["speaker"]
-                or current_selection["revision"] != target["selection_revision"]
-            ):
-                raise RuntimeError("speaker selection changed before config reload")
-        previous_clock = _switch_motu_clock(cdsp, target)
-        cdsp.config.set_file_path(file_path)
-        cdsp.general.reload()
-        _await_reload(cdsp, file_path, settle_time)
-        if target:
-            expected = target.get("expected_config")
-            if expected is not None:
-                _await_active_config(cdsp, file_path, expected)
-
-        if target and target.get("selection_revision") is not None:
-            current_selection = current_speaker_selection()
-            if (
-                current_selection["selected"] != target["speaker"]
-                or current_selection["revision"] != target["selection_revision"]
-            ):
-                raise RuntimeError("speaker selection changed during config transition")
-
-        # Re-assert the owned EQ overlay before sound returns.
-        if target:
-            ensure_audio_eq(
-                cdsp,
-                speaker_id=target["speaker"],
-                state=target.get("audio_state"),
-            )
-        else:
-            ensure_audio_eq(cdsp)
-        if target and target.get("selection_revision") is not None:
-            current_selection = current_speaker_selection()
-            if (
-                current_selection["selected"] != target["speaker"]
-                or current_selection["revision"] != target["selection_revision"]
-            ):
-                raise RuntimeError("speaker selection changed before unmute")
-        maximum = target_volume_limit(target)
-        restored_volume = min(previous_volume, maximum)
-        if restored_volume != previous_volume:
-            print(
-                f"Volume clamped for speaker profile: {previous_volume:+.1f} "
-                f"-> {restored_volume:+.1f}dB",
-                flush=True,
-            )
-        cdsp.volume.set_main_volume(restored_volume)
-        if target:
-            _write_speaker_status(
-                {
-                    "selected": target["speaker"],
-                    "applied": target["speaker"],
-                    "source": target["source"],
-                    "config_path": file_path,
-                    "config_digest": target["digest"],
-                    "capabilities": target.get("capabilities", {}),
-                    "selection_revision": target.get("selection_revision"),
-                    # The ceiling every control surface reads back. Only a
-                    # successful apply publishes one; the failure payloads
-                    # below deliberately omit it so readers fail closed.
-                    "volume_limit_db": maximum,
-                    "ok": True,
-                    "error": "",
-                    "updated_at": time.time(),
-                }
-            )
-        # Bind readiness to this engine instance before sound may return: the
-        # marker lives in the live config only, so an engine that restarts or
-        # reloads comes back without it and every consumer inhibits on its own.
-        generation = engine_generation()
-        stamp_engine_generation(
-            cdsp,
-            generation,
-            timeout=CONFIG_APPLY_TIMEOUT,
-            poll_interval=CONFIG_APPLY_POLL_INTERVAL,
-        )
-        # A listener who muted after previous_mute was captured -- between
-        # recovery retries, say -- asked for silence more recently than it.
-        # Consumed only after the mute call succeeded, so a failed attempt
-        # cannot lose the request and let a retry unmute over it.
-        if mute_request_path(AUDIO_READY_PATH).exists():
-            previous_mute = True
-        cdsp.volume.set_main_mute(previous_mute)
-        discard_mute_request(AUDIO_READY_PATH)
-        clear_pending_transition(target)
-        clear_audio_inhibit(
-            AUDIO_READY_PATH,
-            generation=generation,
-            applied={
-                "config_path": file_path,
-                "config_digest": target.get("digest", "") if target else "",
-                "source": target.get("source") if target else None,
-                "speaker": target.get("speaker") if target else None,
-                "selection_revision": (
-                    target.get("selection_revision") if target else None
-                ),
-            },
-        )
-        if (
-            target
-            and not target.get("legacy", False)
-            and not target.get("operator_config", False)
-        ):
-            removed = prune_generated_configs(
-                SPEAKER_GENERATED_DIR,
-                protected_paths=(Path(file_path),),
-            )
-            if removed:
-                print(f"Pruned {removed} old generated config(s)", flush=True)
-    except Exception as exc:
-        # Failure handling is fail-closed before any rollback I/O. The ready
-        # token stays absent even if the mute RPC response is ambiguous.
+        previous_clock: str | None = None
         try:
-            set_audio_inhibit(AUDIO_READY_PATH)
-            cdsp.volume.set_main_mute(True)
-        except Exception:
-            pass
-        rollback_ok = False
-        _restore_motu_clock(cdsp, previous_clock)
-        if previous_path and os.path.exists(previous_path):
-            try:
-                cdsp.config.set_file_path(previous_path)
-                cdsp.general.reload()
-                time.sleep(settle_time)
-                rollback_state = _processing_state(cdsp)
-                rollback_active = cdsp.config.active()
-                rollback_ok = (
-                    rollback_state in {"running", "paused"}
-                    and same_config(cdsp.config.file_path(), previous_path)
-                    and previous_expected is not None
-                    and _accepted_config_matches(
-                        cdsp, previous_path, rollback_active, previous_expected
-                    )
+            if target and target.get("selection_revision") is not None:
+                locks.enter_context(speaker_selection_lock(SPEAKER_SELECTION_PATH))
+            if target and not target.get("legacy", False):
+                label = (
+                    "operator config"
+                    if target.get("operator_config")
+                    else "generated config"
                 )
-            except Exception as rollback_exc:
-                print(f"Config rollback failed: {rollback_exc}", flush=True)
-        # Never unmute automatically after an uncertain profile transition.
-        try:
-            cdsp.volume.set_main_mute(True)
-        except Exception:
-            pass
-        if target:
-            _write_speaker_status(
-                {
-                    "selected": target["speaker"],
-                    "applied": speaker_for_config(previous_path),
-                    "source": source_for_config(previous_path),
-                    "config_path": previous_path,
-                    "config_digest": "",
-                    "ok": False,
-                    "rollback_ok": rollback_ok,
-                    "error": str(exc),
-                    "updated_at": time.time(),
-                }
-            )
-        raise
-    finally:
-        if selection_guard_entered:
-            selection_guard.__exit__(None, None, None)
-        if audio_guard_entered:
-            assert audio_guard is not None
-            audio_guard.__exit__(None, None, None)
+                on_disk = load_yaml_mapping(Path(file_path), label)
+                if config_digest(on_disk) != target["digest"]:
+                    raise RuntimeError(f"{label} integrity check failed")
+            _require_selection_unchanged(target, "before config reload")
+            previous_clock = _switch_motu_clock(cdsp, target)
+            cdsp.config.set_file_path(file_path)
+            cdsp.general.reload()
+            _await_reload(cdsp, file_path, settle_time)
+            _require_selection_unchanged(target, "during config transition")
+
+            # Re-assert the owned EQ overlay before sound returns.
+            if target:
+                ensure_audio_eq(
+                    cdsp,
+                    speaker_id=target["speaker"],
+                    state=target.get("audio_state"),
+                )
+            else:
+                ensure_audio_eq(cdsp)
+            _require_selection_unchanged(target, "before unmute")
+            maximum = target_volume_limit(target)
+            restored_volume = min(previous_volume, maximum)
+            if restored_volume != previous_volume:
+                print(
+                    f"Volume clamped for speaker profile: {previous_volume:+.1f} "
+                    f"-> {restored_volume:+.1f}dB",
+                    flush=True,
+                )
+            cdsp.volume.set_main_volume(restored_volume)
+            if target:
+                _write_speaker_status(
+                    {
+                        "selected": target["speaker"],
+                        "applied": target["speaker"],
+                        "source": target["source"],
+                        "config_path": file_path,
+                        "config_digest": target["digest"],
+                        "capabilities": target.get("capabilities", {}),
+                        "selection_revision": target.get("selection_revision"),
+                        # The ceiling every control surface reads back. Only a
+                        # successful apply publishes one; the failure payloads
+                        # below deliberately omit it so readers fail closed.
+                        "volume_limit_db": maximum,
+                        "ok": True,
+                        "error": "",
+                        "updated_at": time.time(),
+                    }
+                )
+            cdsp.volume.set_main_mute(restore_mute)
+            if (
+                target
+                and not target.get("legacy", False)
+                and not target.get("operator_config", False)
+            ):
+                removed = prune_generated_configs(
+                    SPEAKER_GENERATED_DIR,
+                    protected_paths=(Path(file_path),),
+                )
+                if removed:
+                    print(f"Pruned {removed} old generated config(s)", flush=True)
+        except Exception as exc:
+            # Fail closed: stay muted, put the previous config back, and never
+            # unmute automatically after an uncertain transition.
+            try:
+                cdsp.volume.set_main_mute(True)
+            except Exception:
+                pass
+            rollback_ok = False
+            _restore_motu_clock(cdsp, previous_clock)
+            if previous_path and os.path.exists(previous_path):
+                try:
+                    cdsp.config.set_file_path(previous_path)
+                    cdsp.general.reload()
+                    _await_reload(cdsp, previous_path, settle_time)
+                    rollback_ok = True
+                except Exception as rollback_exc:
+                    print(f"Config rollback failed: {rollback_exc}", flush=True)
+            try:
+                cdsp.volume.set_main_mute(True)
+            except Exception:
+                pass
+            if target:
+                _write_speaker_status(
+                    {
+                        "selected": target["speaker"],
+                        "applied": speaker_for_config(previous_path),
+                        "source": source_for_config(previous_path),
+                        "config_path": previous_path,
+                        "config_digest": "",
+                        "ok": False,
+                        "rollback_ok": rollback_ok,
+                        "error": str(exc),
+                        "updated_at": time.time(),
+                    }
+                )
+            raise
 
 
 def log_idle(source: str, seconds: float, limit: float = IDLE_TIMEOUT) -> None:
@@ -2234,29 +1901,11 @@ def arbitrate(
 
 
 def mute_for_startup_validation(cdsp: CamillaClient) -> bool:
-    """Capture desired mute, then fail closed before any startup validation."""
+    """Capture the listener's mute state, then mute until a config is applied."""
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        restore_mute = capture_restore_mute(cdsp)
+        restore_mute = bool(cdsp.volume.main_mute())
         cdsp.volume.set_main_mute(True)
     return restore_mute
-
-
-def apply_arbitrated_config(
-    cdsp: CamillaClient,
-    target: dict,
-    startup_restore_mute: bool | None,
-    *,
-    settle_time: float = SETTLE_TIME,
-) -> None:
-    """Apply the first selected source with the pre-start mute preference."""
-    apply_config(
-        cdsp,
-        target["path"],
-        settle_time=settle_time,
-        target=target,
-        restore_mute=startup_restore_mute,
-    )
-    return None
 
 
 def main() -> int:
@@ -2266,8 +1915,6 @@ def main() -> int:
         "-> 3) TOSLINK meters -> 4) Analog meters -> idle keep-last",
         flush=True,
     )
-    with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        set_audio_inhibit(AUDIO_READY_PATH)
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
     # The one MOTU client on this host: meters, clock and main volume.
     global _motu
@@ -2284,47 +1931,41 @@ def main() -> int:
     last_error_message = None
     next_audio_eq_check = 0.0
     clock_reconciler = ClockReconciler()
-    startup_restore_mute: bool | None = None
+    # Whether a config has been applied (muted, reloaded, checked) on this
+    # CamillaDSP connection.  Until then the engine is kept muted.
+    applied = False
+    # The listener's mute state from before the switcher first muted an engine
+    # it has not applied a config to; the next successful apply puts it back.
+    restore_mute: bool | None = None
     startup_configs_validated = False
     recovery = ConfigRecoveryGuard()
+
+    def applied_ok() -> None:
+        nonlocal applied, restore_mute
+        applied = True
+        restore_mute = None
 
     while True:
         try:
             if not cdsp.is_connected():
                 cdsp.connect()
-                # A new websocket may be a new engine process.  Rotate the
-                # generation and drop the token: whatever was verified belonged
-                # to the connection that just ended, and startup validation has
-                # to run again before audio may return.
-                rotate_engine_generation()
-                with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-                    set_audio_inhibit(AUDIO_READY_PATH)
-                startup_restore_mute = None
+                # A new websocket may be a new engine process: whatever was
+                # applied belonged to the connection that just ended.
+                applied = False
+                restore_mute = None
                 startup_configs_validated = False
                 print("Connected to CamillaDSP", flush=True)
+
+            if not applied and restore_mute is None:
+                # Mute before anything else, recovery included, and remember
+                # what the listener had so a boot that needed recovery does not
+                # come back silent.
+                restore_mute = mute_for_startup_validation(cdsp)
 
             if not recovery.ready(cdsp, time.monotonic()):
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            # One engine round-trip per pass decides readiness for the whole
-            # iteration: the token must exist, belong to this switcher run, and
-            # name the generation the live engine instance still carries.
-            inhibited = audio_inhibit_active(
-                AUDIO_READY_PATH, cdsp, generation=engine_generation()
-            )
-            if inhibited:
-                # An engine that dropped the marker without dropping the
-                # connection (restart, external reload, foreign set_active) is
-                # unverified; make that visible to every other control now.
-                with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-                    set_audio_inhibit(AUDIO_READY_PATH)
-
-            recovered_mute = recovery.take_restore_mute()
-            if startup_restore_mute is None and recovered_mute is not None:
-                startup_restore_mute = recovered_mute
-            if startup_restore_mute is None and inhibited:
-                startup_restore_mute = mute_for_startup_validation(cdsp)
             current_config = cdsp.config.file_path()
             selection = current_speaker_selection()
             selected_speaker = selection["selected"]
@@ -2332,10 +1973,6 @@ def main() -> int:
                 # Missing configs now fail only after the live engine is muted.
                 validate_configs(selected_speaker)
                 startup_configs_validated = True
-            if inhibited:
-                requested_mute = pending_transition_mute(selection)
-                if requested_mute is not None:
-                    startup_restore_mute = requested_mute
             current_identity = managed_config_identity(current_config)
             current_source = current_identity[0] if current_identity else None
             current_speaker = current_identity[1] if current_identity else None
@@ -2349,39 +1986,24 @@ def main() -> int:
                 current_config=current_config,
             )
 
-            # A restart — of this switcher or of the engine — begins inhibited.
-            # Re-apply even a matching managed config once so provenance,
-            # Camilla validation, overlays, and the selected revision are all
-            # verified before controls may unmute.
+            # A restart — of this switcher or of the engine — re-applies even a
+            # matching managed config once, so provenance, Camilla validation,
+            # overlays and the selected revision are all checked before the
+            # listener's mute state comes back.
             if (
-                inhibited
+                not applied
                 and current_source
                 and current_speaker == selected_speaker
             ):
-                transition_guard = audio_control_lock(AUDIO_CONTROL_LOCK_PATH)
-                transition_guard.__enter__()
-                try:
-                    restore_mute = (
-                        startup_restore_mute
-                        if startup_restore_mute is not None
-                        else capture_restore_mute(cdsp)
-                    )
-                    cdsp.volume.set_main_mute(True)
-                    target = resolve_config_target(
-                        current_source,
-                        selected_speaker,
-                        selection_revision=selection["revision"],
-                    )
-                    apply_config(
-                        cdsp,
-                        target["path"],
-                        target=target,
-                        restore_mute=restore_mute,
-                        audio_lock_held=True,
-                    )
-                    startup_restore_mute = None
-                finally:
-                    transition_guard.__exit__(None, None, None)
+                target = resolve_config_target(
+                    current_source,
+                    selected_speaker,
+                    selection_revision=selection["revision"],
+                )
+                apply_config(
+                    cdsp, target["path"], target=target, restore_mute=restore_mute
+                )
+                applied_ok()
                 time.sleep(CHECK_INTERVAL)
                 continue
 
@@ -2397,29 +2019,24 @@ def main() -> int:
             if current_config and (
                 current_speaker != selected_speaker or profile_edit_pending
             ):
-                transition_guard = audio_control_lock(AUDIO_CONTROL_LOCK_PATH)
-                transition_guard.__enter__()
                 try:
-                    restore_mute = (
-                        startup_restore_mute
-                        if startup_restore_mute is not None
-                        else capture_restore_mute(cdsp)
-                    )
-                    set_audio_inhibit(AUDIO_READY_PATH)
-                    cdsp.volume.set_main_mute(True)
                     if not current_source:
-                        error = (
+                        raise RuntimeError(
                             "active CamillaDSP config is not managed; "
                             "speaker transition is latched muted"
                         )
-                        raise RuntimeError(error)
                     target = resolve_config_target(
                         current_source,
                         selected_speaker,
                         selection_revision=selection["revision"],
                     )
                 except Exception as exc:
+                    # The selected speaker cannot be served: stay muted rather
+                    # than keep playing the previous speaker's graph.
                     try:
+                        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+                            cdsp.volume.set_main_mute(True)
+                    finally:
                         _write_speaker_status(
                             {
                                 "selected": selected_speaker,
@@ -2433,20 +2050,11 @@ def main() -> int:
                                 "updated_at": time.time(),
                             }
                         )
-                    finally:
-                        transition_guard.__exit__(None, None, None)
                     raise
-                try:
-                    apply_config(
-                        cdsp,
-                        target["path"],
-                        target=target,
-                        restore_mute=restore_mute,
-                        audio_lock_held=True,
-                    )
-                    startup_restore_mute = None
-                finally:
-                    transition_guard.__exit__(None, None, None)
+                apply_config(
+                    cdsp, target["path"], target=target, restore_mute=restore_mute
+                )
+                applied_ok()
                 time.sleep(CHECK_INTERVAL)
                 continue
 
@@ -2476,7 +2084,7 @@ def main() -> int:
 
             # A clock the MOTU reports wrong (a failed in-transition write, or
             # one changed from CueMix 5) is corrected muted, here.
-            if not inhibited:
+            if applied:
                 try:
                     clock_reconciler.run(cdsp, current_source, now)
                 except Exception as exc:
@@ -2638,9 +2246,10 @@ def main() -> int:
                 if target is not None and not same_config(
                     current_config, target["path"]
                 ):
-                    startup_restore_mute = apply_arbitrated_config(
-                        cdsp, target, startup_restore_mute
+                    apply_config(
+                        cdsp, target["path"], target=target, restore_mute=restore_mute
                     )
+                    applied_ok()
                 elif DEBUG_MODE:
                     print(
                         f"-> Idle: keeping {os.path.basename(current_config or '')}",
@@ -2677,12 +2286,14 @@ def main() -> int:
                 last_manual_error = None
 
             if not same_config(current_config, target["path"]):
-                startup_restore_mute = apply_arbitrated_config(
+                apply_config(
                     cdsp,
-                    target,
-                    startup_restore_mute,
+                    target["path"],
                     settle_time=1.5 if decision.source == "gadget" else SETTLE_TIME,
+                    target=target,
+                    restore_mute=restore_mute,
                 )
+                applied_ok()
                 if decision.manual:
                     # The meters describe an input the operator has taken out
                     # of the running; do not carry their history forward.
@@ -2695,12 +2306,8 @@ def main() -> int:
 
         except Exception as exc:
             # An unhandled fault leaves the engine unverified from here on:
-            # drop the token and re-run startup validation before audio may
-            # return, whatever the fault was.
-            try:
-                set_audio_inhibit(AUDIO_READY_PATH)
-            except Exception:
-                pass
+            # mute and re-apply before the listener's mute state comes back.
+            applied = False
             startup_configs_validated = False
             # Throttle identical errors to once per 30s. A CamillaDSP outage
             # otherwise floods the journal (~430 lines/incident observed) and

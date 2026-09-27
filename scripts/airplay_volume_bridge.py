@@ -42,11 +42,6 @@ AUDIO_CONTROL_LOCK_PATH = Path(
         "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
     )
 )
-AUDIO_READY_PATH = Path(
-    os.environ.get(
-        "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
-    )
-)
 SPEAKER_STATUS_PATH = Path(
     os.environ.get(
         "SPEAKER_STATUS_PATH",
@@ -189,12 +184,7 @@ def set_mapped_volume(
     # copy in /usr/local/libexec merely to send a datagram; deployment helpers
     # used by the daemon live beside the daemon script and may not be installed
     # beside that callback copy.
-    from speaker_profiles import (
-        audio_control_lock,
-        note_mute_request,
-        require_audio_unmute_allowed,
-        volume_ceiling,
-    )
+    from speaker_profiles import audio_control_lock, volume_ceiling
 
     # A network sender's 100% maps onto VOLUME_MAX_DB, which knows nothing
     # about the speaker profile in service. The ceiling the switcher verified
@@ -204,10 +194,6 @@ def set_mapped_volume(
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
         capped_db = min(mapped_db, ceiling)
-        if muted:
-            note_mute_request(AUDIO_READY_PATH)
-        else:
-            require_audio_unmute_allowed(AUDIO_READY_PATH, client)
         client.volume.set_main_volume(capped_db)
         client.volume.set_main_mute(muted)
     result = {
@@ -549,15 +535,15 @@ def read_camilla_volume(client) -> tuple[float, bool]:
     )
 
 
-def read_mirrorable_camilla_volume(client) -> tuple[float, bool] | None:
-    """Read a stable master state, or pause while a config transition owns it."""
-    from speaker_profiles import audio_control_lock, require_audio_unmute_allowed
+def read_mirrorable_camilla_volume(client) -> tuple[float, bool]:
+    """Read the master state under the audio-control lock.
+
+    The lock waits out a config transition, so the switcher's brief safety
+    mute during a switch is not mirrored to a sender.
+    """
+    from speaker_profiles import audio_control_lock
 
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-        try:
-            require_audio_unmute_allowed(AUDIO_READY_PATH, client)
-        except RuntimeError:
-            return None
         return read_camilla_volume(client)
 
 
@@ -787,14 +773,8 @@ def run_daemon() -> int:
                     )
 
                 current = read_mirrorable_camilla_volume(camilla)
-                if current is None:
-                    status["spotify"]["paused_for_transition"] = True
-                else:
-                    status["spotify"].pop("paused_for_transition", None)
                 tracker_now = time.monotonic()
-                if current is not None and (
-                    last_camilla is None or current != last_camilla
-                ):
+                if last_camilla is None or current != last_camilla:
                     spotify_volume = map_camilla_to_spotify(
                         current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB
                     )
@@ -808,9 +788,7 @@ def run_daemon() -> int:
                             "muted": current[1],
                         }
                     )
-                elif current is not None and spotify_sync.needs_heartbeat(
-                    tracker_now
-                ):
+                elif spotify_sync.needs_heartbeat(tracker_now):
                     spotify_sync.queue(
                         map_camilla_to_spotify(
                             current[0], current[1], VOLUME_MIN_DB, VOLUME_MAX_DB

@@ -70,30 +70,37 @@ def test_volume_api_rejects_nonfinite_and_boolean_values() -> None:
     assert applied == []
 
 
-def test_blocked_unmute_does_not_partially_apply_volume() -> None:
-    applied: list[float] = []
+def test_ui_volume_and_mute_writes_wait_for_the_audio_control_lock(
+    tmp_path: Path,
+) -> None:
+    """A config transition holds the lock; a UI unmute waits it out."""
+    import threading
+
+    writes: list[tuple[str, object]] = []
     client = SimpleNamespace(
         volume=SimpleNamespace(
             main_volume=lambda: -20.0,
-            set_main_volume=applied.append,
+            set_main_volume=lambda value: writes.append(("volume", value)),
+            set_main_mute=lambda value: writes.append(("mute", value)),
         )
     )
+    lock_path = tmp_path / "audio.lock"
     with (
         patch.object(web_ui, "camilla_client", return_value=nullcontext(client)),
-        patch.object(web_ui, "audio_control_lock", return_value=nullcontext()),
-        patch.object(
-            web_ui,
-            "require_audio_unmute_allowed",
-            side_effect=RuntimeError("audio inhibited"),
-        ),
+        patch.object(web_ui, "AUDIO_CONTROL_LOCK_PATH", lock_path),
+        patch.object(web_ui, "SPEAKER_STATUS_PATH", tmp_path / "status.json"),
+        patch.object(web_ui, "camilla_status", return_value={}),
     ):
-        try:
-            web_ui.set_camilla_volume({"volume_db": -10, "muted": False})
-        except RuntimeError as exc:
-            assert "inhibited" in str(exc)
-        else:
-            raise AssertionError("blocked unmute was accepted")
-    assert applied == []
+        with speaker_profiles.audio_control_lock(lock_path):
+            worker = threading.Thread(
+                target=web_ui.set_camilla_volume,
+                args=({"volume_db": -25, "muted": False},),
+            )
+            worker.start()
+            worker.join(0.3)
+            assert writes == []
+        worker.join(5)
+    assert writes == [("volume", -25.0), ("mute", False)]
 
 
 def test_live_meter_recovers_from_invalid_levels_and_ignores_nonfinite_values() -> None:
@@ -190,32 +197,11 @@ def test_web_audio_save_holds_speaker_selection_lock_through_commit(
     assert selection_locked is False
 
 
-def test_web_speaker_selection_mutes_and_removes_ready_token(tmp_path: Path) -> None:
+def test_web_speaker_selection_only_commits_and_leaves_mute_to_the_switcher(
+    tmp_path: Path,
+) -> None:
+    """The switcher mutes, switches and restores the listener's mute itself."""
     selection_path = tmp_path / "selection.json"
-    ready_path = tmp_path / "ready.json"
-    speaker_profiles.clear_audio_inhibit(ready_path, generation="c" * 32)
-
-    class Volume:
-        muted = False
-
-        def main_mute(self) -> bool:
-            return self.muted
-
-        def set_main_mute(self, value: bool) -> None:
-            self.muted = value
-
-    volume = Volume()
-
-    class Client:
-        def __init__(self, *_args: object) -> None:
-            self.volume = volume
-
-        def connect(self) -> None:
-            pass
-
-        def disconnect(self) -> None:
-            pass
-
     catalog = {
         "kantarellen": {"id": "kantarellen", "available": True},
         "partymeh": {"id": "partymeh", "available": True},
@@ -225,78 +211,49 @@ def test_web_speaker_selection_mutes_and_removes_ready_token(tmp_path: Path) -> 
         patch.object(web_ui, "SPEAKER_AUDIO_DIR", tmp_path / "audio"),
         patch.object(web_ui, "AUDIO_EQ_PATH", tmp_path / "legacy.json"),
         patch.object(web_ui, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
-        patch.object(web_ui, "AUDIO_READY_PATH", ready_path),
-        patch.object(
-            web_ui, "SPEAKER_TRANSITION_PATH", tmp_path / "transition.json"
-        ),
         patch.object(web_ui, "profile_catalog", return_value=catalog),
         patch.object(web_ui, "preflight_speaker_profile"),
         patch.object(web_ui, "require_active_source_supported", return_value="streamer"),
-        patch.dict(sys.modules, {"camilladsp": SimpleNamespace(CamillaClient=Client)}),
+        patch.object(
+            web_ui, "camilla_client", side_effect=AssertionError("engine touched")
+        ),
         patch.object(web_ui, "speaker_payload", return_value={"ok": True}),
     ):
         result = web_ui.select_speaker(
             {"selected": "partymeh", "revision": 0, "confirm": "SWITCH"}
         )
-    assert result == {"ok": True}
-    assert volume.muted is True
-    assert not ready_path.exists()
-    assert speaker_profiles.read_speaker_selection(selection_path)["selected"] == "partymeh"
-    transition = json.loads((tmp_path / "transition.json").read_text())
-    assert transition == {
-        "version": 1,
-        "revision": 1,
-        "selected": "partymeh",
-        "restore_mute": False,
-    }
-
-
-def test_stale_web_speaker_selection_does_not_mute_or_remove_ready(
-    tmp_path: Path,
-) -> None:
-    selection_path = tmp_path / "selection.json"
-    ready_path = tmp_path / "ready.json"
-    speaker_profiles.clear_audio_inhibit(ready_path, generation="c" * 32)
-    muted: list[bool] = []
-
-    class Client:
-        def __init__(self, *_args: object) -> None:
-            self.volume = SimpleNamespace(
-                set_main_mute=lambda value: muted.append(value)
-            )
-
-        def connect(self) -> None:
-            pass
-
-        def disconnect(self) -> None:
-            pass
-
-    catalog = {
-        "kantarellen": {"id": "kantarellen", "available": True},
-        "partymeh": {"id": "partymeh", "available": True},
-    }
-    with (
-        patch.object(web_ui, "SPEAKER_SELECTION_PATH", selection_path),
-        patch.object(web_ui, "SPEAKER_AUDIO_DIR", tmp_path / "audio"),
-        patch.object(web_ui, "AUDIO_EQ_PATH", tmp_path / "legacy.json"),
-        patch.object(web_ui, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"),
-        patch.object(web_ui, "AUDIO_READY_PATH", ready_path),
-        patch.object(web_ui, "profile_catalog", return_value=catalog),
-        patch.object(web_ui, "preflight_speaker_profile"),
-        patch.object(web_ui, "require_active_source_supported", return_value="streamer"),
-        patch.dict(sys.modules, {"camilladsp": SimpleNamespace(CamillaClient=Client)}),
-    ):
         try:
             web_ui.select_speaker(
-                {"selected": "partymeh", "revision": 99, "confirm": "SWITCH"}
+                {"selected": "kantarellen", "revision": 99, "confirm": "SWITCH"}
             )
         except ValueError as exc:
             assert "changed elsewhere" in str(exc)
         else:
             raise AssertionError("stale speaker selection was accepted")
-    assert muted == []
-    assert ready_path.is_file()
-    assert speaker_profiles.read_speaker_selection(selection_path)["selected"] == "kantarellen"
+    assert result == {"ok": True}
+    selection = speaker_profiles.read_speaker_selection(selection_path)
+    assert selection["selected"] == "partymeh"
+    assert selection["revision"] == 1
+
+
+def test_speaker_payload_is_ready_once_the_selected_revision_is_applied(
+    tmp_path: Path,
+) -> None:
+    selection_path = tmp_path / "selection.json"
+    status_path = tmp_path / "status.json"
+    speaker_profiles.update_speaker_selection(selection_path, "partymeh")
+    with (
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", selection_path),
+        patch.object(web_ui, "SPEAKER_STATUS_PATH", status_path),
+        patch.object(web_ui, "installed_profile_catalog", return_value={}),
+    ):
+        assert web_ui.speaker_payload()["ready"] is False
+        status_path.write_text(json.dumps({"ok": True, "selection_revision": 0}))
+        assert web_ui.speaker_payload()["ready"] is False
+        status_path.write_text(json.dumps({"ok": True, "selection_revision": 1}))
+        assert web_ui.speaker_payload()["ready"] is True
+        status_path.write_text(json.dumps({"ok": False, "selection_revision": 1}))
+        assert web_ui.speaker_payload()["ready"] is False
 
 
 def test_audio_eq_ui_write_rejects_stale_revision(tmp_path: Path) -> None:
@@ -449,7 +406,6 @@ def test_speaker_profile_deployment_and_gui_contract_are_present() -> None:
         "SOURCE_BASE_DIR",
         "SPEAKER_GENERATED_DIR",
         "AUDIO_CONTROL_LOCK_PATH",
-        "AUDIO_READY_PATH",
     ):
         assert setting in installer
     assert 'id="speakerProfiles"' in web_ui.HTML

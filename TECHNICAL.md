@@ -32,68 +32,52 @@ contract.
 
 Generated files live under
 `SPEAKER_GENERATED_DIR/<sha256>/<source>--<speaker>.yml`. Both the digest and
-managed-path provenance are checked before use. The ready-token and shared
-audio-control lock make reload a fail-closed transaction: inhibit → mute →
-validate/reload/verify → overlay → stamp the engine generation → restore
-requested mute → publish ready.
-Rollback always re-inhibits and asserts mute before loading the previous graph.
+managed-path provenance are checked before use.
 
-The "requested mute" is the listener's state captured *before* the transition's
-own safety mute, and recovery can carry it across several failed attempts. A
-listener who mutes in between only sets a flag the switcher already set, so
-every mute writer (control UI, remote, AirPlay/Spotify bridge) that mutes while
-the ready token is absent also leaves `mute-request.json` beside the token.
-The switcher consumes that file only after the restore's final mute call has
-succeeded, so a mute requested after any capture keeps the restored output
-muted, even when the restore uses an older captured value (a speaker change's
-transition file) or its first attempt fails. A leftover request can only err
-toward silence. Unmuting while inhibited is refused, as before.
+### Config transitions
 
-After a reload, `SOURCE_SETTLE_TIME` (default 2 s; 1.5 s for the USB gadget) is only a grace period
-before the first look. The engine is then polled until it reports Running or
-Paused on the requested file, within the same `SOURCE_CONFIG_APPLY_TIMEOUT`
-(measured from the reload) as the active-config read-back, so a slow Starting
-phase is not mistaken for a failure and rolled back.
+Every config switch runs inside the shared audio-control lock
+(`AUDIO_CONTROL_LOCK_PATH`): read the listener's mute state → mute →
+integrity/selection checks → MOTU clock (if it changes) → reload → check →
+EQ overlay → volume clamp → publish status → restore the listener's mute
+state. The file is checked with `camilladsp -c` (`validate_config_file`)
+before the reload. After the reload, `SOURCE_SETTLE_TIME` (default 2 s; 1.5 s
+for the USB gadget) is only a grace period before the first look; the check
+is simply that the engine reports Running or Paused on the requested config
+path within `SOURCE_CONFIG_APPLY_TIMEOUT` (measured from the reload), so a
+slow Starting phase is not mistaken for a failure.
 
-Readiness is scoped to one CamillaDSP *instance*, not to the boot. CamillaDSP
-4.1.3 exposes no process id over its websocket, so the switcher synthesizes an
-engine generation, rotates it on every (re)connection, and writes it into the
-live config's `description` with `SetConfigValue` (falling back to a whole
-config write). The ready token records the same generation next to the applied
-config path, digest, source, speaker and selection revision; consumers compare
-the two with one `GetConfigDescription` on the client they already hold. An
-engine restart, a reload from file, a recovery reload, a websocket reconnect,
-or any unhandled error in the switcher loop all invalidate readiness, and the
-loop re-applies the selected config through the same muted, verified path
-before audio can return.
+Any failure reloads the previous config (checked the same way) and leaves the
+engine muted: the switcher never unmutes after an uncertain transition. The
+listener unmutes when they choose to, and until a later apply succeeds the
+controls hold the fail-safe volume ceiling (below).
 
-The marker is a handshake, not proof of engine identity or config integrity:
-consumers only check the description. A foreign `SetConfig`/`SetConfigValue`
-that keeps the description (for example a routing change made through the
-engine's websocket) keeps readiness, and a marked config saved to disk and
-loaded into another instance carries the marker with it. The switcher assumes
-it is the only writer of the live graph; nothing enforces that.
+The remote, the AirPlay/Spotify bridge and the control UI take the same lock
+around every volume or mute write, so a change made mid-switch simply waits
+for the switch to finish. There is no other coordination: no ready token, no
+mute-request file.
+
+The switcher keeps the engine muted until it has applied a config on its
+current CamillaDSP connection. When it starts, and whenever it reconnects, it
+reads the listener's mute state, mutes, and remembers that state; boot
+recovery (below) then runs muted, and the first successful apply - a re-apply
+of the current managed config, a speaker change, or a source switch - restores
+it. Any unhandled error in the loop starts this over. A speaker change from the
+control UI only commits the new selection; the switcher's next pass (within
+about a second) does the muted switch itself.
+
+Accepted gap: CamillaDSP 4.1.3 exposes no process identity, so an engine that
+crashes and restarts by itself is noticed only when the switcher's websocket
+reconnects. Until then a control could unmute the restarted engine. An
+explicit engine restart restarts the switcher too (`PartOf=`).
 
 CamillaDSP answers `SetConfig` and `SetConfigValue` once the change is
-*queued*, not applied. Every live-config write here - reload, EQ overlay
-(including the measurement bypass), readiness stamp - therefore polls for its
-own expected state against `SOURCE_CONFIG_APPLY_TIMEOUT` instead of reading back
-once. The stamp falls back to a whole-config write only when `SetConfigValue`
-was rejected or never took within that deadline. An EQ write is confirmed only
-when the whole filter set and pipeline match, so a bypass that has not yet
-removed a legacy Bass/Treble/Loudness stage, or an engine reporting no config,
-never reads as done.
-
-The reload read-back compares against the config *captured* at resolve time
-(digest-checked for managed targets), never a fresh read of the file: an
-operator file edited between the integrity check and the reload is what the
-engine loads, and must not be able to verify itself. The engine normalizes the
-captured mapping (`ReadConfig`), and the preprocessing a reload applies is
-added on top (`$samplerate$`/`$channels$` tokens, relative Conv coefficient
-paths resolved against the canonical config directory), because `ReadConfig`
-skips that step. A swapped file therefore fails verification and rolls back
-muted; the engine is not handed an immutable snapshot, so the edit is rejected
-rather than prevented.
+*queued*, not applied, so the EQ overlay write (including the measurement
+bypass) polls for its own expected state against `SOURCE_CONFIG_APPLY_TIMEOUT`
+instead of reading back once. An EQ write is confirmed only when the whole
+filter set and pipeline match, so a bypass that has not yet removed a legacy
+Bass/Treble/Loudness stage, or an engine reporting no config, never reads as
+done.
 
 ### Volume limits
 
@@ -114,7 +98,7 @@ or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
 
-I've created Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control runs on its own. The source switcher is the control core, and the MOTU's only client (clock, meters, main volume): it is the only writer of the audio-ready token that permits an unmute, and the only thing that applies a persisted tone/EQ edit, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
+I've created Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control runs on its own. The source switcher is the control core, and the MOTU's only client (clock, meters, main volume): it is the only thing that applies a persisted tone/EQ or speaker change and the only publisher of the volume ceiling, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
 
 ## Installation
 
@@ -212,7 +196,7 @@ device already reports is not written again: every write re-locks and clicks.
 A failed write does not fail the transition, but it is never retried on live
 audio. When the device reports a clock other than the source's - a write that
 failed or did not take, or a clock changed from CueMix 5 - the switcher's loop
-notices and, while readiness is held and at most once per
+notices and, once a config has been applied and at most once per
 `MOTU_CLOCK_RETRY_SECONDS`, runs a small muted correction under the lock:
 mute, the same silent write, settle and check, then the listener's previous
 mute state.
@@ -293,7 +277,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
 - **Keep-last idle behavior** - When all sources are idle, the default is to leave the current config alone. Set `SOURCE_IDLE_MODE=toslink` to restore the older always-fallback behavior.
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
-- **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched. The reload only happens once the engine reads back as muted; if the lock, the token removal, the mute request or its read-back fails, that attempt is skipped
+- **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched. The switcher has already muted (and remembered the listener's mute state) when it connected; recovery mutes again and reloads only once the engine reads back as muted. If the lock, the mute request or its read-back fails, that attempt is skipped. The next pass then re-applies the recovered config through the normal muted transition, which restores the remembered mute state
 
 **Priority logic explained:**
 
@@ -512,25 +496,19 @@ journalctl -u cdsp-remote -f
 ## Can I Use Just One?
 
 Trigger control is independent. The source switcher is a
-required dependency of every component that unmutes or edits tone: the remote,
-the AirPlay/Spotify volume bridge and the web control UI all call
-`speaker_profiles.require_audio_unmute_allowed()` before unmuting, and
-`clear_audio_inhibit()` - the only thing that grants it - is called from
-`scripts/source_switcher.py` alone. The switcher is likewise the only applier
-of the persisted EQ overlay.
+required dependency of the remote, the AirPlay/Spotify volume bridge and the
+web control UI: it is the only applier of persisted EQ and speaker changes,
+and the only publisher of the verified volume ceiling they read (without it
+they hold `FAILSAFE_VOLUME_LIMIT_DB`).
 
 - **Just Trigger** - For basic amp power control
 - **Just Source Switcher** - For automatic source selection, with the MOTU
   clock following the source
 - **Remote, volume bridge, web UI** - Each requires the Source Switcher; the
-  installer pulls it in rather than producing a component that can never unmute
-  and whose tone edits are never applied
+  installer pulls it in rather than producing a component whose edits are
+  never applied
 - **Compatible combinations** - Shared volume writers serialize through the
   audio-control lock
-
-The token is a JSON document naming the engine generation it was verified
-against, so it cannot be forged by creating the file, and the check is never
-weakened: it is what keeps audio muted until a verified config is live.
 
 ---
 

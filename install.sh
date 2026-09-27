@@ -109,7 +109,6 @@ AUDIO_EQ_PATH=/var/lib/cdsp-automation/audio-eq.json
 AUDIO_EQ_STATUS_PATH=/run/cdsp-source-switcher/audio-eq-status.json
 AUDIO_EQ_BACKUP_DIR=$AUDIO_EQ_BACKUP_DEFAULT
 AUDIO_CONTROL_LOCK_PATH=/var/lib/cdsp-automation/audio-control.lock
-AUDIO_READY_PATH=/run/cdsp-source-switcher/audio-ready.json
 AUDIO_EQ_REAPPLY_SECONDS=1.0
 SPEAKER_SELECTION_PATH=/var/lib/cdsp-automation/speaker-selection.json
 SPEAKER_CATALOG_PATH=/etc/cdsp-automation/speaker-catalog.json
@@ -118,7 +117,6 @@ SPEAKER_PROFILE_DIR=/etc/cdsp-automation/speaker-profiles
 SOURCE_BASE_DIR=/etc/cdsp-automation/source-bases
 SPEAKER_GENERATED_DIR=/var/lib/cdsp-automation/generated-configs
 SPEAKER_STATUS_PATH=/run/cdsp-source-switcher/speaker-profile-status.json
-SPEAKER_TRANSITION_PATH=/var/lib/cdsp-automation/speaker-transition.json
 CAMILLA_BINARY=camilladsp
 CONFIG_VALIDATE_TIMEOUT=10
 AIRPLAY_VOLUME_MIN_DB=-50
@@ -249,17 +247,11 @@ print_install_summary() {
 }
 
 # The control core.  Three components - the HID remote, the AirPlay/Spotify
-# volume bridge and the web control UI - call
-# speaker_profiles.require_audio_unmute_allowed() before they are permitted to
-# unmute, and persist tone/EQ edits for something else to apply.  Only the
-# source switcher ever writes that audio-ready token
-# (speaker_profiles.clear_audio_inhibit, called from scripts/source_switcher.py)
-# and only the switcher applies the persisted overlay.  The token is a JSON
-# document carrying the live engine generation, so it cannot be hand-written
-# either, and the check is deliberately never relaxed: it is what stops audio
-# being unmuted against an unverified engine.  So those three are not
-# standalone, and this installer installs the switcher with them rather than
-# producing a deployment that can never unmute.
+# volume bridge and the web control UI - persist tone/EQ edits and speaker
+# selections for the source switcher to apply, and take their volume ceiling
+# from the speaker-profile status only the switcher publishes (without it they
+# hold the fail-safe ceiling).  So those three are not standalone, and this
+# installer installs the switcher with them.
 SOURCE_SWITCHER_INSTALLED_THIS_RUN=0
 
 source_switcher_present() {
@@ -277,10 +269,10 @@ ensure_source_switcher() {
   fi
   echo ""
   echo "REQUIRED DEPENDENCY: $component needs the Source Switcher."
-  echo "  Only the Source Switcher publishes the audio-ready token that allows an"
-  echo "  unmute, and only it applies persisted Bass/Treble/EQ edits to the engine."
-  echo "  Installed alone, $component could never unmute and its tone edits would"
-  echo "  go nowhere, so the Source Switcher is being installed alongside it."
+  echo "  Only the Source Switcher applies persisted Bass/Treble/EQ and speaker"
+  echo "  changes to the engine and publishes the volume ceiling. Installed alone,"
+  echo "  $component would stay at the fail-safe ceiling and its edits would go"
+  echo "  nowhere, so the Source Switcher is being installed alongside it."
   echo ""
   install_source_switcher
   note_dependency "Source Switcher: installed because $component requires it (give it its source configs in $CONFIGS_DIR, or it will not run)"
@@ -378,12 +370,11 @@ ensure_user_writable_dir() {
 }
 
 ensure_audio_state_storage() {
-  local lock audio_eq_path audio_control_lock_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
+  local lock audio_eq_path audio_control_lock_path speaker_selection_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
   audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
   audio_eq_backup_dir="$(get_env_value AUDIO_EQ_BACKUP_DIR)"
   audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
   speaker_selection_path="$(get_env_value SPEAKER_SELECTION_PATH)"
-  speaker_transition_path="$(get_env_value SPEAKER_TRANSITION_PATH)"
   speaker_audio_dir="$(get_env_value SPEAKER_AUDIO_DIR)"
   speaker_profile_dir="$(get_env_value SPEAKER_PROFILE_DIR)"
   source_base_dir="$(get_env_value SOURCE_BASE_DIR)"
@@ -391,7 +382,6 @@ ensure_audio_state_storage() {
   : "${audio_eq_path:=/var/lib/cdsp-automation/audio-eq.json}"
   : "${audio_control_lock_path:=/var/lib/cdsp-automation/audio-control.lock}"
   : "${speaker_selection_path:=/var/lib/cdsp-automation/speaker-selection.json}"
-  : "${speaker_transition_path:=/var/lib/cdsp-automation/speaker-transition.json}"
   : "${speaker_audio_dir:=/var/lib/cdsp-automation/speaker-audio}"
   : "${speaker_profile_dir:=/etc/cdsp-automation/speaker-profiles}"
   : "${source_base_dir:=/etc/cdsp-automation/source-bases}"
@@ -400,7 +390,6 @@ ensure_audio_state_storage() {
   ensure_user_writable_dir "$(dirname "$audio_eq_path")"
   ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"
   ensure_user_writable_dir "$(dirname "$speaker_selection_path")"
-  ensure_user_writable_dir "$(dirname "$speaker_transition_path")"
   ensure_user_writable_dir "$speaker_audio_dir"
   ensure_user_writable_dir "$generated_dir"
   ensure_user_writable_dir "$audio_eq_backup_dir"
@@ -437,14 +426,12 @@ create_unit() {
   local unit_ordering=""
   if [[ "$sysname" == "cdsp-source-switcher" ]]; then
     runtime_directory=$'RuntimeDirectory=cdsp-source-switcher\nRuntimeDirectoryMode=0755\nRuntimeDirectoryPreserve=yes'
-    # The switcher owns the audio-ready token, so it must not outlive the
-    # engine instance the token describes.  PartOf propagates only explicit
-    # stop/restart jobs on camilladsp.service (an operator restart, or the
-    # control UI's), never camilladsp's own Restart= cycles, so it cannot
-    # create a restart loop; BindsTo would additionally stop the switcher
-    # whenever the engine fails, leaving nobody to enforce the inhibit.
-    # An engine that restarts by itself is caught in-process instead, by the
-    # readiness marker no longer matching the live config.
+    # Restarting the engine restarts the switcher, which then mutes and
+    # re-applies the config.  PartOf propagates only explicit stop/restart
+    # jobs on camilladsp.service (an operator restart, or the control UI's),
+    # never camilladsp's own Restart= cycles, so it cannot create a restart
+    # loop.  An engine that restarts by itself drops the switcher's websocket,
+    # and the switcher re-applies on reconnect.
     unit_ordering='PartOf=camilladsp.service'
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
@@ -581,8 +568,8 @@ EOF
 
 install_remote() {
   echo "Installing Remote Control..."
-  # Mute/unmute and the tone keys are the remote's reason to exist, and both
-  # run through the switcher.  Pull it in before the remote's own unit starts.
+  # The volume ceiling and the tone keys both run through the switcher.  Pull
+  # it in before the remote's own unit starts.
   ensure_source_switcher "Remote Control"
 
   if getent group input >/dev/null; then
@@ -648,8 +635,7 @@ configure_shairport_bridge() {
 
 install_airplay_volume_bridge() {
   echo "Installing AirPlay volume bridge daemon and system callback..."
-  # The bridge unmutes when a receiver starts playing, so it needs the same
-  # audio-ready token the remote does.
+  # Like the remote, the bridge takes its volume ceiling from the switcher.
   ensure_source_switcher "AirPlay/Spotify volume bridge"
   sudo install -d -m 0755 /usr/local/libexec
   sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
@@ -705,8 +691,8 @@ install_control_ui() {
     echo "Expose its port on a trusted LAN only, or set a token in $ENV_FILE."
   fi
   echo ""
-  # The UI's audio page unmutes and edits tone through the same gate the remote
-  # uses, so it carries the same dependency.
+  # The UI's volume ceiling, tone and speaker changes all run through the
+  # switcher, so it carries the same dependency as the remote.
   ensure_source_switcher "Web control UI"
   local unit_file
   unit_file="$(mktemp)"
@@ -1059,7 +1045,7 @@ CamillaDSP Utilities - Choose an Option
 11) Install Web Control UI (optional)
 0)  Exit
 Options 5, 8 and 11 also install option 4 when it is missing: the Source
-Switcher is the only thing that can permit an unmute or apply tone/EQ edits.
+Switcher is the only thing that applies tone/EQ and speaker changes.
 Options 10 and 11 ask for confirmation before acting.
 =============================================
 MENU

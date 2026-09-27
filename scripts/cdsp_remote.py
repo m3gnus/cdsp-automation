@@ -18,9 +18,7 @@ from audio_eq import read_audio_state, reset_tone_bands, update_tone_band
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     audio_control_lock,
-    note_mute_request,
     read_speaker_selection,
-    require_audio_unmute_allowed,
     resolve_profile_audio_path,
     speaker_selection_lock,
     volume_ceiling,
@@ -57,11 +55,6 @@ SPEAKER_AUDIO_DIR = Path(
 AUDIO_CONTROL_LOCK_PATH = Path(
     os.environ.get(
         "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
-AUDIO_READY_PATH = Path(
-    os.environ.get(
-        "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
     )
 )
 SPEAKER_STATUS_PATH = Path(
@@ -260,10 +253,6 @@ def toggle_mute() -> None:
         client = ensure_cdsp_connected()
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
             is_muted = client.volume.main_mute()
-            if is_muted:
-                require_audio_unmute_allowed(AUDIO_READY_PATH, client)
-            else:
-                note_mute_request(AUDIO_READY_PATH)
             client.volume.set_main_mute(not is_muted)
         print(f"Mute: {'ON' if not is_muted else 'OFF'}", flush=True)
     except Exception as exc:

@@ -45,15 +45,10 @@ from speaker_profiles import (
     BUILTIN_SPEAKERS,
     DEFAULT_SPEAKER_ID,
     audio_control_lock,
-    audio_inhibit_active,
-    discard_mute_request,
-    note_mute_request,
     operator_configs_for_speaker,
     read_profile_audio_state,
     read_speaker_selection,
-    require_audio_unmute_allowed,
     resolve_profile_audio_path,
-    set_audio_inhibit,
     speaker_selection_lock,
     update_speaker_selection,
     volume_ceiling,
@@ -131,11 +126,6 @@ AUDIO_CONTROL_LOCK_PATH = Path(
         "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
     )
 )
-AUDIO_READY_PATH = Path(
-    os.environ.get(
-        "AUDIO_READY_PATH", "/run/cdsp-source-switcher/audio-ready.json"
-    )
-)
 SPEAKER_SELECTION_PATH = Path(
     os.environ.get(
         "SPEAKER_SELECTION_PATH", "/var/lib/cdsp-automation/speaker-selection.json"
@@ -154,12 +144,6 @@ SPEAKER_STATUS_PATH = Path(
     os.environ.get(
         "SPEAKER_STATUS_PATH",
         "/run/cdsp-source-switcher/speaker-profile-status.json",
-    )
-)
-SPEAKER_TRANSITION_PATH = Path(
-    os.environ.get(
-        "SPEAKER_TRANSITION_PATH",
-        "/var/lib/cdsp-automation/speaker-transition.json",
     )
 )
 BACKUP_KEEP = 15
@@ -1063,7 +1047,7 @@ HTML = r"""<!doctype html>
           <b>${esc(p.label||p.id)}</b><br><span class="sub2">${esc(detail)}</span></button></div>`;
       }).join("");
       const selected=catalog[selection.selected]||{};
-      const error=status.ok===false?`<div class="sub2" style="color:var(--bad);margin-top:10px">${esc(status.error||"Transition failed — output remains inhibited")}</div>`:"";
+      const error=status.ok===false?`<div class="sub2" style="color:var(--bad);margin-top:10px">${esc(status.error||"Transition failed — output stays muted")}</div>`:"";
       const profilePanel=qs("#speakerProfiles");
       if (profilePanel) profilePanel.innerHTML=`<div class="cap">Complete DSP profile</div><div class="sources" style="margin-top:10px">${cards}</div>
         <div class="sub2" style="margin-top:10px">Selected: <b>${esc(selected.label||selection.selected)}</b> · revision ${selection.revision||0}. Profiles are installed definitions and may contain FIR crossovers or custom filter chains. Selecting a target only opens the confirmation dialog. Swap passive speakers only after it shows active. User EQ and loudness are stored separately for every profile.${selected.bypass_user_eq?" This profile deliberately bypasses user EQ.":""}</div>${error}`;
@@ -1074,7 +1058,7 @@ HTML = r"""<!doctype html>
         // already picked instead of snapping the list back to the live profile.
         const pendingTarget=qs("#dashboardSpeakerTarget")?.value;
         const options=Object.values(catalog).map(p=>`<option value="${esc(p.id)}" ${p.id===selection.selected?"selected":""} ${p.available?"":"disabled"}>${esc(p.label||p.id)}${p.available?"":" — unavailable"}</option>`).join("");
-        dashboard.innerHTML=`<div class="active-name">${esc(selected.label||selection.selected||"—")}</div><div><span class="badge ${active?"ok":"warn"}">${active?"active":"transition / inhibited"}</span></div><select id="dashboardSpeakerTarget" aria-label="Target speaker profile">${options}</select><button class="btn danger" id="dashboardSpeakerChange" disabled>Review profile change…</button><div class="sub2">Changing this is intentionally a confirmed maintenance action.</div>${error}`;
+        dashboard.innerHTML=`<div class="active-name">${esc(selected.label||selection.selected||"—")}</div><div><span class="badge ${active?"ok":"warn"}">${active?"active":"switching"}</span></div><select id="dashboardSpeakerTarget" aria-label="Target speaker profile">${options}</select><button class="btn danger" id="dashboardSpeakerChange" disabled>Review profile change…</button><div class="sub2">Changing this is intentionally a confirmed maintenance action.</div>${error}`;
         const target=qs("#dashboardSpeakerTarget"), change=qs("#dashboardSpeakerChange");
         if (pendingTarget && catalog[pendingTarget]?.available) target.value=pendingTarget;
         const sync=()=>{ change.disabled=!target.value||target.value===selection.selected; };
@@ -1792,10 +1776,6 @@ def set_camilla_volume(payload: dict[str, Any]) -> dict[str, Any]:
                 muted = payload["muted"]
                 if not isinstance(muted, bool):
                     raise ValueError("muted must be true or false")
-                if muted:
-                    note_mute_request(AUDIO_READY_PATH)
-                else:
-                    require_audio_unmute_allowed(AUDIO_READY_PATH, client)
 
             if target_volume is not None:
                 client.volume.set_main_volume(target_volume)
@@ -2092,21 +2072,16 @@ def _read_json_object(path: Path) -> dict[str, Any]:
         return {}
 
 
-def audio_ready() -> bool:
-    """Report readiness exactly the way an unmute request would be judged."""
-    try:
-        with camilla_client() as client:
-            return not audio_inhibit_active(AUDIO_READY_PATH, client)
-    except Exception:
-        return False
-
-
 def speaker_payload() -> dict[str, Any]:
+    selection = current_speaker_selection()
+    status = _read_json_object(SPEAKER_STATUS_PATH)
     return {
-        "selection": current_speaker_selection(),
+        "selection": selection,
         "catalog": installed_profile_catalog(),
-        "status": _read_json_object(SPEAKER_STATUS_PATH),
-        "ready": audio_ready(),
+        "status": status,
+        # The switcher has applied the selected revision.
+        "ready": status.get("ok") is True
+        and status.get("selection_revision") == selection["revision"],
     }
 
 
@@ -2242,26 +2217,9 @@ def select_speaker(raw: Any) -> dict[str, Any]:
         raise ValueError(f"cannot select {speaker_id!r}: {reason}")
     preflight_speaker_profile(speaker_id)
 
-    def inhibit_and_mute(updated: dict[str, Any]) -> None:
-        # Called by update_speaker_selection only after its revision check has
-        # succeeded, while both the audio and selection locks are held.
-        set_audio_inhibit(AUDIO_READY_PATH)
-        with camilla_client() as client:
-            # A fresh capture of the live flag supersedes any mute request
-            # still pending from an earlier transition.
-            discard_mute_request(AUDIO_READY_PATH)
-            restore_mute = bool(client.volume.main_mute())
-            atomic_write_json(
-                SPEAKER_TRANSITION_PATH,
-                {
-                    "version": 1,
-                    "revision": updated["revision"],
-                    "selected": updated["selected"],
-                    "restore_mute": restore_mute,
-                },
-            )
-            client.volume.set_main_mute(True)
-
+    # Only the selection is committed here.  The source switcher picks it up
+    # on its next pass and does the switch itself: mute, reload, check, then
+    # the listener's previous mute state -- all under the audio-control lock.
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         require_active_source_supported(speaker_id, catalog)
         update_speaker_selection(
@@ -2269,7 +2227,6 @@ def select_speaker(raw: Any) -> dict[str, Any]:
             speaker_id,
             expected_revision=expected_revision,
             allowed_ids=available_ids,
-            before_commit=inhibit_and_mute,
         )
     # Ensure the new profile has an isolated state before the editor loads it.
     read_profile_audio_state(
