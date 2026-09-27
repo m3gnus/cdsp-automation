@@ -680,6 +680,28 @@ def test_playback_arbiter_recovers_active_airplay_from_dbus(tmp_path: Path) -> N
     assert services == [(volume_sync.SPOTIFY_SERVICE, False)]
 
 
+def test_idle_recovery_restarts_a_receiver_left_stopped(tmp_path: Path) -> None:
+    """A bridge restart mid-AirPlay never saw the session end; idle recovery
+    must bring the stopped Spotify receiver back."""
+    services: list[tuple[str, bool]] = []
+    arbiter = volume_sync.PlaybackArbiter()
+    with (
+        patch.object(volume_sync, "AIRPLAY_ACTIVE_PATH", tmp_path / "playback-active"),
+        patch.object(volume_sync, "shairport_playback_active", return_value=False),
+        patch.object(volume_sync, "service_is_active", return_value=True),
+        patch.object(
+            volume_sync,
+            "set_receiver_service",
+            side_effect=lambda service, enabled: services.append((service, enabled)),
+        ),
+    ):
+        assert arbiter.recover() is None
+    assert services == [
+        (volume_sync.AIRPLAY_SERVICE, True),
+        (volume_sync.SPOTIFY_SERVICE, True),
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
 

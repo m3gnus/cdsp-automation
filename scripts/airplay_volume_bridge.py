@@ -423,6 +423,14 @@ class PlaybackArbiter:
         else:
             self.owner = None
             finish_network_playback()
+            # A session that ended while the bridge was down (a restart
+            # mid-session) never ran stop(), so the receiver it had stopped
+            # would stay off. Idle means both receivers should be up.
+            for service in (AIRPLAY_SERVICE, SPOTIFY_SERVICE):
+                try:
+                    set_receiver_service(service, True)
+                except Exception as exc:
+                    print(f"playback arbiter: {exc}", flush=True)
             print("playback arbiter: recovered idle state", flush=True)
         return self.owner
 
