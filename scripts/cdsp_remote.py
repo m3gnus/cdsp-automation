@@ -15,6 +15,15 @@ from pathlib import Path
 import evdev
 from camilladsp import CamillaClient
 from audio_eq import read_audio_state, reset_tone_bands, update_tone_band
+from settings import (
+    AUDIO_CONTROL_LOCK_PATH,
+    AUDIO_EQ_PATH,
+    CDSP_HOST,
+    CDSP_PORT,
+    SPEAKER_AUDIO_DIR,
+    SPEAKER_SELECTION_PATH,
+    SPEAKER_STATUS_PATH,
+)
 from speaker_profiles import (
     BUILTIN_SPEAKERS,
     audio_control_lock,
@@ -29,40 +38,12 @@ from speaker_profiles import (
 
 
 REMOTE_NAME = os.environ.get("REMOTE_NAME", "HID Remote01 Keyboard")
-CDSP_HOST = os.environ.get("CDSP_HOST", "127.0.0.1")
-CDSP_PORT = int(os.environ.get("CDSP_PORT", "1234"))
-DEVICE_RETRY_SECONDS = max(
-    float(os.environ.get("REMOTE_DEVICE_RETRY_SECONDS", "2")), 0.1
-)
-STATUS_LOG_SECONDS = max(
-    float(os.environ.get("REMOTE_STATUS_LOG_SECONDS", "300")), 1.0
-)
+DEVICE_RETRY_SECONDS = 2.0
+STATUS_LOG_SECONDS = 300.0
 
-TONE_MIN = float(os.environ.get("REMOTE_TONE_MIN", "-6"))
-TONE_MAX = float(os.environ.get("REMOTE_TONE_MAX", "6"))
-TONE_STEP = float(os.environ.get("REMOTE_TONE_STEP", "0.5"))
-AUDIO_EQ_PATH = Path(
-    os.environ.get("AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json")
-)
-SPEAKER_SELECTION_PATH = Path(
-    os.environ.get(
-        "SPEAKER_SELECTION_PATH", "/var/lib/cdsp-automation/speaker-selection.json"
-    )
-)
-SPEAKER_AUDIO_DIR = Path(
-    os.environ.get("SPEAKER_AUDIO_DIR", "/var/lib/cdsp-automation/speaker-audio")
-)
-AUDIO_CONTROL_LOCK_PATH = Path(
-    os.environ.get(
-        "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
-SPEAKER_STATUS_PATH = Path(
-    os.environ.get(
-        "SPEAKER_STATUS_PATH",
-        "/run/cdsp-source-switcher/speaker-profile-status.json",
-    )
-)
+TONE_MIN = -6.0
+TONE_MAX = 6.0
+TONE_STEP = 0.5
 
 VOLUME_MIN = float(os.environ.get("REMOTE_VOLUME_MIN", "-80"))
 # The ceiling comes from the profile the switcher verified into service, not
@@ -73,11 +54,11 @@ VOLUME_MAX_OVERRIDE = (
     if os.environ.get("REMOTE_VOLUME_MAX")
     else None
 )
-VOLUME_STEP = float(os.environ.get("REMOTE_VOLUME_STEP", "1"))
+VOLUME_STEP = 1.0
 
-ENTER_HOLD_SECONDS = float(os.environ.get("REMOTE_ENTER_HOLD_SECONDS", "1"))
-RESTART_HOLD_SECONDS = float(os.environ.get("REMOTE_RESTART_HOLD_SECONDS", "1"))
-SHUTDOWN_HOLD_SECONDS = float(os.environ.get("REMOTE_SHUTDOWN_HOLD_SECONDS", "10"))
+ENTER_HOLD_SECONDS = 1.0
+RESTART_HOLD_SECONDS = 1.0
+SHUTDOWN_HOLD_SECONDS = 10.0
 # Fixed Raspberry Pi OS paths. Never derive NOPASSWD targets from PATH or the
 # user-controlled EnvironmentFile.
 SUDO_BIN = "/usr/bin/sudo"

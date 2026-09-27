@@ -46,9 +46,9 @@ import math
 import os
 import secrets
 import time
-from pathlib import Path
 from typing import Any
 
+import settings
 from audio_eq import atomic_write_json
 
 
@@ -82,17 +82,8 @@ DEFAULT_MAX_DB = 0.0
 # Written by the control UI (root), read and removed by the switcher; the
 # switcher's runtime directory holds both, like its other request and status
 # files.
-REQUEST_PATH = Path(
-    os.environ.get(
-        "MOTU_VOLUME_REQUEST_PATH",
-        "/run/cdsp-source-switcher/motu-volume-request.json",
-    )
-)
-STATUS_PATH = Path(
-    os.environ.get(
-        "MOTU_VOLUME_STATUS_PATH", "/run/cdsp-source-switcher/motu-volume.json"
-    )
-)
+REQUEST_PATH = settings.MOTU_VOLUME_REQUEST_PATH
+STATUS_PATH = settings.MOTU_VOLUME_STATUS_PATH
 
 
 class MotuVolumeRefused(Exception):

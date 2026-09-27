@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import html
 import ipaddress
@@ -26,6 +25,26 @@ from typing import Any, Iterator
 import yaml
 
 import motu_volume
+from settings import (
+    AIRPLAY_VOLUME_STATUS_PATH,
+    AUDIO_CONTROL_LOCK_PATH,
+    AUDIO_EQ_BACKUP_DIR,
+    AUDIO_EQ_PATH,
+    AUDIO_EQ_STATUS_PATH,
+    CAMILLA_BINARY,
+    CDSP_HOST,
+    CDSP_PORT,
+    CONFIG_DIR,
+    ENV_FILE,
+    ISO226_CAPABILITY_PATH,
+    SOURCE_BASE_DIR,
+    SOURCE_OVERRIDE_PATH,
+    SPEAKER_AUDIO_DIR,
+    SPEAKER_GENERATED_DIR,
+    SPEAKER_PROFILE_DIR,
+    SPEAKER_SELECTION_PATH,
+    SPEAKER_STATUS_PATH,
+)
 from audio_eq import (
     atomic_write_json,
     audio_state_lock,
@@ -90,92 +109,22 @@ def configured_ui_token() -> str:
 
 HOST = ui_bind_host()
 PORT = ui_bind_port()
-CDSP_ENV = Path(
-    os.environ.get("CDSP_AUTOMATION_ENV", "/home/magnus/camilladsp/cdsp-automation.env")
-)
-CDSP_CONFIG_DIR = Path(
-    os.environ.get("CDSP_CONFIG_DIR", "/home/magnus/camilladsp/configs")
-)
-SPEAKER_GENERATED_DIR = Path(
-    os.environ.get(
-        "SPEAKER_GENERATED_DIR", "/var/lib/cdsp-automation/generated-configs"
-    )
-)
-SOURCE_OVERRIDE_PATH = Path(
-    os.environ.get("SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source")
-)
+CDSP_ENV = ENV_FILE
+CDSP_CONFIG_DIR = CONFIG_DIR
 UI_SERVICE = "cdsp-control-ui.service"
 # How long a MOTU volume change waits for the source switcher to apply it
 # (normally within one of its ~1.2 s passes) before answering 202.
 MOTU_VOLUME_REPLY_SECONDS = 3.0
-AUDIO_EQ_PATH = Path(
-    os.environ.get("AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json")
-)
-AUDIO_EQ_STATUS_PATH = Path(
-    os.environ.get(
-        "AUDIO_EQ_STATUS_PATH", "/run/cdsp-source-switcher/audio-eq-status.json"
-    )
-)
-AUDIO_EQ_BACKUP_DIR = Path(
-    os.environ.get(
-        "AUDIO_EQ_BACKUP_DIR", "/var/lib/cdsp-automation/audio-eq-backups"
-    )
-)
-AUDIO_CONTROL_LOCK_PATH = Path(
-    os.environ.get(
-        "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
-SPEAKER_SELECTION_PATH = Path(
-    os.environ.get(
-        "SPEAKER_SELECTION_PATH", "/var/lib/cdsp-automation/speaker-selection.json"
-    )
-)
-SPEAKER_AUDIO_DIR = Path(
-    os.environ.get("SPEAKER_AUDIO_DIR", "/var/lib/cdsp-automation/speaker-audio")
-)
-SPEAKER_PROFILE_DIR = Path(
-    os.environ.get("SPEAKER_PROFILE_DIR", "/etc/cdsp-automation/speaker-profiles")
-)
-SOURCE_BASE_DIR = Path(
-    os.environ.get("SOURCE_BASE_DIR", "/etc/cdsp-automation/source-bases")
-)
-SPEAKER_STATUS_PATH = Path(
-    os.environ.get(
-        "SPEAKER_STATUS_PATH",
-        "/run/cdsp-source-switcher/speaker-profile-status.json",
-    )
-)
 BACKUP_KEEP = 15
-MEDIA_ROOT = Path(os.environ.get("MEDIA_ROOT", "/mnt/whispers"))
-MIN_VALID_EPOCH = 1_704_067_200  # 2024-01-01
-MAX_VALID_EPOCH = 4_102_444_800  # 2100-01-01
 DEFAULT_REMOTE_NAME = "HID Remote01 Keyboard"
-CAMILLA_HOST = os.environ.get("CDSP_HOST", "127.0.0.1")
-CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
-CAMILLA_BINARY = os.environ.get("CAMILLA_BINARY", "camilladsp")
-AIRPLAY_VOLUME_STATUS_PATH = Path(
-    os.environ.get(
-        "AIRPLAY_VOLUME_STATUS_PATH", "/run/airplay-volume-bridge/status.json"
-    )
-)
-SHAIRPORT_CONFIG_PATH = Path(
-    os.environ.get("SHAIRPORT_CONFIG_PATH", "/etc/shairport-sync.conf")
-)
+CAMILLA_HOST = CDSP_HOST
+CAMILLA_PORT = CDSP_PORT
+SHAIRPORT_CONFIG_PATH = Path("/etc/shairport-sync.conf")
 SPOTIFY_VOLUME_DROPIN_PATH = Path(
-    os.environ.get(
-        "SPOTIFY_VOLUME_DROPIN_PATH",
-        "/etc/systemd/system/raspotify.service.d/cdsp-volume-sync.conf",
-    )
+    "/etc/systemd/system/raspotify.service.d/cdsp-volume-sync.conf"
 )
-# Name shown in the page title and header; the installer publishes a neutral
-# default and a deployment can override it in the env file.
+# Name shown in the page title and header.
 SITE_NAME = os.environ.get("SITE_NAME", "CamillaDSP")
-ISO226_CAPABILITY_PATH = Path(
-    os.environ.get(
-        "ISO226_CAPABILITY_PATH", "/var/lib/cdsp-automation/iso226-engine.json"
-    )
-)
 VOLUME_MIN_DB = -80.0
 # There is deliberately no VOLUME_MAX_DB here. The UI has no ceiling of its
 # own: it honours whichever ceiling the switcher verified into service, and
@@ -372,7 +321,6 @@ HTML = r"""<!doctype html>
     .grid { display: grid; gap: 12px; }
     .g-auto { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
     .hero { grid-template-columns: 1.4fr 1fr 1fr; }
-    .split { grid-template-columns: 1fr 1fr; align-items: start; }
 
     .tile { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 13px 14px; min-width: 0; }
     .cap { font: 10px/1.2 var(--mono); letter-spacing: 1.4px; text-transform: uppercase; color: var(--faint); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
@@ -517,7 +465,7 @@ HTML = r"""<!doctype html>
     #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
     @media (max-width: 860px) {
-      .hero, .split { grid-template-columns: 1fr; }
+      .hero { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
       .word .sub { display: none; }
@@ -586,10 +534,6 @@ HTML = r"""<!doctype html>
 
         <div class="shead"><span class="ix">03</span><h2>System</h2><span class="rule"></span></div>
         <div class="grid g-auto" id="systemGrid"></div>
-        <div class="grid split" style="margin-top:12px">
-          <div class="card" id="clockCard"></div>
-          <div class="card" id="storageCard"></div>
-        </div>
       </section>
 
       <section id="audio">
@@ -1347,68 +1291,6 @@ HTML = r"""<!doctype html>
       catch (e) { qs("#logBox").textContent = e.message; }
     }
 
-    /* ---- USB storage: status + mount / unmount ---- */
-    async function loadStorage() { try { renderStorage(await api("/api/storage")); } catch (e) { /* keep */ } }
-    function renderStorage(s) {
-      const box = qs("#storageCard"); if (!box) return;
-      s = s || {};
-      const free = s.free_bytes != null ? (s.free_bytes / 1e9).toFixed(1) + " GB free" : "";
-      const size = s.size_bytes != null ? " / " + (s.size_bytes / 1e9).toFixed(0) + " GB" : "";
-      box.style.borderColor = s.mounted ? "var(--line)" : "var(--warn)";
-      box.innerHTML = `<div class="cap">USB storage
-          <span class="badge ${s.mounted ? "ok" : "warn"}">${s.mounted ? "mounted" : "not mounted"}</span></div>
-        <div class="val sm" style="margin-top:6px">${esc(s.root || "/mnt/whispers")}</div>
-        <div class="sub2">${s.mounted
-          ? `${esc(s.device || "")} · ${esc(s.fstype || "")} · ${free}${size} · ${(s.folders || []).length} folders`
-          : "not mounted — Mount it, or it auto-mounts on next boot / on access"}</div>
-        <div class="row" style="margin-top:10px">
-          <button class="btn sm" id="stMount" ${s.mounted ? "disabled" : ""}>Mount</button>
-          <button class="btn sm danger" id="stUnmount" ${s.mounted ? "" : "disabled"}>Unmount (safe remove)</button>
-          <button class="btn sm ghost" id="stRefresh">Refresh</button>
-        </div>`;
-      const act = async action => {
-        try { const r = await api("/api/storage", { method: "POST", body: JSON.stringify({ action }) });
-          renderStorage(r.storage); toast(action === "mount" ? "Mounted" : "Unmounted — safe to remove the drive"); }
-        catch (e) { toast(e.message); }
-      };
-      const m = qs("#stMount"), u = qs("#stUnmount"), r = qs("#stRefresh");
-      if (m) m.addEventListener("click", () => act("mount"));
-      if (u) u.addEventListener("click", () => act("unmount"));
-      if (r) r.addEventListener("click", loadStorage);
-    }
-
-    /* ---- clock sync from the phone (site has no RTC battery / no Wi-Fi) ---- */
-    let clockSyncing = false;
-    async function syncClockFromPhone() {
-      if (clockSyncing) return;
-      clockSyncing = true;
-      try {
-        await api("/api/time", { method: "POST", body: JSON.stringify({ epoch: Date.now() / 1000 }) });
-        toast("Pi clock set from this phone");
-        setTimeout(load, 400);
-      } catch (e) { toast(e.message); }
-      finally { clockSyncing = false; }
-    }
-    function maybeSyncClock(piEpoch) {
-      if (typeof piEpoch !== "number") return;
-      const drift = Date.now() / 1000 - piEpoch;   // + = phone ahead of Pi
-      renderClock(piEpoch, drift);
-      if (Math.abs(drift) > 12 && !clockSyncing) syncClockFromPhone();
-    }
-    function renderClock(piEpoch, drift) {
-      const box = qs("#clockCard"); if (!box) return;
-      const piT = fmtClock(new Date(piEpoch * 1000));
-      const ad = Math.abs(drift), ok = ad <= 12;
-      box.style.borderColor = ok ? "var(--line)" : "var(--warn)";
-      box.innerHTML = `<div class="cap">Pi clock ${ok ? `<span class="ok">in sync</span>` : `<span class="warn">off by ${Math.round(ad)}s</span>`}</div>
-        <div class="row" style="align-items:center;gap:12px;margin-top:4px">
-          <div class="val sm" style="flex:1">${piT}</div>
-          <button class="btn sm" id="clockSyncBtn">Sync from this phone</button>
-        </div>
-        <div class="sub2" style="margin-top:6px">No RTC battery or Wi-Fi on site: open this page after a power cut and it sets the Pi's clock from your phone.</div>`;
-      qs("#clockSyncBtn").addEventListener("click", syncClockFromPhone);
-    }
-
     /* ---------------- loop ---------------- */
     async function load() {
       const data = await api("/api/status");
@@ -1423,8 +1305,6 @@ HTML = r"""<!doctype html>
       if (Number(data.camilla?.sample_rate)>0) eqSampleRate=Number(data.camilla.sample_rate);
       if (data.speaker) { speakerState=data.speaker; renderSpeakerProfiles(); }
       renderSystem(data);
-      maybeSyncClock(data.time);
-      loadStorage();
     }
 
     async function pollLevels() {
@@ -1939,59 +1819,6 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def list_media_folders() -> list[dict[str, Any]]:
-    """Session folders on the USB drive.
-
-    Hidden entries and macOS metadata (._*, .Spotlight-V100, .Trashes, …) are
-    skipped so the GUI shows only real session folders.
-    """
-    folders: list[dict[str, Any]] = []
-    try:
-        if not MEDIA_ROOT.is_dir():
-            return folders
-        entries = sorted(MEDIA_ROOT.iterdir(), key=lambda path: path.name.lower())
-    except OSError:
-        # The removable drive can disappear between the mount check and scan.
-        return folders
-    for path in entries:
-        if not path.is_dir() or path.name.startswith("."):
-            continue
-        folders.append({"name": path.name})
-    return folders
-
-
-def storage_status() -> dict[str, Any]:
-    """USB media status read from /proc/mounts so it never triggers the autofs
-    mount (which would defeat a manual unmount)."""
-    target = str(MEDIA_ROOT)
-    mounted = False
-    device = fstype = None
-    try:
-        with open("/proc/mounts", encoding="utf-8") as fh:
-            for line in fh:
-                parts = line.split()
-                if len(parts) >= 3 and parts[1] == target:
-                    mounted, device, fstype = True, parts[0], parts[2]
-                    break
-    except OSError:
-        pass
-    info: dict[str, Any] = {
-        "root": target,
-        "mounted": mounted,
-        "device": device,
-        "fstype": fstype,
-    }
-    if mounted:
-        try:
-            st = os.statvfs(target)
-            info["free_bytes"] = st.f_bavail * st.f_frsize
-            info["size_bytes"] = st.f_blocks * st.f_frsize
-        except OSError:
-            pass
-        info["folders"] = list_media_folders()
-    return info
-
-
 def _backup_file(
     path: Path, backup_dir: Path, prefix: str, keep: int = BACKUP_KEEP
 ) -> None:
@@ -2014,54 +1841,10 @@ def _backup_file(
         pass
 
 
-def set_system_clock(epoch: int) -> None:
-    """Set the Pi's clock from a trusted epoch (e.g. the phone's browser time)."""
-    if not (MIN_VALID_EPOCH <= epoch <= MAX_VALID_EPOCH):
-        raise ValueError("epoch out of range")
-    run_checked(["date", "-s", f"@{epoch}"], timeout=5)
-    run(["hwclock", "-w"], timeout=5)  # best-effort; harmless without a cell
-
-
-_iso_capability_lock = threading.Lock()
-_iso_capability_checked_at = 0.0
-_iso_capability_cache: tuple[dict[str, Any], bool] = ({}, False)
-
-
 def iso226_capability() -> tuple[dict[str, Any], bool]:
-    """Verify the marker hash against the running CamillaDSP executable."""
-    global _iso_capability_checked_at, _iso_capability_cache
-    with _iso_capability_lock:
-        now = time.monotonic()
-        if now - _iso_capability_checked_at < 30:
-            return _iso_capability_cache
-        try:
-            capability = json.loads(ISO226_CAPABILITY_PATH.read_text(encoding="utf-8"))
-            pid = int(
-                run(
-                    [
-                        "systemctl",
-                        "show",
-                        "-p",
-                        "MainPID",
-                        "--value",
-                        "camilladsp.service",
-                    ]
-                )
-            )
-            executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
-            digest = hashlib.sha256()
-            with executable.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            available = bool(
-                capability.get("engine") == "Iso226"
-                and capability.get("binary_sha256") == digest.hexdigest()
-            )
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            capability, available = {}, False
-        _iso_capability_checked_at = now
-        _iso_capability_cache = capability, available
-        return _iso_capability_cache
+    """The ISO 226 engine installer's receipt, and whether it names the engine."""
+    capability = _read_json_object(ISO226_CAPABILITY_PATH)
+    return capability, capability.get("engine") == "Iso226"
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
@@ -2571,7 +2354,6 @@ class Handler(BaseHTTPRequestHandler):
                 speaker = {"error": str(exc)}
             self.send_json(
                 {
-                    "time": time.time(),
                     "services": services,
                     "camilla": camilla,
                     "source": source,
@@ -2579,10 +2361,6 @@ class Handler(BaseHTTPRequestHandler):
                     "remote": remote_status(services),
                 }
             )
-            return
-
-        if parsed.path == "/api/storage":
-            self.send_json(storage_status())
             return
 
         if parsed.path == "/api/levels":
@@ -2684,32 +2462,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(
                     {"ok": True, "source": source_status(camilla), "camilla": camilla}
                 )
-                return
-
-            if parsed.path == "/api/storage":
-                action = payload.get("action")
-                if action == "mount":
-                    run(["systemctl", "start", "mnt-whispers.automount"], timeout=8)
-                    run_checked(
-                        ["systemctl", "start", "mnt-whispers.mount"], timeout=20
-                    )
-                elif action == "unmount":
-                    # Disable the autofs too so it stays unmounted for safe removal.
-                    run(["systemctl", "stop", "mnt-whispers.automount"], timeout=10)
-                    run(["systemctl", "stop", "mnt-whispers.mount"], timeout=15)
-                    if os.path.ismount(str(MEDIA_ROOT)):
-                        run_checked(["umount", str(MEDIA_ROOT)], timeout=15)
-                else:
-                    raise ValueError("action must be mount or unmount")
-                self.send_json({"ok": True, "storage": storage_status()})
-                return
-
-            if parsed.path == "/api/time":
-                epoch = payload.get("epoch")
-                if not isinstance(epoch, (int, float)):
-                    raise ValueError("epoch required")
-                set_system_clock(int(float(epoch)))
-                self.send_json({"ok": True, "now": time.time()})
                 return
 
             self.send_error(HTTPStatus.NOT_FOUND)

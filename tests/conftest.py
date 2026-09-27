@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -17,8 +16,10 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # before any test module imports it: otherwise the suite silently asserts
 # against whatever /etc/cdsp-automation/speaker-catalog.json happens to hold,
 # which makes it unrunnable on exactly the deployed hosts it should verify.
-HERMETIC_CATALOG_PATH = str(SCRIPTS_DIR / "no-such-speaker-catalog.json")
-os.environ["SPEAKER_CATALOG_PATH"] = HERMETIC_CATALOG_PATH
+import settings  # noqa: E402
+
+HERMETIC_CATALOG_PATH = SCRIPTS_DIR / "no-such-speaker-catalog.json"
+settings.SPEAKER_CATALOG_PATH = HERMETIC_CATALOG_PATH
 
 
 import pytest
@@ -35,5 +36,3 @@ def hermetic_motu_volume_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(motu_volume, "REQUEST_PATH", tmp_path / "motu-volume-request.json")
     monkeypatch.setattr(motu_volume, "STATUS_PATH", tmp_path / "motu-volume.json")
-    # Anything resolving the audio-control lock per call stays out of /var/lib.
-    monkeypatch.setenv("AUDIO_CONTROL_LOCK_PATH", str(tmp_path / "audio-control.lock"))

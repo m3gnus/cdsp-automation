@@ -24,66 +24,39 @@ try:
 except ImportError:  # Mapping/unit tests do not need the network client.
     CamillaClient = None
 
+from settings import (
+    AIRPLAY_ACTIVE_PATH,
+    AIRPLAY_VOLUME_SOCKET_PATH,
+    AIRPLAY_VOLUME_STATUS_PATH,
+    AUDIO_CONTROL_LOCK_PATH,
+    CDSP_HOST,
+    CDSP_PORT,
+    SPEAKER_STATUS_PATH,
+    SPOTIFY_VOLUME_COMMAND_SOCKET_PATH,
+    VOLUME_SYNC_GROUP,
+)
 
-CDSP_HOST = os.environ.get("CDSP_HOST", "127.0.0.1")
-CDSP_PORT = int(os.environ.get("CDSP_PORT", "1234"))
 # CamillaGUI's master slider spans -50..0 dB. Keeping the AirPlay bridge on
 # that same linear range makes the two slider positions track one-to-one.
 VOLUME_MIN_DB = float(os.environ.get("AIRPLAY_VOLUME_MIN_DB", "-50"))
 VOLUME_MAX_DB = float(os.environ.get("AIRPLAY_VOLUME_MAX_DB", "0"))
-VOLUME_CURVE = float(os.environ.get("AIRPLAY_VOLUME_CURVE", "1.0"))
-STATUS_PATH = Path(
-    os.environ.get(
-        "AIRPLAY_VOLUME_STATUS_PATH", "/run/airplay-volume-bridge/status.json"
-    )
-)
-AUDIO_CONTROL_LOCK_PATH = Path(
-    os.environ.get(
-        "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
-SPEAKER_STATUS_PATH = Path(
-    os.environ.get(
-        "SPEAKER_STATUS_PATH",
-        "/run/cdsp-source-switcher/speaker-profile-status.json",
-    )
-)
-SOCKET_PATH = Path(
-    os.environ.get(
-        "AIRPLAY_VOLUME_SOCKET_PATH", "/run/airplay-volume-bridge/input.sock"
-    )
-)
-SPOTIFY_COMMAND_SOCKET_PATH = Path(
-    os.environ.get(
-        "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH",
-        "/run/raspotify/cdsp-volume.sock",
-    )
-)
-POLL_INTERVAL = float(os.environ.get("VOLUME_SYNC_POLL_INTERVAL", "0.25"))
-COMMAND_RETRY_SECONDS = float(
-    os.environ.get("VOLUME_SYNC_COMMAND_RETRY_SECONDS", "1.0")
-)
-COMMAND_ACK_TIMEOUT = float(
-    os.environ.get("VOLUME_SYNC_COMMAND_ACK_TIMEOUT", "3.0")
-)
-HEARTBEAT_INTERVAL = float(
-    os.environ.get("VOLUME_SYNC_HEARTBEAT_SECONDS", "10.0")
-)
-VOLUME_SYNC_GROUP = os.environ.get("VOLUME_SYNC_GROUP", "audio")
-AIRPLAY_ACTIVE_PATH = Path(
-    os.environ.get(
-        "AIRPLAY_ACTIVE_PATH", "/run/airplay-volume-bridge/playback-active"
-    )
-)
-AIRPLAY_HANDOFF_TIMEOUT = float(os.environ.get("AIRPLAY_HANDOFF_TIMEOUT", "10.0"))
-AIRPLAY_RELEASE_DELAY = float(os.environ.get("AIRPLAY_RELEASE_DELAY", "1.25"))
-SYSTEMCTL_BIN = os.environ.get("SYSTEMCTL_BIN", "/usr/bin/systemctl")
-SUDO_BIN = os.environ.get("SUDO_BIN", "/usr/bin/sudo")
-BUSCTL_BIN = os.environ.get("BUSCTL_BIN", "/usr/bin/busctl")
+VOLUME_CURVE = 1.0
+STATUS_PATH = AIRPLAY_VOLUME_STATUS_PATH
+SOCKET_PATH = AIRPLAY_VOLUME_SOCKET_PATH
+SPOTIFY_COMMAND_SOCKET_PATH = SPOTIFY_VOLUME_COMMAND_SOCKET_PATH
+POLL_INTERVAL = 0.25
+COMMAND_RETRY_SECONDS = 1.0
+COMMAND_ACK_TIMEOUT = 3.0
+HEARTBEAT_INTERVAL = 10.0
+AIRPLAY_HANDOFF_TIMEOUT = 10.0
+AIRPLAY_RELEASE_DELAY = 1.25
+SYSTEMCTL_BIN = "/usr/bin/systemctl"
+SUDO_BIN = "/usr/bin/sudo"
+BUSCTL_BIN = "/usr/bin/busctl"
 AIRPLAY_SERVICE = "shairport-sync.service"
 SPOTIFY_SERVICE = "raspotify.service"
-LMS_HOST = os.environ.get("LMS_HOST", "127.0.0.1")
-LMS_PORT = int(os.environ.get("LMS_PORT", "9000"))
+LMS_HOST = "127.0.0.1"
+LMS_PORT = 9000
 # Comma-separated LMS/Squeezelite player names to stop when a network
 # receiver starts. Empty (the default) disables the LMS hand-off entirely.
 LMS_PLAYER_NAMES = tuple(

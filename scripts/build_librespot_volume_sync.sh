@@ -16,11 +16,11 @@ MARKER="${CDSP_AUTOMATION_LIBRESPOT_MARKER:-/var/lib/cdsp-automation/librespot-v
 MARKER_FORMAT="cdsp-volume-sync/2"
 BUILD_FEATURES="alsa-backend,native-tls,with-avahi"
 
-: "${SPOTIFY_VOLUME_COMMAND_SOCKET_PATH:=/run/raspotify/cdsp-volume.sock}"
 : "${SPOTIFY_ALSA_DEVICE:=}"
-: "${VOLUME_SYNC_GROUP:=audio}"
-COMMAND_SOCKET="$SPOTIFY_VOLUME_COMMAND_SOCKET_PATH"
-ACK_SOCKET="${AIRPLAY_VOLUME_SOCKET_PATH:-/run/airplay-volume-bridge/input.sock}"
+# Fixed in scripts/settings.py too.
+COMMAND_SOCKET="/run/raspotify/cdsp-volume.sock"
+ACK_SOCKET="/run/airplay-volume-bridge/input.sock"
+VOLUME_SYNC_GROUP="audio"
 
 BUILD_DIR=""
 deployment_started=false
@@ -29,20 +29,11 @@ had_target=false
 had_dropin=false
 
 validate_settings() {
-  # Allowlists, so whitespace, quotes, $, backticks and systemd's % specifier
+  # An allowlist, so whitespace, quotes, $, backticks and systemd's % specifier
   # can never reach the rendered unit file.
-  local socket_pattern='^/[A-Za-z0-9_./@:,=+-]+$'
   local device_pattern='^[A-Za-z0-9_:,=./@-]+$'
-  if [[ ! "$COMMAND_SOCKET" =~ $socket_pattern ]]; then
-    echo "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH must be an absolute path without shell or systemd metacharacters: $COMMAND_SOCKET" >&2
-    return 1
-  fi
   if [[ -n "$SPOTIFY_ALSA_DEVICE" && ! "$SPOTIFY_ALSA_DEVICE" =~ $device_pattern ]]; then
     echo "SPOTIFY_ALSA_DEVICE contains unsupported characters: $SPOTIFY_ALSA_DEVICE" >&2
-    return 1
-  fi
-  if [[ ! "$VOLUME_SYNC_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-    echo "VOLUME_SYNC_GROUP is not a valid group name: $VOLUME_SYNC_GROUP" >&2
     return 1
   fi
 }

@@ -11,13 +11,14 @@ import time
 import RPi.GPIO as GPIO
 from camilladsp import CamillaClient
 
+from settings import CDSP_HOST as CAMILLA_IP, CDSP_PORT as CAMILLA_PORT
+
 
 POWER_GPIO = int(os.environ.get("POWER_GPIO", "4"))
-CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
-CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
-DELAY_TIME = float(os.environ.get("TRIGGER_DELAY_SECONDS", "320"))
-CHECK_INTERVAL = float(os.environ.get("TRIGGER_CHECK_INTERVAL", "0.2"))
-AUDIO_THRESHOLD_DB = float(os.environ.get("TRIGGER_AUDIO_THRESHOLD_DB", "-80"))
+# Seconds of silence before the amps are switched off.
+DELAY_TIME = 320.0
+CHECK_INTERVAL = 0.2
+AUDIO_THRESHOLD_DB = -80.0
 
 
 def music_is_playing(rms_levels: object) -> bool:

@@ -76,8 +76,8 @@ and loudness remain independent per speaker.
 
 The selectable speakers ship as the maintainer's defaults. A site replaces
 the whole catalog without editing code by writing the JSON file at
-`SPEAKER_CATALOG_PATH` (default `/etc/cdsp-automation/speaker-catalog.json`;
-see `speaker-catalog.example.json`). The contract is one sentence: the
+`/etc/cdsp-automation/speaker-catalog.json` (see
+`speaker-catalog.example.json`). The contract is one sentence: the
 `default` speaker is the one that plays through your existing full CamillaDSP
 configs (and keeps the legacy `audio-eq.json` state path); every other
 speaker is a managed profile — parametric YAML in the profile directory, or
@@ -87,8 +87,8 @@ keeps the built-ins.
 
 Speaker selection and source arbitration are orthogonal. The catalog's default
 speaker uses the existing full configs. Non-legacy profiles are strict YAML fragments in
-`SPEAKER_PROFILE_DIR`; they are composed with capture-only YAML bases from
-`SOURCE_BASE_DIR`, written to digest-addressed immutable files, checked with
+`/etc/cdsp-automation/speaker-profiles`; they are composed with capture-only YAML bases from
+`/etc/cdsp-automation/source-bases`, written to digest-addressed immutable files, checked with
 `camilladsp -c`, and reloaded transactionally. A profile is unavailable until
 all of its declared source bases exist and `enabled: true` is explicit.
 
@@ -105,7 +105,8 @@ operator's responsibility.
 The repository's `speaker-profile.example.yml` is deliberately disabled and
 fully muted; `source-base.example.yml` shows the capture-only boundary.
 
-All master-volume and mute writers share `AUDIO_CONTROL_LOCK_PATH`. The
+All master-volume and mute writers share
+`/var/lib/cdsp-automation/audio-control.lock`. The
 source switcher holds that lock for a whole config switch: it mutes, reloads,
 checks that the engine runs the new file, re-applies the EQ overlay, and then
 puts back the listener's previous mute state. AirPlay, Spotify, the browser
@@ -122,9 +123,10 @@ then a control could unmute it briefly.)
 The all-utilities install also:
 
 - builds the pinned CamillaDSP 4.1.3 ISO 226 patch, runs the full Rust library
-  suite plus deployed-config checks, and rolls back automatically if anything
-  fails between replacing the engine and publishing its receipt - restoring
-  the engine and receipt that were in place just before the attempt;
+  suite plus deployed-config checks, and puts the previous engine back if
+  CamillaDSP does not restart on the new one. Once it runs, the installer writes
+  `/var/lib/cdsp-automation/iso226-engine.json`; while that receipt names the
+  Iso226 engine, the switcher and the control UI offer ISO 226 loudness;
 - installs a persistent network-volume daemon and a non-blocking Shairport
   callback, backs up/validates its configuration, and restores the original
   volume settings on uninstall;
@@ -236,17 +238,16 @@ The installer will prompt you to enter this name during installation.
 
 ### Configuration
 
-User settings live in `~/camilladsp/cdsp-automation.env` and are preserved when you update the scripts. Common remote settings:
+User settings live in `~/camilladsp/cdsp-automation.env` and are preserved when you update the scripts. The remote reads:
 
 ```text
 REMOTE_NAME=HID Remote01 Keyboard
-REMOTE_TONE_MIN=-6
-REMOTE_TONE_MAX=6
-REMOTE_TONE_STEP=0.5
 REMOTE_VOLUME_MIN=-80
 REMOTE_VOLUME_MAX=0
-REMOTE_VOLUME_STEP=1
 ```
+
+Tone steps (0.5 dB, ±6 dB), the 1 dB volume step and the button hold times are
+fixed in `cdsp_remote.py`.
 
 `REMOTE_VOLUME_MAX` can only lower the ceiling. The real maximum comes from the
 speaker profile that is currently applied, so a profile capped at -20 dB stays
@@ -312,14 +313,14 @@ Automatically powers your amplifier on/off by sending the Pi's switched 5V signa
 
 ### Configuration
 
-Edit `~/camilladsp/cdsp-automation.env`:
+Set the GPIO pin in `~/camilladsp/cdsp-automation.env`:
 
 ```text
 POWER_GPIO=4
-TRIGGER_DELAY_SECONDS=320
-TRIGGER_CHECK_INTERVAL=0.2
-TRIGGER_AUDIO_THRESHOLD_DB=-80
 ```
+
+The 320 s off delay, the 200 ms check interval and the -80 dB activity
+threshold are fixed in `trigger.py`.
 
 ### How It Works
 
@@ -384,24 +385,11 @@ the config identity still selects the correct clock. The config's identity
 comes from the speaker catalog, so an operator config mapped to any filename
 (not only `<speaker>-<source>.yml`) still selects the right clock.
 
-Switcher keys:
-
-```text
-# false leaves the MOTU clock alone
-SOURCE_MOTU_CLOCK=true
-# re-lock time allowed before the new graph is loaded on the interface
-MOTU_CLOCK_SETTLE_SECONDS=1.0
-# optional: silence confirmation and correction pacing
-MOTU_CLOCK_SILENCE_TIMEOUT=1.0
-MOTU_CLOCK_SILENT_DB=-100
-MOTU_CLOCK_RETRY_SECONDS=30
-```
+The clock timings (1 s re-lock settle, silence confirmation at -100 dB, a 30 s
+gap between corrections) are fixed in `source_switcher.py`.
 
 Earlier releases ran a separate `cdsp-motu-sync` service; an install or update
-removes it. Its keys (`MOTU_CLOCK_STATE_PATH`, `MOTU_CLOCK_*` read-back
-intervals, `MOTU_ACCESS_PATH`, `MOTU_ACCESS_WINDOW_SECONDS`,
-`MOTU_DATASTORE_URL`) are no longer read and can be removed from the env file;
-`SOURCE_MOTU_CLOCK=auto` still means on.
+removes it.
 
 
 ---
@@ -413,16 +401,15 @@ intervals, `MOTU_ACCESS_PATH`, `MOTU_ACCESS_WINDOW_SECONDS`,
 Automatically switches between CamillaDSP configs based on which audio source is playing.
 
 **Priority order:**
-1. **Manual override** - optional pinned source selected by writing to `SOURCE_OVERRIDE_PATH`
+1. **Manual override** - optional pinned source selected by writing to the override file (`SOURCE_OVERRIDE_PATH`)
 2. **Current active source** - if the current source is still playing, it keeps control
 3. **Streamer** (AirPlay/network streaming) - first automatic choice when changing sources
 4. **USB Gadget** (direct USB connection)
 5. **TOSLINK** (optical input) - detected from MOTU input meters
 6. **Analog** (optional) - disabled by default; can be enabled for MOTU input meters
 
-When no automatic source is active, the default behavior is to keep the current
-config instead of forcing TOSLINK. Set `SOURCE_IDLE_MODE=toslink` if you prefer
-the older fallback behavior.
+When no automatic source is active, the switcher keeps the current config
+instead of forcing TOSLINK.
 
 ### Critical Configuration Requirements
 
@@ -455,21 +442,18 @@ The source name, not a sample-rate heuristic, controls clock ownership.
 5. Waits 60 seconds of silence before abandoning a source whose playback it has *confirmed*, unless another meter-confirmed source is already active
 6. Remembers a source it selected and heard nothing from, and re-probes it on a growing backoff instead of every minute
 7. Uses passive MOTU meter frames to detect TOSLINK activity
-8. Keeps the current config when all sources are idle unless `SOURCE_IDLE_MODE=toslink`
+8. Keeps the current config when all sources are idle
 
 A source with confirmed audio cuts a silent source's grace short rather than
-waiting it out, once it has held that confirmation for
-`SOURCE_PREEMPT_DWELL_SECONDS` (default 2, so a single noisy meter frame cannot
-yank the config away mid-track). A *higher*-priority source waits for nothing
-else. A *lower*-priority one is additionally gated by
-`SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT`, which says how far into the current
-source's silence it is allowed to act; the default is immediate handoff after
-the lower source has passed its own activity debounce. A source that is merely
+waiting it out, once it has held that confirmation for 2 seconds (so a single
+noisy meter frame cannot yank the config away mid-track). A *higher*-priority
+source waits for nothing else. A *lower*-priority one hands off as soon as it
+has passed its own activity debounce. A source that is merely
 ready - a connected-but-paused AirPlay session, say - never cuts a grace short,
 because that grace is exactly what protects a track gap from it.
 
 The MOTU meter sources are a special case: `toslink_available` only goes false
-after `SOURCE_TOSLINK_IDLE_SECONDS` of quiet meters, so by the time one of them
+after 5 seconds of quiet meters, so by the time one of them
 reads silent it has already served a track-gap grace of its own. It does not
 get a second one on top - switch the TV off and the switcher starts looking
 elsewhere as soon as the meters settle, not a minute later.
@@ -477,48 +461,29 @@ elsewhere as soon as the meters settle, not a minute later.
 Hardware readiness only says a stream is open - a connected-but-paused AirPlay
 session or an idle console looks exactly like a playing one until the switcher
 selects it and reads the capture levels. A source selected this way is listened
-to for `SOURCE_PROBE_SILENCE_TIMEOUT` seconds; if it stays silent the switcher
-records that and will not select it again for `SOURCE_PROBE_BACKOFF_SECONDS`,
-growing by `SOURCE_PROBE_BACKOFF_FACTOR` per consecutive silent probe up to
-`SOURCE_PROBE_BACKOFF_MAX`. Confirmed audio, a manual override, and the source
-disappearing and coming back all clear the backoff immediately. Setting
-`SOURCE_PROBE_BACKOFF_SECONDS=0` disables the rate limit.
+to for 5 seconds; if it stays silent the switcher records that and will not
+select it again for 30 seconds, growing fourfold per consecutive silent probe
+up to 15 minutes. Confirmed audio, a manual override, and the source
+disappearing and coming back all clear the backoff immediately.
 
 ### Configuration
 
-Edit `~/camilladsp/cdsp-automation.env`:
+The switcher's timings, thresholds and MOTU meter channels are constants at the
+top of `source_switcher.py`; shared paths are in `settings.py`. The env file
+only names where the manual override lives:
 
 ```text
-SOURCE_IDLE_TIMEOUT=60
-SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
-SOURCE_PREEMPT_DWELL_SECONDS=2
-SOURCE_PROBE_SILENCE_TIMEOUT=5
-SOURCE_PROBE_BACKOFF_SECONDS=30
-SOURCE_PROBE_BACKOFF_FACTOR=4
-SOURCE_PROBE_BACKOFF_MAX=900
-SOURCE_AUDIO_THRESHOLD_DB=-80
 SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
-SOURCE_TOSLINK_MOTU_METERS=true
-SOURCE_ANALOG_MOTU_METERS=false
-SOURCE_IDLE_MODE=keep-last
-SOURCE_TOSLINK_METER_PAIRS=12,13
-SOURCE_ANALOG_METER_PAIRS=16,18
-SOURCE_DEBUG=false
 ```
 
 To pin a source manually, write one of `toslink`, `streamer`, `gadget`, or `analog`
-to `SOURCE_OVERRIDE_PATH`. Remove the file, leave it empty, or write `auto` to return
+to that file. Remove the file, leave it empty, or write `auto` to return
 to automatic switching.
 
 ### Debugging
 
-Enable debug mode to see what the switcher is doing:
-
-```text
-SOURCE_DEBUG=true
-```
-
-Then watch the logs:
+Set `DEBUG_MODE = True` near the top of `~/camilladsp/scripts/source_switcher.py`
+and restart the switcher to see what it is doing, then watch the logs:
 
 ```bash
 journalctl -u cdsp-source-switcher -f
@@ -542,15 +507,15 @@ A single-file, no-framework web dashboard (default port 8088) for the whole
 audio stack: physical source switching, CamillaDSP master volume/mute, the
 persistent parametric EQ with a computed response curve and loudness
 controls, speaker-profile selection (muted, validated, rollback-protected
-transitions), service health and restarts, live input levels, journal logs,
-USB storage mounting, and system clock control.
+transitions), service health and restarts, live input levels and journal
+logs.
 
 The UI edits persistent state only; the source switcher remains the sole
 writer of the live CamillaDSP configuration.
 
 ### Security Model
 
-Because it manages services, storage mounts, and the system clock, the
+Because it starts, stops and restarts system services, the
 `cdsp-control-ui.service` unit runs as **root** by design. Install it only if
 you want that trade-off; every other utility works without it.
 
@@ -584,7 +549,7 @@ sudo systemctl restart cdsp-control-ui
 ```
 
 Every request that changes anything (volume, EQ, source, speaker profile,
-services, storage, the clock) then needs
+services) then needs
 `Authorization: Bearer <token>`. Open the dashboard once as
 `http://<pi>:8088/#token=<token>` and the page remembers it; otherwise it
 prompts for the token the first time you change something. Status views stay
@@ -648,6 +613,14 @@ abandon the rest of the run when one of them cannot be installed.
 - `~/camilladsp/configs/` - CamillaDSP config files (you must create these)
 - `~/camilladsp/.venv/` - Python virtual environment
 - `~/camilladsp/cdsp-automation.env` - User settings preserved across script updates
+
+The env file holds only what varies per site: the CamillaDSP host/port and
+config directory, the manual-override file, the trigger GPIO, the MOTU
+WebSocket URL, the remote's name, volume limits (`MOTU_MAIN_VOLUME_MAX_DB`,
+`AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`, `REMOTE_VOLUME_MIN`/`MAX`), the LMS players
+to interrupt, the Spotify ALSA device, the control UI's host/port/token and
+its site name. Shared paths live in `scripts/settings.py` and timings at the
+top of each script; keys the scripts no longer read are ignored.
 
 **System services:**
 - `cdsp-trigger.service`
@@ -811,13 +784,8 @@ supported.
 
 **Enable debug mode:**
 
-Edit `~/camilladsp/cdsp-automation.env`:
-
-```text
-SOURCE_DEBUG=true
-```
-
-Restart service:
+Set `DEBUG_MODE = True` near the top of `~/camilladsp/scripts/source_switcher.py`,
+then restart the service:
 
 ```bash
 sudo systemctl restart cdsp-source-switcher

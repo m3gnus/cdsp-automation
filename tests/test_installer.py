@@ -22,7 +22,7 @@ class InstallerUnitTests(unittest.TestCase):
         self.assertIn("install_network_volume_sync", installer)
         self.assertIn("build_librespot_volume_sync.sh", installer)
         self.assertIn("librespot-v0.8.0-volume-sync.patch", installer)
-        self.assertIn("SPOTIFY_VOLUME_COMMAND_SOCKET_PATH", installer)
+        self.assertIn("SPOTIFY_ALSA_DEVICE", installer)
 
         builder = (REPOSITORY / "scripts" / "build_librespot_volume_sync.sh").read_text(
             encoding="utf-8"
@@ -91,10 +91,7 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             "create_unit()", 1
         )[0]
 
-        self.assertIn(
-            'ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"',
-            storage,
-        )
+        self.assertIn('ensure_user_writable_dir "$STATE_DIR"', storage)
         # The switcher keeps no MOTU state on disk: the device's own state
         # push names its clock, and nothing coordinates a second client.
         self.assertNotIn("MOTU_CLOCK_STATE_PATH", installer)
@@ -119,9 +116,6 @@ default_env
             )
             rendered = result.stdout.splitlines()
             self.assertIn(f"CDSP_CONFIG_DIR={directory}/site/configs", rendered)
-            self.assertIn(
-                f"CDSP_AUTOMATION_ENV={directory}/site/cdsp-automation.env", rendered
-            )
 
     def test_control_ui_unit_runs_web_ui_from_the_managed_venv(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
@@ -296,23 +290,6 @@ if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; 
             etc = root / "etc"
             base.mkdir()
             log_path = root / "sudo.log"
-            (base / "cdsp-automation.env").write_text(
-                "\n".join(
-                    [
-                        f"AUDIO_EQ_PATH={state}/audio-eq.json",
-                        f"AUDIO_CONTROL_LOCK_PATH={state}/audio-control.lock",
-                        f"SPEAKER_SELECTION_PATH={state}/speaker-selection.json",
-                        f"SPEAKER_AUDIO_DIR={state}/speaker-audio",
-                        f"SPEAKER_PROFILE_DIR={etc}/speaker-profiles",
-                        f"SOURCE_BASE_DIR={etc}/source-bases",
-                        f"SPEAKER_GENERATED_DIR={state}/generated-configs",
-                        f"AUDIO_EQ_BACKUP_DIR={state}/audio-eq-backups",
-                        "",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
             # sudo is unavailable here: run the command directly, drop the
             # ownership flags only root can honour, and record the chown so its
             # arguments are still asserted.
@@ -321,6 +298,8 @@ set -euo pipefail
 export HOME={root!s}
 export CDSP_AUTOMATION_BASE_DIR={base!s}
 source {INSTALLER!s}
+STATE_DIR={state!s}
+SITE_CONFIG_DIR={etc!s}
 sudo() {{
   local args=()
   case "$1" in
@@ -444,24 +423,16 @@ ensure_audio_state_storage
             self.assertIn("ISO 226 loudness engine: FAILED", output)
             self.assertIn("2 skipped or failed component(s)", output)
 
-    def test_uninstall_all_points_the_engine_helper_at_the_configured_receipt(
-        self,
-    ) -> None:
-        """The helper refuses to touch the binary without its receipt, so it has
-        to be told where this deployment keeps one."""
+    def test_uninstall_all_runs_the_engine_helper_uninstall(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             base = root / "site"
             scripts = base / "scripts"
             scripts.mkdir(parents=True)
-            capability = root / "custom" / "iso226-engine.json"
-            (base / "cdsp-automation.env").write_text(
-                f"ISO226_CAPABILITY_PATH={capability}\n", encoding="utf-8"
-            )
             seen = root / "helper.log"
             helper = scripts / "build_camilladsp_iso226.sh"
             helper.write_text(
-                f'#!/bin/bash\nprintf "%s %s\\n" "$1" "$ISO226_CAPABILITY_PATH" >> {seen!s}\n',
+                f'#!/bin/bash\nprintf "%s\\n" "$1" >> {seen!s}\n',
                 encoding="utf-8",
             )
             helper.chmod(0o755)
@@ -480,10 +451,7 @@ ensure_audio_state_storage
                 env={"HOME": str(root), "CDSP_AUTOMATION_BASE_DIR": str(base)},
             )
 
-            self.assertEqual(
-                seen.read_text(encoding="utf-8").strip(),
-                f"--uninstall {capability}",
-            )
+            self.assertEqual(seen.read_text(encoding="utf-8").strip(), "--uninstall")
 
     # --- The source switcher is a dependency, not a sibling ------------------
     # Only the switcher writes the audio-ready token that permits an unmute,
@@ -690,13 +658,11 @@ ensure_audio_state_storage
                 "deactivate() { :; }\n",
                 encoding="utf-8",
             )
-            (base / "cdsp-automation.env").write_text(
-                f"ISO226_CAPABILITY_PATH={capability}\n", encoding="utf-8"
-            )
 
             output = self._run(
                 "\n".join(
                     [
+                        f"STATE_DIR={root!s}",
                         f'systemctl() {{ printf "systemctl %s\\n" "$*" >> {log!s}; }}',
                         'sudo() { if [[ "$1" == systemctl ]]; then shift; systemctl "$@"; fi; }',
                         "download_scripts() { :; }",
@@ -936,21 +902,18 @@ ensure_audio_state_storage
             refresh.index("install_remote_sudoers"),
         )
 
-    def test_bridge_unit_carries_the_volume_sync_supplementary_group(self) -> None:
+    def test_bridge_unit_carries_the_audio_supplementary_group(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             base = root / "site"
             unit_dir = root / "units"
             base.mkdir()
             unit_dir.mkdir()
-            (base / "cdsp-automation.env").write_text(
-                "VOLUME_SYNC_GROUP=studio\n", encoding="utf-8"
-            )
             body = "\n".join(
                 [
                     "systemctl() { :; }",
                     'sudo() { if [[ "$1" == install ]]; then command "$@"; fi; }',
-                    "getent() { [[ \"$2\" == studio ]]; }",
+                    "getent() { [[ \"$2\" == audio ]]; }",
                     "create_unit 'AirPlay Volume Bridge' airplay_volume_bridge.py airplay-volume-bridge --daemon",
                 ]
             )
@@ -963,16 +926,16 @@ ensure_audio_state_storage
             unit = (unit_dir / "airplay-volume-bridge.service").read_text(
                 encoding="utf-8"
             )
-            self.assertIn("SupplementaryGroups=studio", unit)
+            self.assertIn("SupplementaryGroups=audio", unit)
 
             missing = self._run(
-                body.replace('[[ "$2" == studio ]]', "false"), env=environment
+                body.replace('[[ "$2" == audio ]]', "false"), env=environment
             )
             unit = (unit_dir / "airplay-volume-bridge.service").read_text(
                 encoding="utf-8"
             )
             self.assertNotIn("SupplementaryGroups", unit)
-            self.assertIn("group 'studio' does not exist", missing)
+            self.assertIn("group 'audio' does not exist", missing)
 
     def test_uninstall_removes_both_sudoers_files_and_the_unit_files(
         self,
@@ -1014,23 +977,20 @@ ensure_audio_state_storage
             self.assertFalse((sudoers / "cdsp-automation").exists())
             self.assertFalse((sudoers / "cdsp-automation-receivers").exists())
 
-    def test_default_env_publishes_the_backup_directory_and_site_name(self) -> None:
+    def test_default_env_publishes_only_site_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = self._run(
                 "default_env",
                 env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": f"{directory}/site"},
             )
             rendered = output.splitlines()
-            self.assertIn(
-                "AUDIO_EQ_BACKUP_DIR=/var/lib/cdsp-automation/audio-eq-backups",
-                rendered,
-            )
             self.assertIn("SITE_NAME=CamillaDSP", rendered)
             self.assertIn("SPOTIFY_ALSA_DEVICE=", rendered)
-            self.assertIn(
-                "SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=/run/raspotify/cdsp-volume.sock",
-                rendered,
-            )
+            self.assertIn("AIRPLAY_INTERRUPTED_LMS_PLAYERS=", rendered)
+            # Paths and timings are fixed in the scripts, not published here.
+            self.assertNotIn("AUDIO_EQ_BACKUP_DIR", output)
+            self.assertNotIn("SPOTIFY_VOLUME_COMMAND_SOCKET_PATH", output)
+            self.assertNotIn("SOURCE_IDLE_TIMEOUT", output)
 
     def test_docs_describe_the_control_ui_security_posture_the_code_has(self) -> None:
         """The documented posture drifting from the code is how an operator

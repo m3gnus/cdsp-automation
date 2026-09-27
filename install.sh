@@ -48,9 +48,9 @@ unset _tool
 SHAIRPORT_CONFIG="${CDSP_AUTOMATION_SHAIRPORT_CONFIG:-/etc/shairport-sync.conf}"
 RASPOTIFY_DROPIN_DIR="${CDSP_AUTOMATION_RASPOTIFY_DROPIN_DIR:-/etc/systemd/system/raspotify.service.d}"
 SPOTIFY_DROPIN_PATH="$RASPOTIFY_DROPIN_DIR/cdsp-volume-sync.conf"
-SPOTIFY_COMMAND_SOCKET_DEFAULT="/run/raspotify/cdsp-volume.sock"
-AUDIO_EQ_BACKUP_DEFAULT="/var/lib/cdsp-automation/audio-eq-backups"
-ISO226_CAPABILITY_DEFAULT="/var/lib/cdsp-automation/iso226-engine.json"
+# Fixed in scripts/settings.py too.
+STATE_DIR="/var/lib/cdsp-automation"
+SITE_CONFIG_DIR="/etc/cdsp-automation"
 
 CDSP_SERVICES=(
   cdsp-trigger
@@ -62,78 +62,26 @@ CDSP_SERVICES=(
 default_env() {
   cat <<EOF
 # CamillaDSP automation settings.
-# This file is preserved when scripts are updated.
+# This file is preserved when scripts are updated.  Paths and timings are fixed
+# in the scripts (see scripts/settings.py); only what varies per site is here.
 CDSP_HOST=127.0.0.1
 CDSP_PORT=1234
-# The control UI runs as root, so it cannot derive these from \$HOME.
+# The control UI runs as root, so it cannot derive this from \$HOME.
 CDSP_CONFIG_DIR=$CONFIGS_DIR
-CDSP_AUTOMATION_ENV=$ENV_FILE
+SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
 POWER_GPIO=4
-TRIGGER_DELAY_SECONDS=320
-TRIGGER_CHECK_INTERVAL=0.2
-TRIGGER_AUDIO_THRESHOLD_DB=-80
 # The MOTU's control WebSocket.  The source switcher is its only client.
 MOTU_WS_URL=ws://169.254.51.193:1280
 # MOTU main output level, set from the control UI.  It sits after CamillaDSP,
-# so the profile volume limits do not bound it: this ceiling does.  -6 dB is
-# where the device stood when the control was added; raise it deliberately.
+# so the profile volume limits do not bound it: this ceiling does.
 MOTU_MAIN_VOLUME_MAX_DB=0
-SOURCE_CHECK_INTERVAL=1.0
-SOURCE_IDLE_TIMEOUT=60
-SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
-SOURCE_PREEMPT_DWELL_SECONDS=2
-SOURCE_PROBE_SILENCE_TIMEOUT=5
-SOURCE_PROBE_BACKOFF_SECONDS=30
-SOURCE_PROBE_BACKOFF_FACTOR=4
-SOURCE_PROBE_BACKOFF_MAX=900
-SOURCE_AUDIO_THRESHOLD_DB=-80
-SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
-SOURCE_TOSLINK_MOTU_METERS=true
-# The switcher moves the MOTU clock with the source (optical for TOSLINK,
-# internal otherwise) inside its muted transition; false leaves it alone.
-SOURCE_MOTU_CLOCK=true
-MOTU_CLOCK_SETTLE_SECONDS=1.0
-SOURCE_ANALOG_MOTU_METERS=false
-SOURCE_IDLE_MODE=keep-last
-SOURCE_TOSLINK_METER_PAIRS=12,13
-SOURCE_ANALOG_METER_PAIRS=16,18
-SOURCE_MOTU_METER_ACTIVE_BELOW=250
-SOURCE_TOSLINK_ACTIVE_SECONDS=0.5
-SOURCE_TOSLINK_IDLE_SECONDS=5
-SOURCE_ANALOG_ACTIVE_SECONDS=5
-SOURCE_ANALOG_IDLE_SECONDS=30
-SOURCE_DEBUG=false
-SOURCE_RECOVERY_RETRY_SECONDS=10
-SOURCE_RECOVERY_LOG_SECONDS=30
-AUDIO_EQ_PATH=/var/lib/cdsp-automation/audio-eq.json
-AUDIO_EQ_STATUS_PATH=/run/cdsp-source-switcher/audio-eq-status.json
-AUDIO_EQ_BACKUP_DIR=$AUDIO_EQ_BACKUP_DEFAULT
-AUDIO_CONTROL_LOCK_PATH=/var/lib/cdsp-automation/audio-control.lock
-AUDIO_EQ_REAPPLY_SECONDS=1.0
-SPEAKER_SELECTION_PATH=/var/lib/cdsp-automation/speaker-selection.json
-SPEAKER_CATALOG_PATH=/etc/cdsp-automation/speaker-catalog.json
-SPEAKER_AUDIO_DIR=/var/lib/cdsp-automation/speaker-audio
-SPEAKER_PROFILE_DIR=/etc/cdsp-automation/speaker-profiles
-SOURCE_BASE_DIR=/etc/cdsp-automation/source-bases
-SPEAKER_GENERATED_DIR=/var/lib/cdsp-automation/generated-configs
-SPEAKER_STATUS_PATH=/run/cdsp-source-switcher/speaker-profile-status.json
-CAMILLA_BINARY=camilladsp
-CONFIG_VALIDATE_TIMEOUT=10
 AIRPLAY_VOLUME_MIN_DB=-50
 AIRPLAY_VOLUME_MAX_DB=0
-AIRPLAY_VOLUME_CURVE=1.0
-AIRPLAY_VOLUME_STATUS_PATH=/run/airplay-volume-bridge/status.json
-AIRPLAY_VOLUME_SOCKET_PATH=/run/airplay-volume-bridge/input.sock
-SPOTIFY_VOLUME_COMMAND_SOCKET_PATH=$SPOTIFY_COMMAND_SOCKET_DEFAULT
+# Comma-separated LMS player names to stop when AirPlay or Spotify starts.
+AIRPLAY_INTERRUPTED_LMS_PLAYERS=
 # Empty leaves raspotify's own device configuration in force; set an ALSA PCM
 # name here (see 'aplay -L') only to override it.
 SPOTIFY_ALSA_DEVICE=
-VOLUME_SYNC_POLL_INTERVAL=0.25
-VOLUME_SYNC_COMMAND_RETRY_SECONDS=1.0
-VOLUME_SYNC_COMMAND_ACK_TIMEOUT=3.0
-VOLUME_SYNC_HEARTBEAT_SECONDS=10.0
-VOLUME_SYNC_GROUP=audio
-ISO226_CAPABILITY_PATH=$ISO226_CAPABILITY_DEFAULT
 # Control UI bind address.  0.0.0.0 is every interface, which is what this
 # component has always done, so an upgrade does not take the UI away from a
 # working install.  Set 127.0.0.1 to reach it only from the Pi itself, over an
@@ -148,10 +96,6 @@ INSTALLATION_UI_TOKEN=
 # Shown in the control UI's page title and header.
 SITE_NAME=CamillaDSP
 REMOTE_NAME=HID Remote01 Keyboard
-REMOTE_DEVICE_RETRY_SECONDS=2
-REMOTE_STATUS_LOG_SECONDS=300
-REMOTE_RESTART_HOLD_SECONDS=1
-REMOTE_SHUTDOWN_HOLD_SECONDS=10
 EOF
 }
 
@@ -311,7 +255,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
+  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -370,43 +314,22 @@ ensure_user_writable_dir() {
 }
 
 ensure_audio_state_storage() {
-  local lock audio_eq_path audio_control_lock_path speaker_selection_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
-  audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
-  audio_eq_backup_dir="$(get_env_value AUDIO_EQ_BACKUP_DIR)"
-  audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
-  speaker_selection_path="$(get_env_value SPEAKER_SELECTION_PATH)"
-  speaker_audio_dir="$(get_env_value SPEAKER_AUDIO_DIR)"
-  speaker_profile_dir="$(get_env_value SPEAKER_PROFILE_DIR)"
-  source_base_dir="$(get_env_value SOURCE_BASE_DIR)"
-  generated_dir="$(get_env_value SPEAKER_GENERATED_DIR)"
-  : "${audio_eq_path:=/var/lib/cdsp-automation/audio-eq.json}"
-  : "${audio_control_lock_path:=/var/lib/cdsp-automation/audio-control.lock}"
-  : "${speaker_selection_path:=/var/lib/cdsp-automation/speaker-selection.json}"
-  : "${speaker_audio_dir:=/var/lib/cdsp-automation/speaker-audio}"
-  : "${speaker_profile_dir:=/etc/cdsp-automation/speaker-profiles}"
-  : "${source_base_dir:=/etc/cdsp-automation/source-bases}"
-  : "${generated_dir:=/var/lib/cdsp-automation/generated-configs}"
-  : "${audio_eq_backup_dir:=$AUDIO_EQ_BACKUP_DEFAULT}"
-  ensure_user_writable_dir "$(dirname "$audio_eq_path")"
-  ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"
-  ensure_user_writable_dir "$(dirname "$speaker_selection_path")"
-  ensure_user_writable_dir "$speaker_audio_dir"
-  ensure_user_writable_dir "$generated_dir"
-  ensure_user_writable_dir "$audio_eq_backup_dir"
-  if [[ ! -d "$speaker_profile_dir" ]]; then
-    sudo install -d -m 0755 "$speaker_profile_dir"
-  fi
-  if [[ ! -d "$source_base_dir" ]]; then
-    sudo install -d -m 0755 "$source_base_dir"
-  fi
+  local lock dir
+  ensure_user_writable_dir "$STATE_DIR"
+  ensure_user_writable_dir "$STATE_DIR/speaker-audio"
+  ensure_user_writable_dir "$STATE_DIR/generated-configs"
+  ensure_user_writable_dir "$STATE_DIR/audio-eq-backups"
+  for dir in "$SITE_CONFIG_DIR/speaker-profiles" "$SITE_CONFIG_DIR/source-bases"; do
+    [[ -d "$dir" ]] || sudo install -d -m 0755 "$dir"
+  done
   # The locks every component shares are claimed by whichever process opens
   # them first, which on a fresh install can be the root UI or the root
   # Shairport callback.  Own them here, before anything runs.  Per-speaker
   # locks appear later and are covered by the UI unit's Group= and UMask=.
   for lock in \
-    "${audio_eq_path}.lock" \
-    "$audio_control_lock_path" \
-    "${speaker_selection_path}.lock"; do
+    "$STATE_DIR/audio-eq.json.lock" \
+    "$STATE_DIR/audio-control.lock" \
+    "$STATE_DIR/speaker-selection.json.lock"; do
     if [[ ! -e "$lock" ]]; then
       sudo -u "$INSTALL_USER" touch "$lock"
     fi
@@ -436,23 +359,16 @@ create_unit() {
   elif [[ "$sysname" == "airplay-volume-bridge" ]]; then
     runtime_directory=$'RuntimeDirectory=airplay-volume-bridge\nRuntimeDirectoryMode=0755'
     unit_ordering='Before=shairport-sync.service raspotify.service'
-    # The bridge both chowns its own receiver socket to this group and writes
-    # to librespot's group-owned command socket, so it needs the membership in
-    # both directions.  Service-scoped, rather than adding the login account to
-    # the group, and effective without a re-login.
-    local sync_group
-    sync_group="$(get_env_value VOLUME_SYNC_GROUP)"
-    : "${sync_group:=audio}"
-    if [[ ! "$sync_group" =~ ^[a-zA-Z0-9._-]+$ ]]; then
-      echo "WARNING: VOLUME_SYNC_GROUP is not a valid group name: $sync_group" >&2
-      echo "         The bridge socket and the Spotify drop-in will disagree; fix it in $ENV_FILE." >&2
-    elif getent group "$sync_group" >/dev/null; then
-      runtime_directory+=$'\n'"SupplementaryGroups=$sync_group"
+    # The bridge both chowns its own receiver socket to the audio group and
+    # writes to librespot's group-owned command socket, so it needs the
+    # membership in both directions.  Service-scoped, rather than adding the
+    # login account to the group, and effective without a re-login.
+    if getent group audio >/dev/null; then
+      runtime_directory+=$'\n'"SupplementaryGroups=audio"
     else
-      echo "WARNING: group '$sync_group' does not exist on this system." >&2
+      echo "WARNING: group 'audio' does not exist on this system." >&2
       echo "         The AirPlay bridge cannot restrict its socket to it, and the" >&2
-      echo "         Spotify drop-in would name a missing group; create it or set" >&2
-      echo "         VOLUME_SYNC_GROUP in $ENV_FILE." >&2
+      echo "         Spotify drop-in would name a missing group." >&2
     fi
   fi
 
@@ -639,7 +555,7 @@ install_airplay_volume_bridge() {
   ensure_source_switcher "AirPlay/Spotify volume bridge"
   sudo install -d -m 0755 /usr/local/libexec
   sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
-  sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
+  sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
   # Before create_unit, which starts the daemon: a bridge that comes up without
   # its receiver authorization cannot hand playback over.
   install_receiver_sudoers || return 1
@@ -654,9 +570,6 @@ install_spotify_volume_sync() {
   fi
   echo "Building the pinned Spotify Connect volume-sync receiver..."
   SPOTIFY_ALSA_DEVICE="$(get_env_value SPOTIFY_ALSA_DEVICE)" \
-  SPOTIFY_VOLUME_COMMAND_SOCKET_PATH="$(get_env_value SPOTIFY_VOLUME_COMMAND_SOCKET_PATH)" \
-  AIRPLAY_VOLUME_SOCKET_PATH="$(get_env_value AIRPLAY_VOLUME_SOCKET_PATH)" \
-  VOLUME_SYNC_GROUP="$(get_env_value VOLUME_SYNC_GROUP)" \
   "$SCRIPTS_DIR/build_librespot_volume_sync.sh" "$BASE_DIR/librespot-volume-sync/librespot-v0.8.0-volume-sync.patch"
 }
 
@@ -681,8 +594,8 @@ install_control_ui() {
   ui_port="$(control_ui_bind_port)"
   echo "Installing the web control UI (optional)..."
   echo ""
-  echo "The UI manages sources, volume, EQ, speaker profiles, services,"
-  echo "storage and the system clock, so its service runs as root."
+  echo "The UI manages sources, volume, EQ, speaker profiles and services,"
+  echo "so its service runs as root."
   echo "It will bind to ${ui_host}:${ui_port} (INSTALLATION_UI_HOST in $ENV_FILE)."
   if [[ -n "$(get_env_value INSTALLATION_UI_TOKEN)" ]]; then
     echo "INSTALLATION_UI_TOKEN is set: state-changing requests need that secret."
@@ -704,7 +617,7 @@ After=network-online.target camilladsp.service
 
 [Service]
 Type=simple
-# No User=: the UI needs root for systemctl, date -s and umount.  Group= only
+# No User=: the UI needs root for systemctl.  Group= only
 # changes the group of the files it creates, so a lock or state file it makes
 # first stays writable by the daemons running as $INSTALL_USER.
 Group=$INSTALL_GROUP
@@ -785,7 +698,7 @@ refresh_installed_units() {
   if systemctl list-unit-files --no-legend airplay-volume-bridge.service 2>/dev/null | grep -q '^airplay-volume-bridge.service'; then
     sudo install -d -m 0755 /usr/local/libexec
     sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
-    sudo install -m 0644 "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
+    sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
     install_receiver_sudoers
     create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon
     configure_shairport_bridge || note_skip "AirPlay Shairport configuration: FAILED (previous settings were restored)"
@@ -831,14 +744,7 @@ uninstall_all() {
   remove_motu_sync
   sudo rm -f "$SUDOERS_DIR/cdsp-automation" "$SUDOERS_DIR/cdsp-automation-receivers"
   if [[ -x "$SCRIPTS_DIR/build_camilladsp_iso226.sh" ]]; then
-    # The receipt is the builder's only proof that it - and not the operator -
-    # installed /usr/local/bin/camilladsp, so it has to look where this
-    # deployment actually keeps it or it would find nothing and skip its work.
-    local iso_capability
-    iso_capability="$(get_env_value ISO226_CAPABILITY_PATH)"
-    : "${iso_capability:=$ISO226_CAPABILITY_DEFAULT}"
-    ISO226_CAPABILITY_PATH="$iso_capability" \
-      "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
+    "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
   fi
   if [[ -x "$SCRIPTS_DIR/build_librespot_volume_sync.sh" ]]; then
     "$SCRIPTS_DIR/build_librespot_volume_sync.sh" --uninstall || true
@@ -850,7 +756,7 @@ uninstall_all() {
   sudo systemctl stop cdsp-control-ui.service 2>/dev/null || true
   sudo systemctl disable cdsp-control-ui.service 2>/dev/null || true
   remove_unit_file cdsp-control-ui.service
-  sudo rm -f /usr/local/libexec/airplay_volume_bridge.py \
+  sudo rm -f /usr/local/libexec/airplay_volume_bridge.py /usr/local/libexec/settings.py \
     /usr/local/libexec/speaker_profiles.py /usr/local/libexec/audio_eq.py
   sudo systemctl daemon-reload
   echo "Uninstalled."
@@ -891,10 +797,7 @@ update_utilities() {
   # Deliberately no engine rebuild: that would replace the running CamillaDSP
   # binary and restart it, which a routine update must never do.  Menu option 9
   # rebuilds it when the operator asks for it.
-  local iso_capability
-  iso_capability="$(get_env_value ISO226_CAPABILITY_PATH)"
-  : "${iso_capability:=$ISO226_CAPABILITY_DEFAULT}"
-  if [[ -f "$iso_capability" ]]; then
+  if [[ -f "$STATE_DIR/iso226-engine.json" ]]; then
     echo "An ISO 226 engine is installed and was left running untouched."
     echo "Run menu option 9 to rebuild it against the downloaded pinned patch."
   fi
@@ -917,8 +820,7 @@ update_utilities() {
 # keyboard, rather than letting a speaker go silent at its next transition.
 audit_operator_volume_limits() {
   local profile_dir config_dir output
-  profile_dir="$(get_env_value SPEAKER_PROFILE_DIR)"
-  : "${profile_dir:=/etc/cdsp-automation/speaker-profiles}"
+  profile_dir="$SITE_CONFIG_DIR/speaker-profiles"
   config_dir="$(get_env_value CDSP_CONFIG_DIR)"
   : "${config_dir:=$CONFIGS_DIR}"
   [[ -x "$VENV_DIR/bin/python3" ]] || return 0
@@ -998,8 +900,8 @@ confirm_control_ui_exposure() {
   ui_host="$(control_ui_bind_host)"
   ui_port="$(control_ui_bind_port)"
   echo ""
-  echo "The web control UI is a root web server: it restarts services, mounts"
-  echo "storage, sets the system clock and changes volume."
+  echo "The web control UI is a root web server: it restarts services and"
+  echo "changes volume."
   echo "It will bind to ${ui_host}:${ui_port} (INSTALLATION_UI_HOST in $ENV_FILE)."
   if [[ -n "$(get_env_value INSTALLATION_UI_TOKEN)" ]]; then
     auth="a shared secret is required"

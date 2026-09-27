@@ -123,28 +123,6 @@ def test_live_meter_recovers_from_invalid_levels_and_ignores_nonfinite_values() 
         assert web_ui.camilla_levels() == {"ok": True, "signal_db": -42.5}
 
 
-def test_media_folder_scan_lists_sessions_and_tolerates_drive_disappearing(
-    tmp_path: Path,
-) -> None:
-    """The UI renders only the folder count, so the scan must not stat files."""
-    for name in ("Session B", "session a", ".Spotlight-V100"):
-        (tmp_path / name).mkdir()
-    (tmp_path / "track.wav").write_bytes(b"")
-    (tmp_path / "._track.wav").write_bytes(b"")
-
-    with patch.object(web_ui, "MEDIA_ROOT", tmp_path):
-        assert web_ui.list_media_folders() == [
-            {"name": "session a"},
-            {"name": "Session B"},
-        ]
-
-    with (
-        patch.object(web_ui, "MEDIA_ROOT", tmp_path),
-        patch.object(Path, "iterdir", side_effect=OSError("unmounted")),
-    ):
-        assert web_ui.list_media_folders() == []
-
-
 def test_web_audio_state_follows_selected_speaker_profile(tmp_path: Path) -> None:
     selection_path = tmp_path / "selection.json"
     audio_dir = tmp_path / "audio"
@@ -351,6 +329,26 @@ def test_iso226_ui_rejects_enable_without_verified_engine(tmp_path: Path) -> Non
             raise AssertionError("ISO 226 enabled without verified engine")
 
 
+def test_iso226_receipt_naming_the_engine_is_enough(tmp_path: Path) -> None:
+    from scripts import source_switcher
+
+    receipt = tmp_path / "iso226-engine.json"
+    for content, available in (
+        ('{"engine":"Iso226","upstream_commit":"05e9cfcd"}', True),
+        ('{"engine":"Other"}', False),
+        ("not json", False),
+    ):
+        receipt.write_text(content, encoding="utf-8")
+        with (
+            patch.object(web_ui, "ISO226_CAPABILITY_PATH", receipt),
+            patch.object(source_switcher, "ISO226_CAPABILITY_PATH", receipt),
+        ):
+            assert web_ui.iso226_capability()[1] is available
+            assert source_switcher.iso226_capability_available() is available
+    with patch.object(source_switcher, "ISO226_CAPABILITY_PATH", tmp_path / "gone"):
+        assert source_switcher.iso226_capability_available() is False
+
+
 def test_simultaneous_audio_posts_cannot_both_overwrite_revision(
     tmp_path: Path,
 ) -> None:
@@ -401,13 +399,13 @@ def test_speaker_profile_deployment_and_gui_contract_are_present() -> None:
     assert len(example["muted_outputs"]) == example["output_channels"]
 
     installer = (REPOSITORY / "install.sh").read_text()
-    for setting in (
-        "SPEAKER_PROFILE_DIR",
-        "SOURCE_BASE_DIR",
-        "SPEAKER_GENERATED_DIR",
-        "AUDIO_CONTROL_LOCK_PATH",
+    for directory in (
+        "speaker-profiles",
+        "source-bases",
+        "generated-configs",
+        "audio-control.lock",
     ):
-        assert setting in installer
+        assert directory in installer
     assert 'id="speakerProfiles"' in web_ui.HTML
     assert 'api("/api/speaker"' in web_ui.HTML
     assert "speakerState?.selection?.selected" in web_ui.HTML
@@ -1258,9 +1256,9 @@ def test_read_only_endpoints_stay_open_when_a_token_is_configured() -> None:
     assert "authorize_state_change" not in inspect.getsource(web_ui.Handler.do_GET)
 
     with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
-        handler = _DrivableHandler("/api/storage", _raw_headers(), b"")
+        handler = _DrivableHandler("/api/levels", _raw_headers(), b"")
         handler.command = "GET"
-        with patch.object(web_ui, "storage_status", return_value={"mounted": False}):
+        with patch.object(web_ui, "camilla_levels", return_value={"signal_db": None}):
             handler.do_GET()
     assert handler.status == HTTPStatus.OK
 

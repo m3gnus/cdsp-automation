@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import math
-import os
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import settings
 from audio_eq import (
     atomic_write_json,
     audio_state_lock,
@@ -31,9 +31,7 @@ SELECTION_VERSION = 1
 # path); every other speaker is a managed profile. LEGACY_SPEAKER_ID is a
 # readable alias for that same identity at the call sites that care about
 # the legacy state path rather than the boot selection.
-SPEAKER_CATALOG_PATH = os.environ.get(
-    "SPEAKER_CATALOG_PATH", "/etc/cdsp-automation/speaker-catalog.json"
-)
+SPEAKER_CATALOG_PATH = settings.SPEAKER_CATALOG_PATH
 DEFAULT_SPEAKER_ID = "kantarellen"
 LEGACY_SPEAKER_ID = DEFAULT_SPEAKER_ID
 # These profiles are complete operator-owned CamillaDSP files in the normal

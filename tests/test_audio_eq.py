@@ -270,11 +270,6 @@ def test_iso226_patch_is_pinned_tested_and_fader_linked() -> None:
     assert "Reference phon must be between 40 and 90" in patch_text
     assert audio_eq.ISO226_MAX_PHON == 90
     assert 'max="90"' in (REPOSITORY / "scripts" / "web_ui.py").read_text()
-    assert "binary_sha256" in (REPOSITORY / "scripts" / "web_ui.py").read_text()
-    assert (
-        "binary_sha256"
-        in (REPOSITORY / "scripts" / "source_switcher.py").read_text()
-    )
 
 
 def test_reference_phon_is_limited_to_the_iso_range() -> None:

@@ -186,7 +186,7 @@ class VolumeSyncTests(unittest.TestCase):
         environment = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith(("SPOTIFY_", "VOLUME_SYNC_", "AIRPLAY_VOLUME_"))
+            if not key.startswith("SPOTIFY_")
         }
         environment.update(settings)
         return subprocess.run(
@@ -214,24 +214,15 @@ class VolumeSyncTests(unittest.TestCase):
         )
         self.assertIn("Group=audio", result.stdout)
 
-    def test_dropin_renders_the_configured_device_socket_and_group(self) -> None:
-        result = self._print_dropin(
-            SPOTIFY_ALSA_DEVICE="hw:CARD=Loopback,DEV=0",
-            SPOTIFY_VOLUME_COMMAND_SOCKET_PATH="/run/raspotify/site.sock",
-            VOLUME_SYNC_GROUP="snd",
-        )
+    def test_dropin_renders_the_configured_device(self) -> None:
+        result = self._print_dropin(SPOTIFY_ALSA_DEVICE="hw:CARD=Loopback,DEV=0")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "ExecStart=/usr/local/bin/librespot-cdsp --device hw:CARD=Loopback,DEV=0\n",
             result.stdout,
         )
-        self.assertIn(
-            "Environment=CDSP_SPOTIFY_VOLUME_SOCKET=/run/raspotify/site.sock",
-            result.stdout,
-        )
-        self.assertIn("Group=snd", result.stdout)
-        # One setting drives both the unit and the health check, so the drop-in
-        # and the post-install probe can no longer disagree.
+        # One value drives both the unit and the health check, so the drop-in
+        # and the post-install probe cannot disagree.
         builder = BUILDER.read_text(encoding="utf-8")
         self.assertIn('[[ ! -S "$COMMAND_SOCKET" ]]', builder)
 
@@ -239,8 +230,6 @@ class VolumeSyncTests(unittest.TestCase):
         for setting in (
             {"SPOTIFY_ALSA_DEVICE": "x; reboot"},
             {"SPOTIFY_ALSA_DEVICE": "%H"},
-            {"SPOTIFY_VOLUME_COMMAND_SOCKET_PATH": "relative.sock"},
-            {"VOLUME_SYNC_GROUP": "bad group"},
         ):
             result = self._print_dropin(**setting)
             self.assertNotEqual(result.returncode, 0, setting)
@@ -627,9 +616,11 @@ def test_network_sender_volume_is_capped_by_the_applied_profile(
 def test_airplay_notify_callback_starts_without_deployment_helpers(
     tmp_path: Path,
 ) -> None:
-    """The /usr/local callback copy must not import daemon-only modules."""
+    """The /usr/local callback copy must not import daemon-only modules: only
+    settings.py is installed beside it for start-up."""
     callback = tmp_path / "airplay_volume_bridge.py"
     callback.write_bytes(SCRIPT.read_bytes())
+    (tmp_path / "settings.py").write_bytes((SCRIPT.parent / "settings.py").read_bytes())
     result = subprocess.run(
         [sys.executable, str(callback)],
         cwd=tmp_path,

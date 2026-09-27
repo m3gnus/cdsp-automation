@@ -29,6 +29,23 @@ from audio_eq import (
     status_payload,
 )
 import motu_volume
+import settings
+from settings import (
+    AUDIO_CONTROL_LOCK_PATH,
+    AUDIO_EQ_PATH,
+    AUDIO_EQ_STATUS_PATH,
+    CAMILLA_BINARY,
+    CDSP_HOST,
+    CDSP_PORT,
+    ISO226_CAPABILITY_PATH,
+    SOURCE_BASE_DIR,
+    SOURCE_OVERRIDE_PATH,
+    SPEAKER_AUDIO_DIR,
+    SPEAKER_GENERATED_DIR,
+    SPEAKER_PROFILE_DIR,
+    SPEAKER_SELECTION_PATH,
+    SPEAKER_STATUS_PATH,
+)
 from speaker_config import (
     compile_profile_config,
     config_digest,
@@ -53,37 +70,26 @@ from speaker_profiles import (
 )
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
-CAMILLA_IP = os.environ.get("CDSP_HOST", "127.0.0.1")
-CAMILLA_PORT = int(os.environ.get("CDSP_PORT", "1234"))
-CHECK_INTERVAL = float(os.environ.get("SOURCE_CHECK_INTERVAL", "1.0"))
+CAMILLA_IP = CDSP_HOST
+CAMILLA_PORT = CDSP_PORT
+CHECK_INTERVAL = 1.0
 # Longest span one arbitration pass may account for (see main()).
 MAX_ARBITRATION_STEP = 5 * CHECK_INTERVAL
 # How long a source whose playback has been *confirmed* is held through
 # silence before the switcher looks elsewhere.  This is the track-gap grace
 # period and its meaning is unchanged.
-IDLE_TIMEOUT = float(os.environ.get("SOURCE_IDLE_TIMEOUT", "60"))
+IDLE_TIMEOUT = 60.0
 # How far into that grace period a *lower*-priority source with confirmed
 # audio may cut the hold short.  Meaning unchanged, and it governs only the
 # lower-priority direction: an operator who raises it is saying "do not let
 # the TV steal my AirPlay track gap", which must not be read as "do not let
 # AirPlay interrupt a TV that has stopped".
-LOWER_PRIORITY_ACTIVE_TIMEOUT = float(
-    os.environ.get("SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT", "0")
-)
+LOWER_PRIORITY_ACTIVE_TIMEOUT = 0.0
 # How long a rival must have been *continuously confirmed playing* before it
 # may cut a silent source's grace short.  Real audio should not wait, but one
 # noisy meter frame should not yank the config away mid-track either, so a
 # rival has to hold the observation for a couple of passes first.
-PREEMPT_DWELL_SECONDS = max(
-    float(os.environ.get("SOURCE_PREEMPT_DWELL_SECONDS", "2")), 0.0
-)
+PREEMPT_DWELL_SECONDS = 2.0
 # How long an *unconfirmed* source is listened to after the switcher probes it
 # by selecting it.  Hardware readiness (an open ALSA Loopback stream, a USB
 # gadget with a non-zero capture rate, a meter above its floor) says a stream
@@ -91,38 +97,29 @@ PREEMPT_DWELL_SECONDS = max(
 # out is to select the source and read the capture levels.  A probe that hears
 # nothing must give up quickly - IDLE_TIMEOUT is the wrong yardstick here,
 # because nothing was ever playing to leave a gap in.
-PROBE_SILENCE_TIMEOUT = float(os.environ.get("SOURCE_PROBE_SILENCE_TIMEOUT", "5"))
+PROBE_SILENCE_TIMEOUT = 5.0
 # A source probed and found silent is not re-probed until this backoff expires,
 # growing by PROBE_BACKOFF_FACTOR per consecutive silent probe up to
 # PROBE_BACKOFF_MAX.  Without it, hardware readiness alone makes a silent
 # source eligible again on the very next pass, and two ready-but-silent inputs
 # alternate forever - one config reload plus a mute/restore per cycle.
-PROBE_BACKOFF_SECONDS = max(
-    float(os.environ.get("SOURCE_PROBE_BACKOFF_SECONDS", "30")), 0.0
-)
-PROBE_BACKOFF_FACTOR = max(
-    float(os.environ.get("SOURCE_PROBE_BACKOFF_FACTOR", "4")), 1.0
-)
-PROBE_BACKOFF_MAX = max(
-    float(os.environ.get("SOURCE_PROBE_BACKOFF_MAX", "900")),
-    PROBE_BACKOFF_SECONDS,
-)
-SETTLE_TIME = float(os.environ.get("SOURCE_SETTLE_TIME", "2.0"))
+PROBE_BACKOFF_SECONDS = 30.0
+PROBE_BACKOFF_FACTOR = 4.0
+PROBE_BACKOFF_MAX = 900.0
+SETTLE_TIME = 2.0
 # SetConfig/Reload acknowledge that a change was queued, not that the
 # processing controller finished applying it. SETTLE_TIME remains the grace
 # period before the first state read; the engine is then polled until it runs
 # the requested file (or an EQ write shows up) or this bounded deadline expires.
-CONFIG_APPLY_TIMEOUT = float(os.environ.get("SOURCE_CONFIG_APPLY_TIMEOUT", "10.0"))
-CONFIG_APPLY_POLL_INTERVAL = float(
-    os.environ.get("SOURCE_CONFIG_APPLY_POLL_INTERVAL", "0.25")
-)
-AUDIO_THRESHOLD_DB = float(os.environ.get("SOURCE_AUDIO_THRESHOLD_DB", "-80"))
-DEBUG_MODE = env_bool("SOURCE_DEBUG", False)
+CONFIG_APPLY_TIMEOUT = 10.0
+CONFIG_APPLY_POLL_INTERVAL = 0.25
+AUDIO_THRESHOLD_DB = -80.0
+# Verbose arbitration logging.
+DEBUG_MODE = False
 MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
 # Whether the switcher changes the MOTU clock to follow the source, inside its
-# muted transition.  Only an explicit off turns it off; the historical "auto"
-# (which followed a separate clock unit that no longer exists) means on.
-SOURCE_MOTU_CLOCK = os.environ.get("SOURCE_MOTU_CLOCK", "on").strip().lower()
+# muted transition.
+SOURCE_MOTU_CLOCK = True
 # MOTU UltraLite mk5 clock source (CueMix 5 dev.js): parameter 11,
 # ``kClockSource``, one byte; ``kClockSources`` Internal=3, S/PDIF=0,
 # Optical=2.  The writes are CueMix 5's own encoding: id 11, index 0,
@@ -135,108 +132,47 @@ MOTU_CLOCK_WRITES = {
 }
 # How long a fresh MOTU connection gets to push its state dump (every
 # parameter, then the first meter frame).
-MOTU_STATE_TIMEOUT = float(os.environ.get("SOURCE_MOTU_STATE_TIMEOUT", "3.0"))
+MOTU_STATE_TIMEOUT = 3.0
 # How long the MOTU gets to re-lock before the new graph is loaded on it.
-MOTU_CLOCK_SETTLE_SECONDS = float(os.environ.get("MOTU_CLOCK_SETTLE_SECONDS", "1.0"))
+MOTU_CLOCK_SETTLE_SECONDS = 1.0
 # Extra time allowed, past the mute ramp and output buffer, for the playback
 # meter to confirm silence before a clock write is given up.
-MOTU_CLOCK_SILENCE_TIMEOUT = float(os.environ.get("MOTU_CLOCK_SILENCE_TIMEOUT", "1.0"))
+MOTU_CLOCK_SILENCE_TIMEOUT = 1.0
 # Playback peak at or below this reads as silent.
-MOTU_CLOCK_SILENT_DB = float(os.environ.get("MOTU_CLOCK_SILENT_DB", "-100"))
+MOTU_CLOCK_SILENT_DB = -100.0
 # Shortest gap between two out-of-transition clock corrections; each one
 # briefly mutes, so a MOTU that keeps refusing must not blip every pass.
-MOTU_CLOCK_RETRY_SECONDS = float(os.environ.get("MOTU_CLOCK_RETRY_SECONDS", "30"))
-TOSLINK_MOTU_METERS = env_bool("SOURCE_TOSLINK_MOTU_METERS", True)
-ANALOG_MOTU_METERS = env_bool("SOURCE_ANALOG_MOTU_METERS", False)
-MOTU_METER_ACTIVE_BELOW = int(os.environ.get("SOURCE_MOTU_METER_ACTIVE_BELOW", "250"))
-MOTU_METER_MAX_AGE = float(os.environ.get("SOURCE_MOTU_METER_MAX_AGE", "2.0"))
-MOTU_CONNECT_RETRY_SECONDS = float(
-    os.environ.get("SOURCE_MOTU_CONNECT_RETRY_SECONDS", "10")
-)
-MOTU_READ_WINDOW_SECONDS = float(
-    os.environ.get("SOURCE_MOTU_READ_WINDOW_SECONDS", "0.2")
-)
-TOSLINK_ACTIVE_SECONDS = float(os.environ.get("SOURCE_TOSLINK_ACTIVE_SECONDS", "0.5"))
-TOSLINK_IDLE_SECONDS = float(os.environ.get("SOURCE_TOSLINK_IDLE_SECONDS", "5"))
-ANALOG_ACTIVE_SECONDS = float(os.environ.get("SOURCE_ANALOG_ACTIVE_SECONDS", "5"))
-ANALOG_IDLE_SECONDS = float(os.environ.get("SOURCE_ANALOG_IDLE_SECONDS", "30"))
-SOURCE_IDLE_MODE = os.environ.get("SOURCE_IDLE_MODE", "keep-last").strip().lower()
-RECOVERY_RETRY_SECONDS = max(
-    float(os.environ.get("SOURCE_RECOVERY_RETRY_SECONDS", "10")), 1.0
-)
-RECOVERY_LOG_SECONDS = max(
-    float(os.environ.get("SOURCE_RECOVERY_LOG_SECONDS", "30")),
-    RECOVERY_RETRY_SECONDS,
-)
+MOTU_CLOCK_RETRY_SECONDS = 30.0
+TOSLINK_MOTU_METERS = True
+ANALOG_MOTU_METERS = False
+MOTU_METER_ACTIVE_BELOW = 250
+MOTU_METER_MAX_AGE = 2.0
+MOTU_CONNECT_RETRY_SECONDS = 10.0
+MOTU_READ_WINDOW_SECONDS = 0.2
+TOSLINK_ACTIVE_SECONDS = 0.5
+TOSLINK_IDLE_SECONDS = 5.0
+ANALOG_ACTIVE_SECONDS = 5.0
+ANALOG_IDLE_SECONDS = 30.0
+# What to select when every source is idle: keep the last one, or "toslink".
+SOURCE_IDLE_MODE = "keep-last"
+RECOVERY_RETRY_SECONDS = 10.0
+RECOVERY_LOG_SECONDS = 30.0
 
-TOSLINK_METER_PAIRS = tuple(
-    int(value)
-    for value in os.environ.get("SOURCE_TOSLINK_METER_PAIRS", "12,13").split(",")
-    if value.strip()
-)
-ANALOG_METER_PAIRS = tuple(
-    int(value)
-    for value in os.environ.get("SOURCE_ANALOG_METER_PAIRS", "16,18").split(",")
-    if value.strip()
-)
+# MOTU meter channels that carry the TOSLINK and analog inputs.
+TOSLINK_METER_PAIRS = (12, 13)
+ANALOG_METER_PAIRS = (16, 18)
 
-HOME = os.path.expanduser("~")
-CONFIG_DIR = os.environ.get("CDSP_CONFIG_DIR", os.path.join(HOME, "camilladsp/configs"))
+CONFIG_DIR = str(settings.CONFIG_DIR)
 
 TOSLINK_CFG = os.path.join(CONFIG_DIR, "toslink.yml")
 STREAMER_CFG = os.path.join(CONFIG_DIR, "streamer.yml")
 GADGET_CFG = os.path.join(CONFIG_DIR, "gadget.yml")
 ANALOG_CFG = os.path.join(CONFIG_DIR, "analog.yml")
-SOURCE_OVERRIDE_PATH = os.environ.get(
-    "SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source"
-)
-AUDIO_EQ_PATH = os.environ.get(
-    "AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json"
-)
-AUDIO_EQ_STATUS_PATH = os.environ.get(
-    "AUDIO_EQ_STATUS_PATH", "/run/cdsp-source-switcher/audio-eq-status.json"
-)
-ISO226_CAPABILITY_PATH = os.environ.get(
-    "ISO226_CAPABILITY_PATH", "/var/lib/cdsp-automation/iso226-engine.json"
-)
-AUDIO_EQ_REAPPLY_SECONDS = float(os.environ.get("AUDIO_EQ_REAPPLY_SECONDS", "1.0"))
-SPEAKER_SELECTION_PATH = Path(
-    os.environ.get(
-        "SPEAKER_SELECTION_PATH",
-        "/var/lib/cdsp-automation/speaker-selection.json",
-    )
-)
-SPEAKER_AUDIO_DIR = Path(
-    os.environ.get("SPEAKER_AUDIO_DIR", "/var/lib/cdsp-automation/speaker-audio")
-)
-SPEAKER_PROFILE_DIR = Path(
-    os.environ.get("SPEAKER_PROFILE_DIR", "/etc/cdsp-automation/speaker-profiles")
-)
-SOURCE_BASE_DIR = Path(
-    os.environ.get("SOURCE_BASE_DIR", os.path.join(CONFIG_DIR, "source-bases"))
-)
-SPEAKER_GENERATED_DIR = Path(
-    os.environ.get(
-        "SPEAKER_GENERATED_DIR",
-        "/var/lib/cdsp-automation/generated-configs",
-    )
-)
-SPEAKER_STATUS_PATH = Path(
-    os.environ.get(
-        "SPEAKER_STATUS_PATH",
-        "/run/cdsp-source-switcher/speaker-profile-status.json",
-    )
-)
-CAMILLA_BINARY = os.environ.get("CAMILLA_BINARY", "camilladsp")
-CONFIG_VALIDATE_TIMEOUT = float(os.environ.get("CONFIG_VALIDATE_TIMEOUT", "10"))
+AUDIO_EQ_REAPPLY_SECONDS = 1.0
+CONFIG_VALIDATE_TIMEOUT = 10.0
 # CamillaDSP's own ceiling, and therefore the ceiling for anything that
 # declares no cap of its own (the default speaker's full configs).
 DEFAULT_VOLUME_LIMIT_DB = 0.0
-AUDIO_CONTROL_LOCK_PATH = Path(
-    os.environ.get(
-        "AUDIO_CONTROL_LOCK_PATH", "/var/lib/cdsp-automation/audio-control.lock"
-    )
-)
 
 CONFIGS = {
     "toslink": TOSLINK_CFG,
@@ -245,45 +181,13 @@ CONFIGS = {
     "analog": ANALOG_CFG,
 }
 
-_iso226_capability_result = False
-_iso226_capability_next_check = 0.0
-
 def iso226_capability_available() -> bool:
-    """Verify the marker hash against the executable of the live service."""
-    global _iso226_capability_result, _iso226_capability_next_check
-    now = time.monotonic()
-    if now < _iso226_capability_next_check:
-        return _iso226_capability_result
-    _iso226_capability_next_check = now + 30
+    """Whether the ISO 226 engine installer left its receipt."""
     try:
-        capability = json.loads(
-            Path(ISO226_CAPABILITY_PATH).read_text(encoding="utf-8")
-        )
-        pid = int(
-            subprocess.check_output(
-                ["systemctl", "show", "-p", "MainPID", "--value", "camilladsp.service"],
-                text=True,
-                timeout=2,
-            ).strip()
-        )
-        executable = Path(f"/proc/{pid}/exe").resolve(strict=True)
-        digest = hashlib.sha256()
-        with executable.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                digest.update(chunk)
-        _iso226_capability_result = bool(
-            capability.get("engine") == "Iso226"
-            and capability.get("binary_sha256") == digest.hexdigest()
-        )
-    except (
-        OSError,
-        ValueError,
-        TypeError,
-        json.JSONDecodeError,
-        subprocess.SubprocessError,
-    ):
-        _iso226_capability_result = False
-    return _iso226_capability_result
+        capability = json.loads(ISO226_CAPABILITY_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(capability, dict) and capability.get("engine") == "Iso226"
 
 
 METER_FRAME_HEADER = bytes.fromhex("17700000")

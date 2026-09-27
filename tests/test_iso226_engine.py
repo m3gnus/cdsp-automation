@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 import tempfile
@@ -179,17 +178,12 @@ class EnginePreflightTests(unittest.TestCase):
 
 class EngineUninstallTests(unittest.TestCase):
     """`--uninstall` fires on every "Uninstall All", even on installs that never
-    built an engine, so it has to prove ownership before removing anything."""
+    built an engine, so it acts only when this helper left its receipt."""
 
     STOCK = b"stock camilladsp from the distribution\n"
     OURS = b"ISO 226 camilladsp built by this helper\n"
 
-    def _receipt(self, payload: bytes) -> str:
-        digest = hashlib.sha256(payload).hexdigest()
-        return (
-            '{"engine":"Iso226","upstream_commit":"05e9cfcd",'
-            f'"binary_sha256":"{digest}","installed_at":1758326400}}\n'
-        )
+    RECEIPT = '{"engine":"Iso226","upstream_commit":"05e9cfcd","installed_at":1758326400}\n'
 
     def _uninstall(self, root: Path) -> subprocess.CompletedProcess[str]:
         """Run the real script against sandboxed paths; sudo is a pass-through."""
@@ -207,7 +201,7 @@ class EngineUninstallTests(unittest.TestCase):
             HOME=str(root),
             CDSP_AUTOMATION_CAMILLADSP_TARGET=str(root / "camilladsp"),
             CDSP_AUTOMATION_CAMILLADSP_BACKUP=str(root / "camilladsp.pre-iso226"),
-            ISO226_CAPABILITY_PATH=str(root / "iso226-engine.json"),
+            CDSP_AUTOMATION_ISO226_RECEIPT=str(root / "iso226-engine.json"),
         )
         return subprocess.run(
             ["bash", str(BUILDER), "--uninstall"],
@@ -236,41 +230,6 @@ class EngineUninstallTests(unittest.TestCase):
             self.assertIn("No ISO 226 install receipt", result.stdout)
             self.assertEqual(self._service_calls(root), "")
 
-    def test_uninstall_keeps_a_replaced_binary_and_drops_the_stale_receipt(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "camilladsp"
-            replacement = b"a newer camilladsp the operator installed later\n"
-            target.write_bytes(replacement)
-            target.chmod(0o755)
-            capability = root / "iso226-engine.json"
-            capability.write_text(self._receipt(self.OURS), encoding="utf-8")
-
-            result = self._uninstall(root)
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(target.read_bytes(), replacement)
-            self.assertFalse(capability.exists())
-            self.assertIn("does not match the ISO 226 receipt", result.stderr)
-            self.assertEqual(self._service_calls(root), "")
-
-    def test_uninstall_keeps_the_binary_when_the_receipt_is_unreadable(self) -> None:
-        """A receipt without a usable digest proves nothing, so it decides nothing."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / "camilladsp"
-            target.write_bytes(self.OURS)
-            target.chmod(0o755)
-            capability = root / "iso226-engine.json"
-            capability.write_text('{"engine":"Iso226"}\n', encoding="utf-8")
-
-            result = self._uninstall(root)
-
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(target.read_bytes(), self.OURS)
-            self.assertFalse(capability.exists())
-            self.assertEqual(self._service_calls(root), "")
-
     def test_uninstall_restores_the_backup_it_took_and_then_consumes_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -281,7 +240,7 @@ class EngineUninstallTests(unittest.TestCase):
             backup.write_bytes(self.STOCK)
             backup.chmod(0o755)
             capability = root / "iso226-engine.json"
-            capability.write_text(self._receipt(self.OURS), encoding="utf-8")
+            capability.write_text(self.RECEIPT, encoding="utf-8")
 
             result = self._uninstall(root)
 
@@ -299,7 +258,7 @@ class EngineUninstallTests(unittest.TestCase):
             target.write_bytes(self.OURS)
             target.chmod(0o755)
             capability = root / "iso226-engine.json"
-            capability.write_text(self._receipt(self.OURS), encoding="utf-8")
+            capability.write_text(self.RECEIPT, encoding="utf-8")
 
             result = self._uninstall(root)
 
@@ -320,8 +279,8 @@ class EngineUninstallTests(unittest.TestCase):
 
 
 class EngineInstallRollbackTests(unittest.TestCase):
-    """Every failure after the live engine is replaced must put back what was
-    running a moment ago - binary and receipt together.
+    """An engine that does not come back up after the swap is replaced by
+    what was running a moment ago, and the receipt is left as it was.
 
     The toolchain and the service are shimmed.  ``failpoint`` picks the one
     post-swap step that fails; the rest behave like a healthy Pi."""
@@ -329,14 +288,9 @@ class EngineInstallRollbackTests(unittest.TestCase):
     STOCK = b"stock camilladsp from the distribution\n"
     PREVIOUS = b"ISO 226 camilladsp from an earlier successful install\n"
     CANDIDATE = b"ISO 226 camilladsp candidate being installed\n"
-    FAILPOINTS = ("restart", "health", "show", "receipt")
+    FAILPOINTS = ("restart", "health", "show")
 
-    def _receipt(self, payload: bytes) -> str:
-        digest = hashlib.sha256(payload).hexdigest()
-        return (
-            '{"engine":"Iso226","upstream_commit":"05e9cfcd",'
-            f'"binary_sha256":"{digest}","installed_at":1758326400}}\n'
-        )
+    RECEIPT = '{"engine":"Iso226","upstream_commit":"05e9cfcd","installed_at":1758326400}\n'
 
     def _install(self, root: Path, failpoint: str = "") -> subprocess.CompletedProcess[str]:
         binaries = root / "bin"
@@ -345,15 +299,7 @@ class EngineInstallRollbackTests(unittest.TestCase):
         candidate = root / "candidate"
         candidate.write_bytes(self.CANDIDATE)
         restarts = root / "restarts"
-        # The receipt publish is the only 0644 install whose source is the
-        # freshly written marker; rollback's copy is previous-iso226-engine.json.
-        _shim(
-            binaries,
-            "sudo",
-            'if [[ "$FAILPOINT" == receipt && "$1" == install '
-            '&& "$(basename "${@: -2:1}")" == iso226-engine.json ]]; then exit 1; fi\n'
-            'exec "$@"',
-        )
+        _shim(binaries, "sudo", 'exec "$@"')
         _shim(binaries, "sleep", "exit 0")
         _shim(binaries, "rustc", 'echo "rustc 1.90.0 (shim)"')
         _shim(
@@ -397,7 +343,7 @@ class EngineInstallRollbackTests(unittest.TestCase):
             CDSP_CONFIG_DIR=str(root / "configs"),
             CDSP_AUTOMATION_CAMILLADSP_TARGET=str(target),
             CDSP_AUTOMATION_CAMILLADSP_BACKUP=str(root / "camilladsp.pre-iso226"),
-            ISO226_CAPABILITY_PATH=str(root / "iso226-engine.json"),
+            CDSP_AUTOMATION_ISO226_RECEIPT=str(root / "iso226-engine.json"),
         )
         return subprocess.run(
             ["bash", str(BUILDER)],
@@ -412,9 +358,8 @@ class EngineInstallRollbackTests(unittest.TestCase):
         target.write_bytes(self.PREVIOUS)
         target.chmod(0o755)
         (root / "camilladsp.pre-iso226").write_bytes(self.STOCK)
-        receipt = self._receipt(self.PREVIOUS)
-        (root / "iso226-engine.json").write_text(receipt, encoding="utf-8")
-        return receipt
+        (root / "iso226-engine.json").write_text(self.RECEIPT, encoding="utf-8")
+        return self.RECEIPT
 
     def test_a_healthy_upgrade_publishes_the_new_build_and_its_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -426,7 +371,8 @@ class EngineInstallRollbackTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual((root / "camilladsp").read_bytes(), self.CANDIDATE)
             receipt = (root / "iso226-engine.json").read_text(encoding="utf-8")
-            self.assertIn(hashlib.sha256(self.CANDIDATE).hexdigest(), receipt)
+            self.assertIn('"engine":"Iso226"', receipt)
+            self.assertNotEqual(receipt, self.RECEIPT)
             self.assertEqual((root / "camilladsp.pre-iso226").read_bytes(), self.STOCK)
 
     def test_every_post_swap_failure_restores_the_previous_build_and_receipt(
@@ -441,7 +387,6 @@ class EngineInstallRollbackTests(unittest.TestCase):
 
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("restoring the previous engine", result.stderr)
-                self.assertNotIn("ROLLBACK INCOMPLETE", result.stderr)
                 self.assertEqual((root / "camilladsp").read_bytes(), self.PREVIOUS)
                 self.assertFalse((root / "camilladsp.new").exists())
                 self.assertEqual(

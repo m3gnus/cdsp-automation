@@ -1,5 +1,19 @@
 # CamillaDSP Automation Utilities for Raspberry Pi
 
+## Settings
+
+Shared paths (state under `/var/lib/cdsp-automation`, site files under
+`/etc/cdsp-automation`, runtime files under `/run`) are constants in
+`scripts/settings.py`; each script keeps its own timings as constants at its
+top. Only what varies per site is read from `cdsp-automation.env`, which every
+unit loads with `EnvironmentFile=`: `CDSP_HOST`, `CDSP_PORT`,
+`CDSP_CONFIG_DIR` (the env file is its sibling), `SOURCE_OVERRIDE_PATH`,
+`POWER_GPIO`, `MOTU_WS_URL`, `MOTU_MAIN_VOLUME_MAX_DB`, `REMOTE_NAME`,
+`REMOTE_VOLUME_MIN`/`MAX`, `AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`,
+`AIRPLAY_INTERRUPTED_LMS_PLAYERS`, `SPOTIFY_ALSA_DEVICE`, `SITE_NAME` and
+`INSTALLATION_UI_HOST`/`PORT`/`TOKEN`. Other keys in the file are ignored.
+The AirPlay callback copy in `/usr/local/libexec` gets `settings.py` beside it.
+
 ## Speaker-profile contract
 
 Speaker selection is stored as a versioned, compare-and-swap document at
@@ -41,10 +55,10 @@ Every config switch runs inside the shared audio-control lock
 integrity/selection checks → MOTU clock (if it changes) → reload → check →
 EQ overlay → volume clamp → publish status → restore the listener's mute
 state. The file is checked with `camilladsp -c` (`validate_config_file`)
-before the reload. After the reload, `SOURCE_SETTLE_TIME` (default 2 s; 1.5 s
+before the reload. After the reload, `SETTLE_TIME` (2 s; 1.5 s
 for the USB gadget) is only a grace period before the first look; the check
 is simply that the engine reports Running or Paused on the requested config
-path within `SOURCE_CONFIG_APPLY_TIMEOUT` (measured from the reload), so a
+path within `CONFIG_APPLY_TIMEOUT` (10 s, measured from the reload), so a
 slow Starting phase is not mistaken for a failure.
 
 Any failure reloads the previous config (checked the same way) and leaves the
@@ -73,7 +87,7 @@ explicit engine restart restarts the switcher too (`PartOf=`).
 
 CamillaDSP answers `SetConfig` and `SetConfigValue` once the change is
 *queued*, not applied, so the EQ overlay write (including the measurement
-bypass) polls for its own expected state against `SOURCE_CONFIG_APPLY_TIMEOUT`
+bypass) polls for its own expected state against `CONFIG_APPLY_TIMEOUT`
 instead of reading back once. An EQ write is confirmed only when the whole
 filter set and pipeline match, so a bypass that has not yet removed a legacy
 Bass/Treble/Loudness stage, or an engine reporting no config, never reads as
@@ -121,13 +135,13 @@ Automatically turns on a GPIO pin when music is playing and turns it off after 5
 
 ### How it works (detailed):
 
-The script continuously monitors CamillaDSP's capture RMS levels every 200ms by default. When any channel is above the configured activity threshold (`TRIGGER_AUDIO_THRESHOLD_DB`, default `-80` dB), it immediately sets GPIO pin 4 HIGH. When silence is detected, it starts a 320-second countdown timer. Only if silence persists for the full duration does it set the pin LOW.
+The script continuously monitors CamillaDSP's capture RMS levels every 200ms by default. When any channel is above the configured activity threshold (`AUDIO_THRESHOLD_DB`, `-80` dB), it immediately sets GPIO pin 4 HIGH. When silence is detected, it starts a 320-second countdown timer. Only if silence persists for the full duration does it set the pin LOW.
 
 **Why this approach:**
 
 - **200ms polling interval** - Fast enough to catch audio immediately, but not so frequent it wastes CPU
 - **320-second timeout** - Long enough to handle natural gaps in music (between tracks, quiet passages) without constantly cycling your amplifier on/off, which could cause pops or reduce component life
-- **Configurable RMS threshold** - Defaults to `-80` dB, avoiding a hard dependency on sentinel values and keeping quiet-but-real audio detectable
+- **RMS threshold** - `-80` dB, avoiding a hard dependency on sentinel values and keeping quiet-but-real audio detectable
 - **Uses lgpio** - The modern GPIO library that works with current Raspberry Pi OS versions (RPi.GPIO is deprecated)
 - **Manual off without disabling automation** - `SIGUSR1` drops the relay
   immediately and suppresses the current continuous audio session; after
@@ -161,7 +175,7 @@ connection and uses it for everything, as CueMix 5 itself does:
 - **State** - on every new connection the device pushes its whole parameter
   set unsolicited (one `id, index, value` frame per parameter), then the meter
   stream, and afterwards pushes any parameter that changes. The switcher reads
-  that dump before using a fresh connection (up to `SOURCE_MOTU_STATE_TIMEOUT`,
+  that dump before using a fresh connection (up to `MOTU_STATE_TIMEOUT`,
   3 s), so the clock source (parameter 11, `kClockSource`: Internal=3,
   S/PDIF=0, Optical=2) and the main volume are known without asking. While
   the switcher is disconnected - for example while CueMix 5 holds the device -
@@ -169,22 +183,23 @@ connection and uses it for everything, as CueMix 5 itself does:
 - **Writes** - CueMix 5's own layout, `id, index, length, value`, on the same
   socket: `000b0000000103` for internal, `000b0000000102` for optical.
 
-**Clock changes inside the mute window.** With `SOURCE_MOTU_CLOCK=true` (the
-default; `false` leaves the clock alone), every clock write is one operation:
+**Clock changes inside the mute window.** While `SOURCE_MOTU_CLOCK` is true
+(set `False` in `source_switcher.py` to leave the clock alone), every clock
+write is one operation:
 under the audio-control lock, with mute requested, the switcher first waits
 for the output to actually go silent, then writes, then waits
-`MOTU_CLOCK_SETTLE_SECONDS` for the re-lock, then reconnects so the fresh
+`MOTU_CLOCK_SETTLE_SECONDS` (1 s) for the re-lock, then reconnects so the fresh
 state dump - not its own belief - says whether the device took the value.
 "Silent" is not the mute flag: CamillaDSP ramps mute over `volume_ramp_time`
 (400 ms by default), and behind the ramp sit up to `queuelimit` processed
 chunks plus the `target_level` device buffer. The switcher waits out the ramp,
-requires the playback peak meter to read at or below `MOTU_CLOCK_SILENT_DB`
+requires the playback peak meter to read at or below `MOTU_CLOCK_SILENT_DB` (-100 dB)
 over the queued-audio window, then lets that span drain. The meter only
 reports chunks it played, so an idle engine returns an empty history; that
 counts as silence only when the engine state was also read successfully as
 `Paused` or `Inactive`. A failed or malformed meter reading, `Starting`,
 `Stalled` or an unrecognized state is "unknown" and keeps waiting. If silence
-is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the ramp, the clock
+is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` (1 s) past the ramp, the clock
 is not written.
 
 In a source transition that operation runs after the integrity and selection
@@ -197,7 +212,7 @@ A failed write does not fail the transition, but it is never retried on live
 audio. When the device reports a clock other than the source's - a write that
 failed or did not take, or a clock changed from CueMix 5 - the switcher's loop
 notices and, once a config has been applied and at most once per
-`MOTU_CLOCK_RETRY_SECONDS`, runs a small muted correction under the lock:
+`MOTU_CLOCK_RETRY_SECONDS` (30 s), runs a small muted correction under the lock:
 mute, the same silent write, settle and check, then the listener's previous
 mute state.
 
@@ -268,14 +283,14 @@ When a higher-priority source becomes active, it immediately switches configs. W
 - **Hardware state checking** - Looking at `/proc/asound` and `amixer` output gives us reliable, kernel-level information about audio hardware state
 - **MOTU meter detection** - TOSLINK is detected from live MOTU input meter frames instead of being treated as always active
 - **Three-state detection** - A source is *ready* (hardware says the stream is open), *playing* (capture RMS confirms audio), or *probed and found silent*. Capture levels only describe the selected config, so for the streamer and the USB gadget "playing" is simply unknown until the switcher selects them. The arbitration logic lives in one pure function, `source_switcher.arbitrate()`, which takes a snapshot of every source plus the elapsed pass time and returns the decision; `main()` only gathers the snapshot and applies the result. The elapsed time is the measured monotonic interval since the previous arbitration, capped at five check intervals so one stalled pass (a config apply, a reconnect) cannot satisfy a silence or dwell timeout by itself.
-- **Silent-probe backoff** - Selecting a source to find out whether it is playing costs a full config reload plus a mute/restore, so a probe that hears nothing is remembered. The source is not re-probed for `SOURCE_PROBE_BACKOFF_SECONDS`, growing by `SOURCE_PROBE_BACKOFF_FACTOR` up to `SOURCE_PROBE_BACKOFF_MAX`. Without this, two ready-but-silent inputs alternate forever, because readiness alone requalified each one as soon as the other timed out. Confirmed audio, a manual override, or the hardware genuinely going away and coming back all clear the backoff.
-- **Probe window vs track gap** - `SOURCE_IDLE_TIMEOUT` is the grace a source gets *after its playback has been confirmed*, so a quiet passage or a pause does not lose it. A source that has only ever proved ready gets the much shorter `SOURCE_PROBE_SILENCE_TIMEOUT` instead: there was no music to leave a gap in.
+- **Silent-probe backoff** - Selecting a source to find out whether it is playing costs a full config reload plus a mute/restore, so a probe that hears nothing is remembered. The source is not re-probed for `PROBE_BACKOFF_SECONDS` (30 s), growing by `PROBE_BACKOFF_FACTOR` (4) up to `PROBE_BACKOFF_MAX` (900 s). Without this, two ready-but-silent inputs alternate forever, because readiness alone requalified each one as soon as the other timed out. Confirmed audio, a manual override, or the hardware genuinely going away and coming back all clear the backoff.
+- **Probe window vs track gap** - `IDLE_TIMEOUT` (60 s) is the grace a source gets *after its playback has been confirmed*, so a quiet passage or a pause does not lose it. A source that has only ever proved ready gets the much shorter `PROBE_SILENCE_TIMEOUT` (5 s) instead: there was no music to leave a gap in.
 - **Grace periods** - The 60-second timeout and "last active source" tracking ensure the switcher doesn't jump away from a source it has heard playing just because of a quiet passage or pause button
-- **Fast lower-priority handoff** - If streamer or gadget is silent while TOSLINK/analog MOTU meters are active, `SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT` lets the switcher fall through sooner than the normal track-gap timeout.
-- **Confirmed audio pre-empts a grace** - A rival that has been *confirmed playing* for `SOURCE_PREEMPT_DWELL_SECONDS` cuts a silent source's grace short instead of waiting it out; a higher-priority rival waits for nothing else, a lower-priority one is additionally gated by `SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT`. The dwell keeps a single noisy meter frame from yanking the config away mid-track. A rival that is only *ready* never pre-empts - protecting a track gap from a connected-but-paused source is the entire point of the grace.
-- **Meter sources get no second grace** - `toslink_available` / `analog_available` only go false after `SOURCE_TOSLINK_IDLE_SECONDS` / `SOURCE_ANALOG_IDLE_SECONDS` of quiet meters, so a meter source has already served a track-gap grace by the time it reads silent. `SourceSnapshot.self_metering` marks that, and such a source is released as soon as its meter settles rather than holding the output for another `SOURCE_IDLE_TIMEOUT`. It is never probed either, so it is never backed off: its meter requalifies it the instant signal returns.
-- **RMS level threshold** - Audio is treated as active when any capture channel is above `SOURCE_AUDIO_THRESHOLD_DB` (default `-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
-- **Keep-last idle behavior** - When all sources are idle, the default is to leave the current config alone. Set `SOURCE_IDLE_MODE=toslink` to restore the older always-fallback behavior.
+- **Fast lower-priority handoff** - If streamer or gadget is silent while TOSLINK/analog MOTU meters are active, `LOWER_PRIORITY_ACTIVE_TIMEOUT` (0 s) lets the switcher fall through sooner than the normal track-gap timeout.
+- **Confirmed audio pre-empts a grace** - A rival that has been *confirmed playing* for `PREEMPT_DWELL_SECONDS` (2 s) cuts a silent source's grace short instead of waiting it out; a higher-priority rival waits for nothing else, a lower-priority one is additionally gated by `LOWER_PRIORITY_ACTIVE_TIMEOUT`. The dwell keeps a single noisy meter frame from yanking the config away mid-track. A rival that is only *ready* never pre-empts - protecting a track gap from a connected-but-paused source is the entire point of the grace.
+- **Meter sources get no second grace** - `toslink_available` / `analog_available` only go false after `TOSLINK_IDLE_SECONDS` (5 s) / `ANALOG_IDLE_SECONDS` (30 s) of quiet meters, so a meter source has already served a track-gap grace by the time it reads silent. `SourceSnapshot.self_metering` marks that, and such a source is released as soon as its meter settles rather than holding the output for another `IDLE_TIMEOUT`. It is never probed either, so it is never backed off: its meter requalifies it the instant signal returns.
+- **RMS level threshold** - Audio is treated as active when any capture channel is above `AUDIO_THRESHOLD_DB` (`-80` dB). This keeps steady tones, quiet sustained passages, and compressed audio from being mistaken for silence.
+- **Keep-last idle behavior** - When all sources are idle, the current config is left alone (`SOURCE_IDLE_MODE = "keep-last"`; `"toslink"` falls back to TOSLINK instead).
 - **Settle time** - After switching configs, the script waits 2 seconds for hardware to reinitialize, preventing glitches
 - **Boot-race recovery** - If CamillaDSP remembers a config path but started before its audio device existed, the switcher reloads that existing config while processing is `INACTIVE`; healthy `PAUSED`/`RUNNING` configs are left untouched. The switcher has already muted (and remembered the listener's mute state) when it connected; recovery mutes again and reloads only once the engine reads back as muted. If the lock, the mute request or its read-back fails, that attempt is skipped. The next pass then re-applies the recovered config through the normal muted transition, which restores the remembered mute state
 
@@ -296,7 +311,7 @@ When a higher-priority source becomes active, it immediately switches configs. W
 
 Optional configs:
 
-- `analog.yml` - Configured for analog inputs, selectable manually or by setting `SOURCE_ANALOG_MOTU_METERS=true`
+- `analog.yml` - Configured for analog inputs, selectable manually or by setting `ANALOG_MOTU_METERS = True` in `source_switcher.py`
 
 ---
 
@@ -320,12 +335,12 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 
 - **evdev for input** - Direct kernel-level access to input events, works with any HID device that registers as a keyboard
 - **Async event loop** - Non-blocking event processing allows the script to handle rapid button presses and long holds without lag
-- **Separate tone step** - Bass/treble use 0.5dB steps (configurable) for fine adjustment, while volume uses 1dB steps for faster changes
-- **Tone limits** - Configurable ±6dB default range prevents accidental over-boosting
+- **Separate tone step** - Bass/treble use 0.5dB steps for fine adjustment, while volume uses 1dB steps for faster changes
+- **Tone limits** - A ±6dB range prevents accidental over-boosting
 - **Persistent tone control** - Atomically updates reserved `low`/`high` shelf IDs in the shared audio overlay; the source switcher applies them and remains the sole live-config writer
 - **Device reconnection** - If the Bluetooth remote disconnects, the script automatically searches for it again
 - **Recovery controls stay available** - A failed CamillaDSP connection does not block the HID event loop, so the power-button restart and shutdown actions still work
-- **Throttled idle logging** - The remote is checked every two seconds while asleep, but unchanged "not found" status is logged only every five minutes by default
+- **Throttled idle logging** - The remote is checked every two seconds while asleep, but unchanged "not found" status is logged only every five minutes
 
 **Button mapping:**
 
@@ -387,8 +402,8 @@ in `scripts/` (`audio_eq.py`, `speaker_profiles.py`, `speaker_config.py`,
 single-writer contract: every EQ or speaker edit goes through the persistent
 state files and is composed into the live config by the source switcher.
 
-The unit deliberately runs as root because the UI restarts services, mounts
-USB storage, and sets the system clock. Users who do not want a root web
+The unit deliberately runs as root because the UI starts, stops and restarts
+services. Users who do not want a root web
 service simply skip this component — nothing else depends on it.
 
 ### Request guards
@@ -477,13 +492,9 @@ is enabled from that target.
 
 ## Debug Mode
 
-The Source Switcher includes a `SOURCE_DEBUG` setting. Set it in `~/camilladsp/cdsp-automation.env` to see detailed output:
-
-```text
-SOURCE_DEBUG=true
-```
-
-This shows real-time status of hardware detection, timers, and switching decisions - helpful for troubleshooting or understanding the logic.
+The Source Switcher has a `DEBUG_MODE` constant. Set it to `True` near the top
+of `~/camilladsp/scripts/source_switcher.py` and restart the switcher to see
+detailed output. This shows real-time status of hardware detection, timers, and switching decisions - helpful for troubleshooting or understanding the logic.
 
 For Remote Control, all actions are logged to journalctl by default. Watch live:
 

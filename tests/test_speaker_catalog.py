@@ -4,7 +4,6 @@ import contextlib
 import importlib
 import io
 import json
-import os
 import sys
 import tempfile
 import types
@@ -17,18 +16,17 @@ if "camilladsp" not in sys.modules:
     camilladsp.CamillaClient = object
     sys.modules["camilladsp"] = camilladsp
 
+import settings
 from scripts import speaker_profiles
 
 
 # conftest pins this at a nonexistent path so imports stay hermetic; restore
-# that instead of unsetting, which would fall back to the real /etc lookup.
-HERMETIC_CATALOG_PATH = os.environ.get(
-    "SPEAKER_CATALOG_PATH", "/nonexistent/speaker-catalog.json"
-)
+# that afterwards, never the real /etc lookup.
+HERMETIC_CATALOG_PATH = settings.SPEAKER_CATALOG_PATH
 
 
 def _reload_with_catalog(path: str) -> None:
-    os.environ["SPEAKER_CATALOG_PATH"] = path
+    settings.SPEAKER_CATALOG_PATH = path
     importlib.reload(speaker_profiles)
 
 
@@ -115,7 +113,7 @@ class SpeakerCatalogNormalizationTests(unittest.TestCase):
 
 class SpeakerCatalogLoadTests(unittest.TestCase):
     def tearDown(self) -> None:
-        os.environ["SPEAKER_CATALOG_PATH"] = HERMETIC_CATALOG_PATH
+        settings.SPEAKER_CATALOG_PATH = HERMETIC_CATALOG_PATH
         importlib.reload(speaker_profiles)
 
     def test_missing_catalog_keeps_builtins(self) -> None:
