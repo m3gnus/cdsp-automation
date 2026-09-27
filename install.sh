@@ -1,6 +1,6 @@
 #!/bin/bash
 # CamillaDSP Utilities Setup Script
-# Installs: Trigger Control, MOTU Clock Sync, Source Switcher, and Remote Control
+# Installs: Trigger Control, Source Switcher (which also drives the MOTU), and Remote Control
 set -euo pipefail
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -54,7 +54,6 @@ ISO226_CAPABILITY_DEFAULT="/var/lib/cdsp-automation/iso226-engine.json"
 
 CDSP_SERVICES=(
   cdsp-trigger
-  cdsp-motu-sync
   cdsp-source-switcher
   cdsp-remote
   airplay-volume-bridge
@@ -73,17 +72,12 @@ POWER_GPIO=4
 TRIGGER_DELAY_SECONDS=320
 TRIGGER_CHECK_INTERVAL=0.2
 TRIGGER_AUDIO_THRESHOLD_DB=-80
+# The MOTU's control WebSocket.  The source switcher is its only client.
 MOTU_WS_URL=ws://169.254.51.193:1280
-MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 # MOTU main output level, set from the control UI.  It sits after CamillaDSP,
 # so the profile volume limits do not bound it: this ceiling does.  -6 dB is
 # where the device stood when the control was added; raise it deliberately.
 MOTU_MAIN_VOLUME_MAX_DB=0
-# Every MOTU connection besides the switcher's meters (clock writes and
-# read-backs, UI volume) is recorded here.  Read-backs and UI volume accesses
-# keep this far apart from any other one; clock writes never wait.
-MOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock
-MOTU_ACCESS_WINDOW_SECONDS=5
 SOURCE_CHECK_INTERVAL=1.0
 SOURCE_IDLE_TIMEOUT=60
 SOURCE_LOWER_PRIORITY_ACTIVE_TIMEOUT=0
@@ -95,9 +89,9 @@ SOURCE_PROBE_BACKOFF_MAX=900
 SOURCE_AUDIO_THRESHOLD_DB=-80
 SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
 SOURCE_TOSLINK_MOTU_METERS=true
-# The switcher changes the MOTU clock inside its muted transition whenever
-# the MOTU Clock Sync unit is installed (auto), or always/never (true/false).
-SOURCE_MOTU_CLOCK=auto
+# The switcher moves the MOTU clock with the source (optical for TOSLINK,
+# internal otherwise) inside its muted transition; false leaves it alone.
+SOURCE_MOTU_CLOCK=true
 MOTU_CLOCK_SETTLE_SECONDS=1.0
 SOURCE_ANALOG_MOTU_METERS=false
 SOURCE_IDLE_MODE=keep-last
@@ -325,7 +319,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in trigger.py clock_sync.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_access.py motu_volume.py web_ui.py; do
+  for script in trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -384,12 +378,10 @@ ensure_user_writable_dir() {
 }
 
 ensure_audio_state_storage() {
-  local lock audio_eq_path audio_control_lock_path motu_clock_state_path motu_access_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
+  local lock audio_eq_path audio_control_lock_path speaker_selection_path speaker_transition_path speaker_audio_dir speaker_profile_dir source_base_dir generated_dir audio_eq_backup_dir
   audio_eq_path="$(get_env_value AUDIO_EQ_PATH)"
   audio_eq_backup_dir="$(get_env_value AUDIO_EQ_BACKUP_DIR)"
   audio_control_lock_path="$(get_env_value AUDIO_CONTROL_LOCK_PATH)"
-  motu_clock_state_path="$(get_env_value MOTU_CLOCK_STATE_PATH)"
-  motu_access_path="$(get_env_value MOTU_ACCESS_PATH)"
   speaker_selection_path="$(get_env_value SPEAKER_SELECTION_PATH)"
   speaker_transition_path="$(get_env_value SPEAKER_TRANSITION_PATH)"
   speaker_audio_dir="$(get_env_value SPEAKER_AUDIO_DIR)"
@@ -398,8 +390,6 @@ ensure_audio_state_storage() {
   generated_dir="$(get_env_value SPEAKER_GENERATED_DIR)"
   : "${audio_eq_path:=/var/lib/cdsp-automation/audio-eq.json}"
   : "${audio_control_lock_path:=/var/lib/cdsp-automation/audio-control.lock}"
-  : "${motu_clock_state_path:=/var/lib/cdsp-automation/motu-clock-source}"
-  : "${motu_access_path:=/var/lib/cdsp-automation/motu-access.lock}"
   : "${speaker_selection_path:=/var/lib/cdsp-automation/speaker-selection.json}"
   : "${speaker_transition_path:=/var/lib/cdsp-automation/speaker-transition.json}"
   : "${speaker_audio_dir:=/var/lib/cdsp-automation/speaker-audio}"
@@ -409,8 +399,6 @@ ensure_audio_state_storage() {
   : "${audio_eq_backup_dir:=$AUDIO_EQ_BACKUP_DEFAULT}"
   ensure_user_writable_dir "$(dirname "$audio_eq_path")"
   ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"
-  ensure_user_writable_dir "$(dirname "$motu_clock_state_path")"
-  ensure_user_writable_dir "$(dirname "$motu_access_path")"
   ensure_user_writable_dir "$(dirname "$speaker_selection_path")"
   ensure_user_writable_dir "$(dirname "$speaker_transition_path")"
   ensure_user_writable_dir "$speaker_audio_dir"
@@ -426,13 +414,10 @@ ensure_audio_state_storage() {
   # them first, which on a fresh install can be the root UI or the root
   # Shairport callback.  Own them here, before anything runs.  Per-speaker
   # locks appear later and are covered by the UI unit's Group= and UMask=.
-  # The MOTU access record is written by clock_sync and the source switcher
-  # (both $INSTALL_USER) and by the root control UI.
   for lock in \
     "${audio_eq_path}.lock" \
     "$audio_control_lock_path" \
-    "${speaker_selection_path}.lock" \
-    "$motu_access_path"; do
+    "${speaker_selection_path}.lock"; do
     if [[ ! -e "$lock" ]]; then
       sudo -u "$INSTALL_USER" touch "$lock"
     fi
@@ -521,18 +506,25 @@ install_trigger() {
   echo "Trigger Control installed."
 }
 
-install_motu_sync() {
-  echo "Installing MOTU Clock Sync..."
-  read -r -p "Enter your MOTU device IP address (default: 169.254.51.193): " motu_ip
-  motu_ip=${motu_ip:-169.254.51.193}
-  set_env_value "MOTU_WS_URL" "ws://${motu_ip}:1280"
-  create_unit "MOTU Clock Sync" clock_sync.py cdsp-motu-sync
-  echo "MOTU Clock Sync installed."
+# The MOTU Clock Sync service of earlier releases.  The source switcher is now
+# the MOTU's only client (clock, meters and main volume), and a second client
+# would keep dropping its connection, so an install or update removes the old
+# unit and its scripts.
+remove_motu_sync() {
+  if [[ -f "$SYSTEMD_UNIT_DIR/cdsp-motu-sync.service" || -f /etc/systemd/system/cdsp-motu-sync.service ]]; then
+    echo "Removing the retired MOTU Clock Sync service..."
+    sudo systemctl stop cdsp-motu-sync.service || true
+    sudo systemctl disable cdsp-motu-sync.service || true
+    remove_unit_file cdsp-motu-sync.service
+    sudo systemctl daemon-reload
+  fi
+  rm -f "$SCRIPTS_DIR/clock_sync.py" "$SCRIPTS_DIR/motu_access.py"
 }
 
 install_source_switcher() {
   echo "Installing Source Switcher..."
   mkdir -p "$CONFIGS_DIR"
+  remove_motu_sync
   create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
   echo ""
   echo "IMPORTANT: create these config files if they do not already exist:"
@@ -556,7 +548,7 @@ install_remote_sudoers() {
 
   cat > "$tmp" <<EOF
 # Allow the remote control service to perform only its documented actions.
-$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-motu-sync.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
+$INSTALL_USER ALL=(root) NOPASSWD: $SYSTEMCTL_BIN restart camilladsp.service, $SYSTEMCTL_BIN restart camillagui.service, $SYSTEMCTL_BIN restart cdsp-source-switcher.service, $SYSTEMCTL_BIN --no-block restart cdsp-remote.service, $SYSTEMCTL_BIN poweroff
 EOF
   # Explicit checks: these helpers also run on the left of `||`, where set -e
   # is off and a rejected file would otherwise still be installed.
@@ -615,7 +607,7 @@ install_remote() {
   echo "   - LEFT/RIGHT arrows: Adjust bass (+/-0.5 dB)"
   echo "   - ENTER (short): Show current status"
   echo "   - ENTER (hold ~1s): Reset bass/treble to 0 dB"
-  echo "   - POWER (hold ~1s): Restart CamillaDSP, GUI, MOTU sync and the switcher"
+  echo "   - POWER (hold ~1s): Restart CamillaDSP, GUI and the switcher"
   echo "   - POWER (hold ~10s): Shutdown system"
   echo ""
   echo "NOTE: log out/in or reboot if this installer just added your user to the input group."
@@ -671,7 +663,7 @@ install_airplay_volume_bridge() {
 
 install_spotify_volume_sync() {
   if ! systemctl list-unit-files --no-legend raspotify.service 2>/dev/null | grep -q '^raspotify.service'; then
-    note_skip "Spotify volume sync: SKIPPED (raspotify.service is not installed; install raspotify, then re-run menu option 9)"
+    note_skip "Spotify volume sync: SKIPPED (raspotify.service is not installed; install raspotify, then re-run menu option 8)"
     return 0
   fi
   echo "Building the pinned Spotify Connect volume-sync receiver..."
@@ -792,11 +784,11 @@ install_iso226_engine_optional() {
 }
 
 refresh_installed_units() {
+  # Before the switcher restarts, so it is the MOTU's only client from its
+  # first connection.
+  remove_motu_sync
   if systemctl list-unit-files --no-legend cdsp-trigger.service 2>/dev/null | grep -q '^cdsp-trigger.service'; then
     create_unit "Trigger Control" trigger.py cdsp-trigger
-  fi
-  if systemctl list-unit-files --no-legend cdsp-motu-sync.service 2>/dev/null | grep -q '^cdsp-motu-sync.service'; then
-    create_unit "MOTU Clock Sync" clock_sync.py cdsp-motu-sync
   fi
   if systemctl list-unit-files --no-legend cdsp-source-switcher.service 2>/dev/null | grep -q '^cdsp-source-switcher.service'; then
     create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
@@ -850,6 +842,7 @@ uninstall_all() {
     sudo systemctl disable "${service}.service" || true
     remove_unit_file "${service}.service"
   done
+  remove_motu_sync
   sudo rm -f "$SUDOERS_DIR/cdsp-automation" "$SUDOERS_DIR/cdsp-automation-receivers"
   if [[ -x "$SCRIPTS_DIR/build_camilladsp_iso226.sh" ]]; then
     # The receipt is the builder's only proof that it - and not the operator -
@@ -881,7 +874,6 @@ install_all() {
   reset_install_notes
   prepare_install
   install_trigger
-  install_motu_sync
   install_source_switcher
   install_remote
   install_airplay_volume_bridge || note_skip "AirPlay volume bridge: FAILED (Shairport settings were restored)"
@@ -911,14 +903,14 @@ update_utilities() {
   pip install --upgrade websocket-client evdev pyyaml
   deactivate
   # Deliberately no engine rebuild: that would replace the running CamillaDSP
-  # binary and restart it, which a routine update must never do.  Menu option 10
+  # binary and restart it, which a routine update must never do.  Menu option 9
   # rebuilds it when the operator asks for it.
   local iso_capability
   iso_capability="$(get_env_value ISO226_CAPABILITY_PATH)"
   : "${iso_capability:=$ISO226_CAPABILITY_DEFAULT}"
   if [[ -f "$iso_capability" ]]; then
     echo "An ISO 226 engine is installed and was left running untouched."
-    echo "Run menu option 10 to rebuild it against the downloaded pinned patch."
+    echo "Run menu option 9 to rebuild it against the downloaded pinned patch."
   fi
   audit_operator_volume_limits
   # refresh_installed_units already restarts every installed service once:
@@ -1011,7 +1003,7 @@ confirm_action() {
   [[ "$answer" =~ ^[Yy]([Ee][Ss])?$ ]]
 }
 
-# Menu option 12.  Names the address the UI is about to bind to before asking
+# Menu option 11.  Names the address the UI is about to bind to before asking
 # for anything, and offers loopback-only first so the LAN-wide default is a
 # choice rather than an accident.  Answering No to both questions changes
 # nothing.
@@ -1057,19 +1049,18 @@ CamillaDSP Utilities - Choose an Option
 1)  Install All Utilities
 2)  Update Utilities
 3)  Install Trigger Control
-4)  Install MOTU Clock Sync
-5)  Install Source Switcher
-6)  Install Remote Control
-7)  Pair Bluetooth Remote
-8)  Show Service Status
-9)  Install AirPlay + Spotify Volume Sync
-10) Install ISO 226 Loudness Engine
-11) Uninstall All Utilities
-12) Install Web Control UI (optional)
+4)  Install Source Switcher
+5)  Install Remote Control
+6)  Pair Bluetooth Remote
+7)  Show Service Status
+8)  Install AirPlay + Spotify Volume Sync
+9)  Install ISO 226 Loudness Engine
+10) Uninstall All Utilities
+11) Install Web Control UI (optional)
 0)  Exit
-Options 6, 9 and 12 also install option 5 when it is missing: the Source
+Options 5, 8 and 11 also install option 4 when it is missing: the Source
 Switcher is the only thing that can permit an unmute or apply tone/EQ edits.
-Options 11 and 12 ask for confirmation before acting.
+Options 10 and 11 ask for confirmation before acting.
 =============================================
 MENU
 }
@@ -1083,15 +1074,14 @@ main() {
       1) install_all ;;
       2) update_utilities ;;
       3) prepare_install; install_trigger ;;
-      4) prepare_install; install_motu_sync ;;
-      5) prepare_install; install_source_switcher ;;
-      6) reset_install_notes; prepare_install; install_remote; print_install_summary ;;
-      7) pair_bluetooth_remote ;;
-      8) show_status ;;
-      9) install_network_volume_sync ;;
-      10) prepare_install; install_iso226_engine ;;
-      11) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
-      12) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
+      4) prepare_install; install_source_switcher ;;
+      5) reset_install_notes; prepare_install; install_remote; print_install_summary ;;
+      6) pair_bluetooth_remote ;;
+      7) show_status ;;
+      8) install_network_volume_sync ;;
+      9) prepare_install; install_iso226_engine ;;
+      10) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
+      11) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac

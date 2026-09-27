@@ -110,6 +110,9 @@ SOURCE_OVERRIDE_PATH = Path(
     os.environ.get("SOURCE_OVERRIDE_PATH", "/run/cdsp-source-switcher/manual_source")
 )
 UI_SERVICE = "cdsp-control-ui.service"
+# How long a MOTU volume change waits for the source switcher to apply it
+# (normally within one of its ~1.2 s passes) before answering 202.
+MOTU_VOLUME_REPLY_SECONDS = 3.0
 AUDIO_EQ_PATH = Path(
     os.environ.get("AUDIO_EQ_PATH", "/var/lib/cdsp-automation/audio-eq.json")
 )
@@ -228,12 +231,6 @@ SERVICE_CATALOG: dict[str, dict[str, Any]] = {
     },
     "cdsp-trigger.service": {
         "label": "Amp trigger",
-        "group": "Automation",
-        "required": True,
-        "controls": ["start", "restart", "stop"],
-    },
-    "cdsp-motu-sync.service": {
-        "label": "MOTU clock sync",
         "group": "Automation",
         "required": True,
         "controls": ["start", "restart", "stop"],
@@ -1176,7 +1173,6 @@ HTML = r"""<!doctype html>
       qs("#systemGrid").innerHTML = [
         tile("CamillaDSP", esc(c.error ? "error" : (c.state || st("camilladsp.service"))), c.error ? "bad" : cl("camilladsp.service"), esc(c.config_title || "")),
         tile("Source switcher", esc(st("cdsp-source-switcher.service")), cl("cdsp-source-switcher.service")),
-        tile("MOTU clock sync", esc(st("cdsp-motu-sync.service")), cl("cdsp-motu-sync.service")),
         tile("Amp trigger", esc(st("cdsp-trigger.service")), cl("cdsp-trigger.service")),
         tile("HID remote", r.connected ? "connected" : "not connected", r.connected ? "ok" : "warn", esc(r.expected_name || "")),
         tile("Config", esc(c.config_title || "—"), "", esc((c.config_file || "").split("/").pop() || "")),
@@ -1218,10 +1214,10 @@ HTML = r"""<!doctype html>
        The MOTU's own output level, after CamillaDSP.  The control starts only
        from a level the server read off the device (never a default), and each
        write names the level it expects to replace, so it cannot jump.  The
-       MOTU serves one client at a time and every access briefly drops the
-       source switcher's meters: slider moves are debounced here and the server
-       allows one device access per window, sending the latest value after. */
-    let motu = null, motuTarget = null, motuTimer = null, motuBusy = false, motuWaitUntil = 0;
+       MOTU serves one client at a time, the source switcher: the server hands
+       it each request and reports the level it publishes.  Slider moves are
+       debounced here, and only the latest value is sent. */
+    let motu = null, motuTarget = null, motuTimer = null, motuBusy = false, motuPoll = null;
     const MOTU_DEBOUNCE_MS = 700;
     // The MOTU main trim is whole dB only (a device limit), so every MOTU control
     // steps by 1 dB and never offers a finer level it cannot hold.
@@ -1237,7 +1233,7 @@ HTML = r"""<!doctype html>
       badge.className = "badge " + (!known ? "bad" : (writable ? "ok" : "warn"));
       if (!known) {
         panel.innerHTML = `<div class="val sm bad">unknown</div>
-          <div class="row" style="margin-top:10px"><button class="btn sm" id="motuRead">Read from MOTU</button></div>`;
+          <div class="row" style="margin-top:10px"><button class="btn sm" id="motuRead">Read again</button></div>`;
         qs("#motuRead").addEventListener("click", loadMotu);
       } else if (!qs("#motuRange") || motuTarget == null) {
         // Rebuilt only while no drag is pending, so a reply never yanks the
@@ -1273,8 +1269,7 @@ HTML = r"""<!doctype html>
       if (known && motu.max_db != null) notes.push(`ceiling ${motu.max_db.toFixed(0)} dB (MOTU_MAIN_VOLUME_MAX_DB)`);
       if (known && motu.max_db != null && motu.volume_db > motu.max_db) notes.push(`<span class="warn">above the ceiling</span>`);
       if (motuTarget != null) {
-        const wait = Math.ceil((motuWaitUntil - Date.now()) / 1000);
-        notes.push(`<span class="warn">${motuDb(motuTarget)} dB pending${wait > 0 ? ` in ${wait} s` : ""}</span>`);
+        notes.push(`<span class="warn">${motuDb(motuTarget)} dB pending</span>`);
       }
       if (motu && motu.reason) notes.push(`<span class="bad">${esc(motu.reason)}</span>`);
       cap.innerHTML = notes.join(" · ");
@@ -1282,7 +1277,6 @@ HTML = r"""<!doctype html>
     async function loadMotu() {
       try {
         motu = (await api("/api/motu/volume")).motu;
-        if (motu && motu.retry_after > 0) motuWaitUntil = Date.now() + 1000 * motu.retry_after + 250;
       }
       catch (e) { motu = null; toast(e.message); }
       renderMotu();
@@ -1291,7 +1285,7 @@ HTML = r"""<!doctype html>
        the -1/+1 buttons. Nudges step from the pending target when there is one,
        so three quick +1 taps from -6 dB become a single write of -3 dB. Each
        control is kept in step with the others, and the write goes through the
-       same debounce and access window as a drag. */
+       same debounce as a drag. */
     function motuSetTarget(db, source) {
       if (!motu || !motu.known || !motu.writable || !motuTaper || !Number.isFinite(db)) return;
       db = Math.min(motu.max_db, Math.max(motu.min_db, Math.round(db / MOTU_STEP_DB) * MOTU_STEP_DB));
@@ -1301,7 +1295,7 @@ HTML = r"""<!doctype html>
       const label = qs("#motuValue"); if (label) label.innerHTML = `${motuDb(db)}<span class="unit"> dB</span>`;
       renderMotuCaption();
       clearTimeout(motuTimer);
-      motuTimer = setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS, motuWaitUntil - Date.now()));
+      motuTimer = setTimeout(flushMotu, MOTU_DEBOUNCE_MS);
     }
     async function flushMotu() {
       if (motuBusy || motuTarget == null) return;
@@ -1313,24 +1307,22 @@ HTML = r"""<!doctype html>
         const d = await api("/api/motu/volume", { method: "POST", body: JSON.stringify({ volume_db: target, expected_db: motu.volume_db }) });
         motu = d.motu;
         if (motuTarget === target) motuTarget = null;
-      } catch (e) {
-        if (e.status === 429) {
-          // Keep the latest target and send it when the window reopens.
-          motuWaitUntil = Date.now() + 1000 * Number(e.data?.retry_after || 5) + 250;
-          clearTimeout(motuTimer);
-          motuTimer = setTimeout(flushMotu, motuWaitUntil - Date.now());
-        } else {
-          // Refused: re-sync to what the device reports, drop the target.
-          motu = e.data?.motu || null; motuTarget = null;
-          toast(e.message);
+        if (d.pending) {
+          // The switcher is busy (a source change, say) and applies it when
+          // it gets there; read what it publishes shortly.
+          clearTimeout(motuPoll);
+          motuPoll = setTimeout(loadMotu, 2000);
         }
+      } catch (e) {
+        // Refused: re-sync to what the device reports, drop the target.
+        motu = e.data?.motu || null; motuTarget = null;
+        toast(e.message);
       } finally {
         motuBusy = false;
-        if (motu && motu.retry_after > 0) motuWaitUntil = Math.max(motuWaitUntil, Date.now() + 1000 * motu.retry_after + 250);
         // A value dragged to while this request was in flight still goes out.
         if (motuTarget != null && motuTarget !== target) {
           clearTimeout(motuTimer);
-          motuTimer = setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS, motuWaitUntil - Date.now()));
+          motuTimer = setTimeout(flushMotu, MOTU_DEBOUNCE_MS);
         }
         renderMotu();
       }
@@ -2641,9 +2633,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/motu/volume":
-            # A read, so ungated like every GET; it touches the device at most
-            # once per rate-limit window and otherwise answers from cache.
-            self.send_json({"ok": True, "motu": motu_volume.MAIN_VOLUME.status()})
+            # A read, so ungated like every GET: what the source switcher, the
+            # MOTU's one client, last published.
+            self.send_json({"ok": True, "motu": motu_volume.read_status()})
             return
 
         if parsed.path == "/api/audio":
@@ -2768,30 +2760,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
 
     def send_motu_volume_change(self, payload: dict[str, Any]) -> None:
-        """Apply a MOTU main-volume change, mapping refusals to statuses.
+        """Hand a MOTU main-volume change to the switcher, mapping its outcome.
 
-        Every refusal carries the current reading, so the page re-syncs its
-        control to the device instead of retrying from a stale value.
+        Every reply carries the switcher's current reading, so the page
+        re-syncs its control to the device instead of retrying from a stale
+        value.  A switcher that has not answered yet still applies the
+        request: 202, and the page reads the result later.
         """
-        control = motu_volume.MAIN_VOLUME
         try:
-            result = control.set(payload)
-        except motu_volume.MotuVolumeRateLimited as exc:
-            body = {"ok": False, "error": str(exc), "retry_after": exc.retry_after}
-            self.send_json(body, HTTPStatus.TOO_MANY_REQUESTS)
-            return
-        except motu_volume.MotuVolumeError as exc:
-            status = {
-                "conflict": HTTPStatus.CONFLICT,
-                "refused": HTTPStatus.CONFLICT,
-            }.get(exc.kind, HTTPStatus.SERVICE_UNAVAILABLE)
-            # status() only answers from cache here: the failed attempt just
-            # used this window's device access.
+            _request_id, result = motu_volume.submit_request(
+                payload, MOTU_VOLUME_REPLY_SECONDS
+            )
+        except motu_volume.MotuVolumeRefused as exc:
             self.send_json(
-                {"ok": False, "error": str(exc), "motu": control.status()}, status
+                {"ok": False, "error": str(exc), "motu": motu_volume.read_status()},
+                HTTPStatus.CONFLICT,
             )
             return
-        self.send_json({"ok": True, "motu": result})
+        status = motu_volume.read_status()
+        if result is None:
+            self.send_json({"ok": True, "pending": True, "motu": status}, HTTPStatus.ACCEPTED)
+            return
+        if result.get("ok"):
+            self.send_json({"ok": True, "written": result.get("written"), "motu": status})
+            return
+        code = (
+            HTTPStatus.CONFLICT
+            if result.get("kind") in {"conflict", "refused"}
+            else HTTPStatus.SERVICE_UNAVAILABLE
+        )
+        self.send_json({"ok": False, "error": result.get("error"), "motu": status}, code)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(f"{self.address_string()} - {fmt % args}", flush=True)

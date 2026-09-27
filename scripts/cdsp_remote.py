@@ -370,7 +370,6 @@ def restart_services() -> None:
     services = [
         "camilladsp.service",
         "camillagui.service",
-        "cdsp-motu-sync.service",
         "cdsp-source-switcher.service",
     ]
 

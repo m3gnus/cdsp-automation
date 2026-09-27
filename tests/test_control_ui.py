@@ -1332,28 +1332,39 @@ def test_frontend_sends_the_token_and_recovers_from_a_challenge() -> None:
 
 
 @contextmanager
-def _motu_device(**device_kwargs: object):
-    """Point the UI's MOTU control at a replay of the real connect dump."""
-    import motu_volume
-    from test_motu_volume import Device, FakeClock
+def _motu_device(*, switcher: bool = True, **device_kwargs: object):
+    """Run a source switcher's MOTU connection against a replay of the real
+    connect dump, serving the UI's requests the way its loop does."""
+    import threading
+
+    from test_motu_volume import Device, switcher_on
 
     device = Device(**device_kwargs)  # type: ignore[arg-type]
-    clock = FakeClock()
-    control = motu_volume.MotuMainVolume(connect=device.connect, clock=clock)
     env = {
         k: v
         for k, v in os.environ.items()
-        if k
-        not in (
-            "MOTU_MAIN_VOLUME_MAX_DB",
-            "MOTU_ACCESS_WINDOW_SECONDS",
-            "MOTU_VOLUME_CACHE_SECONDS",
-            "INSTALLATION_UI_TOKEN",
-        )
+        if k not in ("MOTU_MAIN_VOLUME_MAX_DB", "INSTALLATION_UI_TOKEN")
     }
-    with patch.dict(os.environ, env, clear=True):
-        with patch.object(motu_volume, "MAIN_VOLUME", control):
-            yield device, clock
+    stop = threading.Event()
+
+    def loop(motu) -> None:
+        while not stop.is_set():
+            motu.read()
+            motu.serve_volume_request()
+            stop.wait(0.01)
+
+    with patch.dict(os.environ, env, clear=True), switcher_on(device) as motu:
+        motu.read()
+        motu.serve_volume_request()
+        thread = threading.Thread(target=loop, args=(motu,), daemon=True)
+        if switcher:
+            thread.start()
+        try:
+            yield device
+        finally:
+            stop.set()
+            if switcher:
+                thread.join()
 
 
 def _get(path: str) -> _DrivableHandler:
@@ -1365,7 +1376,7 @@ def _get(path: str) -> _DrivableHandler:
 
 def test_motu_volume_change_is_token_gated_and_the_read_is_not() -> None:
     body = json.dumps({"volume_db": -20, "expected_db": -6}).encode()
-    with _motu_device() as (device, clock):
+    with _motu_device() as device:
         with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
             refused = _post("/api/motu/volume", body=body)
             refused.do_POST()
@@ -1378,13 +1389,12 @@ def test_motu_volume_change_is_token_gated_and_the_read_is_not() -> None:
             )
             cross_site.do_POST()
             assert cross_site.status == HTTPStatus.FORBIDDEN
-            assert device.sockets == []
+            assert device.sent == []
 
             read = _get("/api/motu/volume")
             assert read.status == HTTPStatus.OK
             assert read.response_body()["motu"]["volume_db"] == -6.0
 
-            clock.now += 60
             allowed = _post("/api/motu/volume", body=body, token="s3cret-value")
             allowed.do_POST()
             assert allowed.status == HTTPStatus.OK
@@ -1392,7 +1402,7 @@ def test_motu_volume_change_is_token_gated_and_the_read_is_not() -> None:
 
 
 def test_motu_volume_ceiling_holds_for_a_request_straight_to_the_server() -> None:
-    with _motu_device() as (device, _clock):
+    with _motu_device() as device:
         with patch.dict(os.environ, {"MOTU_MAIN_VOLUME_MAX_DB": "-10"}):
             handler = _post(
                 "/api/motu/volume",
@@ -1405,13 +1415,12 @@ def test_motu_volume_ceiling_holds_for_a_request_straight_to_the_server() -> Non
 
 
 def test_motu_volume_unknown_device_is_reported_and_writes_are_refused() -> None:
-    with _motu_device(fail=True) as (device, clock):
+    with _motu_device(fail=True) as device:
         read = _get("/api/motu/volume")
         motu = read.response_body()["motu"]
         assert motu["known"] is False and motu["volume_db"] is None
         assert motu["writable"] is False
 
-        clock.now += 60
         handler = _post(
             "/api/motu/volume",
             body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
@@ -1423,7 +1432,7 @@ def test_motu_volume_unknown_device_is_reported_and_writes_are_refused() -> None
 
 
 def test_motu_volume_failed_send_is_unavailable_with_an_unknown_level() -> None:
-    with _motu_device(send_error=ConnectionResetError("reset")) as (device, _clock):
+    with _motu_device(send_error=ConnectionResetError("reset")) as device:
         handler = _post(
             "/api/motu/volume",
             body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
@@ -1435,30 +1444,25 @@ def test_motu_volume_failed_send_is_unavailable_with_an_unknown_level() -> None:
     assert len(device.sent) == 1
 
 
-def test_motu_volume_burst_is_answered_429_with_retry_after() -> None:
-    with _motu_device() as (device, clock):
-        first = _post(
-            "/api/motu/volume",
-            body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
-        )
-        first.do_POST()
-        assert first.status == HTTPStatus.OK
-        clock.now += 1
-        second = _post(
-            "/api/motu/volume",
-            body=json.dumps({"volume_db": -21, "expected_db": -20}).encode(),
-        )
-        second.do_POST()
-    assert second.status == HTTPStatus.TOO_MANY_REQUESTS
-    import motu_access
+def test_motu_volume_change_the_switcher_has_not_reached_yet_is_accepted() -> None:
+    """A switcher busy inside a source change applies it later: 202."""
+    import motu_volume
 
-    # One second into the window, the rest of it remains.
-    assert second.response_body()["retry_after"] == motu_access.DEFAULT_WINDOW_SECONDS - 1
-    assert len(device.sockets) == 1
+    with _motu_device(switcher=False) as device:
+        with patch.object(web_ui, "MOTU_VOLUME_REPLY_SECONDS", 0.05):
+            handler = _post(
+                "/api/motu/volume",
+                body=json.dumps({"volume_db": -20, "expected_db": -6}).encode(),
+            )
+            handler.do_POST()
+        assert handler.status == HTTPStatus.ACCEPTED
+        body = handler.response_body()
+        assert body["pending"] is True and body["motu"]["volume_db"] == -6.0
+        assert motu_volume.REQUEST_PATH.exists() and device.sent == []
 
 
 def test_motu_volume_stale_expected_level_is_a_conflict_with_the_real_level() -> None:
-    with _motu_device() as (device, _clock):
+    with _motu_device() as device:
         handler = _post(
             "/api/motu/volume",
             body=json.dumps({"volume_db": -3, "expected_db": -30}).encode(),
@@ -1483,11 +1487,11 @@ def test_motu_volume_page_starts_from_the_device_and_debounces() -> None:
         page.index("function renderMotu() {") : page.index("function renderMotuCaption() {")
     ]
     assert render.index("if (!known)") < render.index('id="motuRange"')
-    # Every write names the level it replaces, and moves are debounced and
-    # retried after the server's window rather than sent per pixel.
+    # Every write names the level it replaces, and moves are debounced rather
+    # than sent per pixel; a change the switcher has not reached is re-read.
     assert "expected_db: motu.volume_db" in page
-    assert "setTimeout(flushMotu, Math.max(MOTU_DEBOUNCE_MS" in page
-    assert "e.status === 429" in page
+    assert "setTimeout(flushMotu, MOTU_DEBOUNCE_MS)" in page
+    assert "if (d.pending)" in page and "setTimeout(loadMotu" in page
     # Nothing on this control touches the CamillaDSP mute or the ready token.
     motu_js = page[
         page.index("MOTU main volume ---") : page.index("/* ---------------- actions")
@@ -1542,7 +1546,7 @@ def test_camilla_volume_slider_stays_linear_to_match_the_airplay_mapping() -> No
 
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-    assert "motu_access.py motu_volume.py web_ui.py" in installer
+    assert "configure_shairport.py motu_volume.py web_ui.py" in installer
     assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
-    assert "\nMOTU_ACCESS_WINDOW_SECONDS=5\n" in installer
-    assert "\nMOTU_ACCESS_PATH=/var/lib/cdsp-automation/motu-access.lock\n" in installer
+    assert "motu_access.py motu_volume.py" not in installer and "MOTU_ACCESS" not in installer
+    assert "clock_sync.py source_switcher.py" not in installer

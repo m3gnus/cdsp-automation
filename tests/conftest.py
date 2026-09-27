@@ -25,14 +25,15 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def hermetic_motu_access_record(tmp_path, monkeypatch):
-    """Give every test its own MOTU access record (motu_access.py).
+def hermetic_motu_volume_files(tmp_path, monkeypatch):
+    """Give every test its own MOTU volume request and status files.
 
-    The default lives under /var/lib, and a record shared between tests would
-    let one test's MOTU access defer the next test's read-back.
+    The defaults live under /run/cdsp-source-switcher, where a file left by
+    one test (or by a deployed switcher) would answer the next test's request.
     """
-    monkeypatch.setenv("MOTU_ACCESS_PATH", str(tmp_path / "motu-access.lock"))
-    monkeypatch.delenv("MOTU_ACCESS_WINDOW_SECONDS", raising=False)
-    # clock_sync takes the audio-control lock around each clock decision and
-    # resolves the path per call; keep it out of /var/lib as well.
+    import motu_volume
+
+    monkeypatch.setattr(motu_volume, "REQUEST_PATH", tmp_path / "motu-volume-request.json")
+    monkeypatch.setattr(motu_volume, "STATUS_PATH", tmp_path / "motu-volume.json")
+    # Anything resolving the audio-control lock per call stays out of /var/lib.
     monkeypatch.setenv("AUDIO_CONTROL_LOCK_PATH", str(tmp_path / "audio-control.lock"))

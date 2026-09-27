@@ -114,7 +114,7 @@ or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
 
-I've created four Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control and MOTU clock sync run on their own. The source switcher is the control core: it is the only writer of the audio-ready token that permits an unmute, and the only thing that applies a persisted tone/EQ edit, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
+I've created Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control runs on its own. The source switcher is the control core, and the MOTU's only client (clock, meters, main volume): it is the only writer of the audio-ready token that permits an unmute, and the only thing that applies a persisted tone/EQ edit, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
 
 ## Installation
 
@@ -123,7 +123,7 @@ wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/install.sh -O
 chmod +x install.sh && ./install.sh
 ```
 
-The installer provides a menu to install utilities individually or all at once, and sets up systemd services for each one. The entries that install a component depending on the source switcher (menu options 6, 9 and 12) install the switcher too when it is missing, say so before they act, and list it in their closing summary.
+The installer provides a menu to install utilities individually or all at once, and sets up systemd services for each one. The entries that install a component depending on the source switcher (menu options 5, 8 and 11) install the switcher too when it is missing, say so before they act, and list it in their closing summary.
 
 Python 3.10 or newer is required.
 
@@ -153,218 +153,109 @@ The script continuously monitors CamillaDSP's capture RMS levels every 200ms by 
 
 ---
 
-## 2. MOTU Clock Sync
+## 2. MOTU Control (inside the Source Switcher)
 
 ### What it does (simple):
 
-Automatically switches your MOTU audio interface's clock source from the active
-managed source identity. TOSLINK selects optical; streamer, gadget, and analog
-select internal, regardless of sample rate.
+Keeps the MOTU UltraLite mk5's clock source in step with the active source
+(TOSLINK selects optical; streamer, gadget and analog select internal,
+regardless of sample rate), and lets the control UI set the MOTU's main
+output volume. There is no separate service: the source switcher does both.
 
 ### How it works (detailed):
 
-The script polls CamillaDSP's active managed config path every second. A
-`toslink` config selects optical clock; `streamer`, `gadget`, and `analog`
-select internal clock. The sample rate is checked for a valid running config
-but is not used to infer ownership. It sends binary WebSocket commands directly
-to the MOTU's control WebSocket (port 1280). The hex payloads (`000b0000000103`
-for internal, `000b0000000102` for optical) are CueMix 5's own encoding of
-parameter 11 (`kClockSource`): id, index 0, length 1, value.
+The UltraLite mk5 has no HTTP API (port 80 closes every request unanswered;
+the HTTP datastore belongs to MOTU's AVB interfaces). Its whole control
+surface is the binary WebSocket on port 1280 (`MOTU_WS_URL`) that MOTU's
+CueMix 5 app uses, and it serves **one client at a time**: every new
+connection drops the previous one. So the source switcher is the only client
+on the Pi (`MotuConnection` in `scripts/source_switcher.py`). It holds one
+connection and uses it for everything, as CueMix 5 itself does:
 
-The config path is named by `speaker_config.identify_managed_config()`, the
-same lookup the source switcher and the control UI use, so the speaker
-catalog's source-to-filename mapping - not a filename convention - decides
-which source owns the clock. Only the two names this project generates itself
-(`<source>.yml` and `<source>--<speaker>.yml`) are still recognized by shape,
-as a fallback for configs the catalog does not describe; anything else the
-catalog cannot name leaves the clock untouched rather than being guessed at.
+- **Meters** - the passive meter frames that detect TOSLINK and analog input
+  (section 3).
+- **State** - on every new connection the device pushes its whole parameter
+  set unsolicited (one `id, index, value` frame per parameter), then the meter
+  stream, and afterwards pushes any parameter that changes. The switcher reads
+  that dump before using a fresh connection (up to `SOURCE_MOTU_STATE_TIMEOUT`,
+  3 s), so the clock source (parameter 11, `kClockSource`: Internal=3,
+  S/PDIF=0, Optical=2) and the main volume are known without asking. While
+  the switcher is disconnected - for example while CueMix 5 holds the device -
+  both are unknown, and nothing is written on a guess.
+- **Writes** - CueMix 5's own layout, `id, index, length, value`, on the same
+  socket: `000b0000000103` for internal, `000b0000000102` for optical.
 
-**Why this approach:**
-
-- **WebSocket communication** - the UltraLite mk5 exposes a binary WebSocket API that MOTU's CueMix 5 app uses. By capturing and replaying these commands, we can control the device programmatically without any official API
-- **Source identity** - The immutable managed config name records the active
-  input, so equal-rate sources still select the correct owner
-- **Binary payloads** - The MOTU protocol uses binary WebSocket frames, not JSON/text, which is why we need `binascii.unhexlify()`
-
-- **Read-back over the same WebSocket** - a binary WebSocket send that does
-  not raise proves only that the frame left this host. On every new
-  connection the device pushes its whole parameter set unsolicited (one
-  `id, index, value` frame per parameter) before the meter stream, so the
-  daemon connects, sends nothing, and takes parameter 11 from that dump. The
-  persisted `MOTU_CLOCK_STATE_PATH` value is treated as a cache of the last
-  *request*, and the device's own answer overrides it. A confirmed value is
-  re-checked every `MOTU_CLOCK_VERIFY_INTERVAL` seconds, which also notices a
-  clock changed from CueMix 5. The device serves one client at a time, so a
-  read-back briefly displaces the source switcher's meter connection, which
-  reconnects by itself. Verification is skipped on any pass where a clock
-  change is already due, so a stalled read can never delay the change itself,
-  and a write the device contradicts is repeated at most once per
-  `MOTU_CLOCK_REWRITE_INTERVAL`, never every pass. The UltraLite has no HTTP
-  API (port 80 closes every request unanswered); the HTTP datastore belongs
-  to MOTU's AVB interfaces.
-
-**Practical use:** Switching between TOSLINK and USB changes the MOTU clock
-owner even when both graphs run at 48 kHz. Failed WebSocket sends are retried
-instead of being recorded as applied, and so is a send the device accepted but
-never applied.
-
-**Clock changes inside the mute window.** With the MOTU Clock Sync unit
-installed (`SOURCE_MOTU_CLOCK=auto`; `true`/`false` override), every clock
-write is made by the source switcher through one operation: under the
-audio-control lock, with mute requested, it first waits for the output to
-actually go silent, then writes, then waits `MOTU_CLOCK_SETTLE_SECONDS` for
-the re-lock. "Silent" is not the mute flag: CamillaDSP ramps mute over
-`volume_ramp_time` (400 ms by default), and behind the ramp sit up to
-`queuelimit` processed chunks plus the `target_level` device buffer. The
-switcher waits out the ramp, requires the playback peak meter to read at or
-below `MOTU_CLOCK_SILENT_DB` over the queued-audio window, then lets that span
-drain. The meter only reports chunks it played, so an idle engine returns an
-empty history; that counts as silence only when the engine state was also
-read successfully as `Paused` or `Inactive`. A failed or malformed meter
-reading, `Starting`, `Stalled` or an unrecognized state is "unknown" and keeps
-waiting. If silence is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the
-ramp, the clock is not written.
+**Clock changes inside the mute window.** With `SOURCE_MOTU_CLOCK=true` (the
+default; `false` leaves the clock alone), every clock write is one operation:
+under the audio-control lock, with mute requested, the switcher first waits
+for the output to actually go silent, then writes, then waits
+`MOTU_CLOCK_SETTLE_SECONDS` for the re-lock, then reconnects so the fresh
+state dump - not its own belief - says whether the device took the value.
+"Silent" is not the mute flag: CamillaDSP ramps mute over `volume_ramp_time`
+(400 ms by default), and behind the ramp sit up to `queuelimit` processed
+chunks plus the `target_level` device buffer. The switcher waits out the ramp,
+requires the playback peak meter to read at or below `MOTU_CLOCK_SILENT_DB`
+over the queued-audio window, then lets that span drain. The meter only
+reports chunks it played, so an idle engine returns an empty history; that
+counts as silence only when the engine state was also read successfully as
+`Paused` or `Inactive`. A failed or malformed meter reading, `Starting`,
+`Stalled` or an unrecognized state is "unknown" and keeps waiting. If silence
+is not confirmed within `MOTU_CLOCK_SILENCE_TIMEOUT` past the ramp, the clock
+is not written.
 
 In a source transition that operation runs after the integrity and selection
 checks and *before* the reload, so the new graph opens the interface on a
 clock that has already re-locked. A transition that rolls back restores the
 previous clock the same way before reloading the previous graph. A clock the
-shared `MOTU_CLOCK_STATE_PATH` cache already names is not written again.
+device already reports is not written again: every write re-locks and clicks.
 
 A failed write does not fail the transition, but it is never retried on live
-audio. The cache still disagrees with the source, and so does it when
-clock_sync's read-back contradicts a write. The switcher's loop notices, and
-- while readiness is held, at most once per `MOTU_CLOCK_RETRY_SECONDS` - runs a
-small muted correction under the lock: mute, the same silent write and
-settle, then the listener's previous mute state.
+audio. When the device reports a clock other than the source's - a write that
+failed or did not take, or a clock changed from CueMix 5 - the switcher's loop
+notices and, while readiness is held and at most once per
+`MOTU_CLOCK_RETRY_SECONDS`, runs a small muted correction under the lock:
+mute, the same silent write, settle and check, then the listener's previous
+mute state.
 
-The daemon only verifies while the switcher manages the clock (it detects the
-switcher's unit, `SOURCE_SWITCHER_UNIT_PATH`): it reads back, writes what the
-device really reports into the shared cache, and never writes the clock
-itself. Standalone, without a switcher, it writes as before, under the
-audio-control lock; if the lock cannot be taken it skips the write rather
-than making an uncoordinated one.
-
-**Note:** The payloads and read-back values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
+**Note:** The parameter ids and values are for the MOTU UltraLite mk5, taken from CueMix 5's `dev.js`. Other MOTU models may use different parameters - check that model's `dev_*.js` in CueMix 5.
 
 ### MOTU main output volume (control UI)
 
 The control UI's "MOTU main output" card replaces CueMix 5's main volume knob,
-which cannot reach the MOTU while it hangs off the Pi's USB network
-(`scripts/motu_volume.py`). It is CueMix's `kMainTrim`: parameter 5011, one
-byte of attenuation in dB (6 = -6 dB, 100 = -inf). It scales every output
-enabled in `kMainGroup` (parameter 5012, an int16 bit per output DAC). On this
-unit that group is `0x03ff`, meaning all ten analog line outputs. So the high
-(Main 1-2), mid (Line 3-4) and low (Line 5-6) crossover pairs always move
-together. A write is refused if the group ever stops covering all of them.
+which cannot reach the MOTU while it hangs off the Pi's USB network. It is
+CueMix's `kMainTrim`: parameter 5011, one byte of attenuation in dB (6 = -6 dB,
+100 = -inf). It scales every output enabled in `kMainGroup` (parameter 5012,
+an int16 bit per output DAC). On this unit that group is `0x03ff`, meaning all
+ten analog line outputs. So the high (Main 1-2), mid (Line 3-4) and low
+(Line 5-6) crossover pairs always move together. A write is refused if the
+group ever stops covering all of them.
+
+The UI never connects to the MOTU. A change is a small request file,
+`MOTU_VOLUME_REQUEST_PATH` (`/run/cdsp-source-switcher/motu-volume-request.json`),
+which the switcher takes on its next pass (about every 1.2 s) and applies on
+its connection. It publishes the device's level and the outcome of the last
+request in `MOTU_VOLUME_STATUS_PATH`
+(`/run/cdsp-source-switcher/motu-volume.json`); the UI reads that for every
+GET and waits up to 3 s for its request's outcome. A switcher busy inside a
+source change answers later: the UI replies 202 and the page reads the
+published level again shortly after. Only the newest request is kept, so a
+slider drag never queues. Protocol helpers and the request/status plumbing
+live in `scripts/motu_volume.py`.
 
 - **Ceiling:** `MOTU_MAIN_VOLUME_MAX_DB` (default `0`, the top of the MOTU's
   main attenuator -- the same range as its front-panel knob). Set it lower to
-  cap the control. It is enforced server-side, because the MOTU sits after
-  CamillaDSP and the profile volume limits cannot bound it. An unparseable
-  value disables writes.
-- **No jumps:** the page starts the slider from the level the server read off
-  the device, and shows `unknown` with no slider when the device cannot be
-  read. Every write names the level it replaces and is refused (409) if the
-  device reports anything else, for example after the front-panel knob moved.
-- **Uncertain writes:** a send that raises may still have reached the
-  device, so the cached level is forgotten (`unknown`, 503) rather than kept
-  as confirmed, and nothing is resent; the next permitted read settles it.
-- **One client:** the browser debounces the slider and sends only the latest
-  value once the shared access window reopens. Inside the window the server
-  answers 429 with `retry_after`. The next section covers the window.
-
-### Shared MOTU access window
-
-The MOTU serves one WebSocket client at a time. The source switcher's meter
-reader holds that slot, and any other connection drops it. The reader then
-refuses to reconnect sooner than `SOURCE_MOTU_CONNECT_RETRY_SECONDS` (10 s)
-after its previous connect. So if two extra connections land within ~10 s, the
-meters stay dark for ~10 s. That exceeds the TOSLINK tolerance (2 s of held
-values, `SOURCE_MOTU_METER_MAX_AGE`, plus the 5 s `SOURCE_TOSLINK_IDLE_SECONDS`
-debounce), and TOSLINK drops mid-song.
-
-Every extra connection is therefore recorded in `MOTU_ACCESS_PATH` (default
-`/var/lib/cdsp-automation/motu-access.lock`, `scripts/motu_access.py`). The
-record is a `CLOCK_MONOTONIC` reading plus the kernel boot id, written under
-`flock`. clock_sync and the switcher (install user) and the root control UI all
-use it. The installer pre-creates it as `$INSTALL_USER:$INSTALL_GROUP` with
-mode 0660. Accesses are ranked:
-
-1. **Clock write** (a source change): never waits, only records itself. If the
-   record is unusable it is logged and the write still goes out.
-2. **Clock read-back:** deferrable. Within `MOTU_ACCESS_WINDOW_SECONDS`
-   (default 15) of any recorded access it is postponed until the window
-   opens, without connecting. This includes the read-back that used to confirm
-   a clock write about 1 s after sending it. If the record is unusable, the
-   read-back is skipped.
-3. **UI volume** read or write: deferrable, 429 with `retry_after`. If the
-   record is unusable, the UI refuses to touch the MOTU.
-
-A clock write cannot be delayed and cannot be predicted, so a deferrable access
-may still land shortly before one. That is the switch *to* TOSLINK, where the
-meters are what confirm the source. The meter reader closes this gap. When its
-connection drops and the record shows an extra access made after that
-connection opened, the reader reconnects on its next pass instead of waiting
-out the 10 s backoff. Each recorded access forgives one drop. A drop the
-record does not explain (the device vanished, a foreign client, an unreadable
-record) keeps the backoff.
-
-**An access in progress holds the device.** Each claim also records how long
-the access can keep the device at most (its own timeouts: 7 s for a clock
-read-back, 4 s for a clock write, 7 s for a UI volume access, never more than
-10 s), and the access releases it as soon as it closes its connection. The
-meter reader checks that span and reconnects under the record's lock, so it
-cannot reconnect in the middle of an access. It used to: after a clock write
-inside a source transition the switcher only notices the dropped meters once
-the transition is done, and on the rig that late reconnect landed 70 ms into a
-read-back that had just been let through the reopened window, resetting it
-before the device had sent its clock. A skipped pass costs no backoff; the
-reader connects on the next pass after the access ends. Deferrable accesses
-respect the same span: one is allowed only once both the window since the
-last access has passed *and* no access still holds the device, so a UI volume
-access cannot take the device from a read-back that is running past 5 s.
-`retry_after` reports the same condition. Clock writes keep their priority.
-
-**Worst-case meter gap.** A single extra access costs the time the reader
-takes to notice the drop (up to one switcher pass, 1 s plus a 0.2 s read
-window) plus one pass to reconnect, and the dump before the first meter frame
-(0.12 s measured). That is about 2.5-3.5 s. It happened once on a live read:
-the drop was logged and the reader reconnected 1.1 s later. Held values cover
-the first 2 s, so the TOSLINK idle counter advances by at most about 1.5 s of
-its 5 s. Deferrable accesses are at least `MOTU_ACCESS_WINDOW_SECONDS` (5 s)
-from every other extra access, so their gaps never stack. The only possible stacking is a clock write right
-after a deferrable access. If the write lands before the reader has
-reconnected, both drops fall inside one gap. If it lands just after the
-reconnect but before the first meter frame, the gaps merge to about 5-6 s of
-no fresh meters. That is still under the ~7 s tolerance, with the idle
-counter reaching about 4 s. Previously that case stayed dark for ~10 s.
-
-**Choosing the window.** The window used to be 15 s, sized to exceed the
-meter reader's 10 s reconnect backoff. A recorded access no longer waits out
-that backoff, so the window only has to exceed one switcher pass: a 1 s sleep
-plus a 0.2 s meter read. It was checked by driving the real reader, meter
-parsing, TOSLINK timers and access record through minutes of simulated
-playback, with a fake one-client MOTU that drops the reader mid-read on every
-access and a clock write chasing each deferrable access. The window was swept
-against switcher passes of 1-6 s and every landing moment across a pass:
-
-- At normal passes (1-2 s), 3 s and wider never cost TOSLINK a single pass of
-  meter data. 5 s keeps it at zero, with margin, even at a 4.5 s pass.
-- TOSLINK drops only when accesses land about once per switcher pass, so the
-  reader never gets a pass with a fresh frame -- 2 s accesses against 2 s
-  passes, or 5 s against 5 s. Even then it takes a few specific landing
-  moments to line up.
-
-At 5 s that needs switcher passes stretched to about 5 s, one after another.
-A pass only runs that long inside `apply_config`, during a source change, so
-it takes several source changes in a row, each chased by a MOTU volume change
-landing in step, while TOSLINK is the source. Normal playback runs 1.2 s
-passes and is not exposed. `test_default_window_keeps_toslink_through_back_to_back_accesses`
-runs that simulation at the default window, and
-`test_toslink_simulation_detects_accesses_landing_once_per_pass` shows it can
-fail. Raise `MOTU_ACCESS_WINDOW_SECONDS` if a site needs more margin; it trades
-it for a slower response between MOTU changes.
+  cap the control. The switcher enforces it when it applies a request, because
+  the MOTU sits after CamillaDSP and the profile volume limits cannot bound
+  it. An unparseable value disables writes.
+- **No jumps:** the page starts the slider from the level the device reported,
+  and shows `unknown` with no slider when it has not. Every write names the
+  level it replaces and is refused (409) if the device reports anything else,
+  for example after the front-panel knob moved.
+- **Uncertain writes:** a send that raises may still have reached the device,
+  so the switcher drops the connection and the level is `unknown` (503)
+  rather than kept as confirmed, and nothing is resent; the next connection's
+  state dump settles it. A level we wrote reads "sent" until the device
+  pushes it back.
 
 ---
 
@@ -471,7 +362,6 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 Holding the power button for ~1 second restarts the CamillaDSP control stack:
 - camilladsp.service
 - camillagui.service
-- cdsp-motu-sync.service
 - cdsp-source-switcher.service
 - cdsp-remote.service
 
@@ -507,7 +397,7 @@ the owned overlay; legacy stages are stripped when a config becomes active.
 ## 5. Web Control UI (optional)
 
 `scripts/web_ui.py` is a single-file stdlib `http.server` dashboard installed
-by menu option 12 as `cdsp-control-ui.service`. It reuses the sibling modules
+by menu option 11 as `cdsp-control-ui.service`. It reuses the sibling modules
 in `scripts/` (`audio_eq.py`, `speaker_profiles.py`, `speaker_config.py`,
 `speaker_xo.py`) and the shared `cdsp-automation.env`, and it respects the
 single-writer contract: every EQ or speaker edit goes through the persistent
@@ -545,7 +435,7 @@ nothing until the operator chooses otherwise:
   historical value is kept as the fallback in both `install.sh` and
   `web_ui.py` so an upgrade cannot silently take a working UI away. Set it to
   `127.0.0.1` for loopback only and reach the UI over an SSH tunnel
-  (`ssh -N -L 8088:127.0.0.1:8088 <user>@<pi>`). Menu option 12 prints the
+  (`ssh -N -L 8088:127.0.0.1:8088 <user>@<pi>`). Menu option 11 prints the
   address it is about to bind to and offers loopback before it asks to
   install. `INSTALLATION_UI_PORT` (default `8088`) is read the same way. The
   unit deliberately carries no `Environment=INSTALLATION_UI_HOST` or
@@ -589,7 +479,7 @@ All four utilities run as systemd services with these benefits:
 - **Auto-start on boot** - No need to manually launch them
 - **Automatic restart** - If a script crashes, systemd brings it back up after `RestartSec=2`
 - **Dependency management** - They are ordered after CamillaDSP and retry transient connection failures
-- **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-motu-sync`, `-source-switcher`, `-remote`)
+- **Logging** - View logs with `journalctl -u cdsp-trigger -f` (or `-source-switcher`, `-remote`)
 - **Easy control** - Standard `systemctl start/stop/restart` commands
 
 Current units are enabled from `multi-user.target`. On update, the installer
@@ -621,7 +511,7 @@ journalctl -u cdsp-remote -f
 
 ## Can I Use Just One?
 
-Trigger control and MOTU clock sync are independent. The source switcher is a
+Trigger control is independent. The source switcher is a
 required dependency of every component that unmutes or edits tone: the remote,
 the AirPlay/Spotify volume bridge and the web control UI all call
 `speaker_profiles.require_audio_unmute_allowed()` before unmuting, and
@@ -630,8 +520,8 @@ the AirPlay/Spotify volume bridge and the web control UI all call
 of the persisted EQ overlay.
 
 - **Just Trigger** - For basic amp power control
-- **Just MOTU Sync** - If you only need clock management
-- **Just Source Switcher** - For automatic source selection
+- **Just Source Switcher** - For automatic source selection, with the MOTU
+  clock following the source
 - **Remote, volume bridge, web UI** - Each requires the Source Switcher; the
   installer pulls it in rather than producing a component that can never unmute
   and whose tone edits are never applied
@@ -649,7 +539,7 @@ weakened: it is what keeps audio muted until a verified config is live.
 - Raspberry Pi (any model with GPIO for trigger control)
 - CamillaDSP installed and running on port 1234
 - Python 3 with venv support
-- For MOTU sync: MOTU UltraLite (or similar) on the network
+- For MOTU clock/meters/volume: MOTU UltraLite mk5 on the network
 - For Source Switcher: Appropriate audio hardware and configs
 - For Remote: Bluetooth or USB HID remote control
 

@@ -1,6 +1,6 @@
 # CamillaDSP Utilities for Raspberry Pi
 
-Automation utilities for CamillaDSP on Raspberry Pi: trigger control, MOTU clock sync, seamless source switching, and Bluetooth remote control.
+Automation utilities for CamillaDSP on Raspberry Pi: trigger control, seamless source switching with MOTU clock control, and Bluetooth remote control.
 
 ## Prerequisites
 
@@ -15,7 +15,7 @@ Before installing, ensure you have:
 - `camilladsp.service` must start `/usr/local/bin/camilladsp`, because the
   engine replaces that exact binary. A CamillaDSP installed elsewhere is
   detected before anything is compiled: Install All skips it with a note in the
-  run summary and installs everything else, while menu option 10 fails and
+  run summary and installs everything else, while menu option 9 fails and
   prints the reason.
 
 **For the optional Spotify Volume Sync:**
@@ -29,7 +29,7 @@ Before installing, ensure you have:
 - Mono 3.5mm jack connector ([like this](https://www.aliexpress.com/item/32704200322.html))
 - Your amplifier must support trigger input (typically 3-12V)
 
-**For MOTU Clock Sync:**
+**For MOTU clock, meters and main volume (Source Switcher):**
 - MOTU UltraLite mk5 (or compatible MOTU interface)
 - MOTU accessible on your network
 
@@ -61,7 +61,7 @@ chmod +x install.sh
 - Run the installer on the Raspberry Pi where you want the utilities installed
 - The installer uses `sudo` where required, so you do not need to run the whole script as root
 - Choose option **1** to install all utilities at once, or install them
-  individually - but note that options 6, 9 and 12 also install the source
+  individually - but note that options 5, 8 and 11 also install the source
   switcher, which they require in order to unmute or apply tone changes
 
 ## Audio control architecture
@@ -206,7 +206,7 @@ Use the installer's built-in pairing option:
 
 ```bash
 ./install.sh
-# Choose option 7: Pair Bluetooth Remote
+# Choose option 6: Pair Bluetooth Remote
 ```
 
 Or pair manually:
@@ -337,43 +337,48 @@ TRIGGER_AUDIO_THRESHOLD_DB=-80
 
 ---
 
-## 🎚️ MOTU Clock Sync
+## 🎚️ MOTU Clock (in the Source Switcher)
 
 ### What It Does
 
-Automatically switches your MOTU audio interface's clock source from the active
-managed source identity.
+The source switcher moves your MOTU audio interface's clock source with the
+active managed source. There is no separate MOTU service.
 
 ### How It Works
 
-- Reads the source name from CamillaDSP's managed config path, through the
-  same speaker-catalog lookup the source switcher uses
-- Sends WebSocket commands to MOTU to change clock source
+- The UltraLite serves one WebSocket client at a time, so the source switcher
+  is the only thing on the Pi that talks to it: its one connection carries the
+  TOSLINK/analog meters, the clock writes and the control UI's main volume
 - **TOSLINK** → switches to **optical** clock
 - **Streamer, USB gadget, or analog** → switches to **internal** clock
-- Retries a failed MOTU command until it is confirmed sent
-- Reads the clock source back from the MOTU and retries a command the device
-  did not actually apply
+- The MOTU pushes its whole state to every new connection and every change
+  afterwards, so the switcher always knows the clock it is on and never
+  rewrites a clock the device already reports (each write re-locks audibly)
+- Every write goes into silence: inside the muted source transition, before
+  the new config is loaded, the switcher waits for CamillaDSP's mute ramp and
+  output buffer to go quiet (confirmed on the playback meter), writes, lets
+  the interface re-lock, and reconnects to check the device took it. A
+  rolled-back transition puts the old clock back the same way
+- A write that failed or did not take, or a clock changed from CueMix 5, is
+  corrected later in its own brief muted step, never on live audio
 
 ### Requirements
 
-- MOTU UltraLite mk5 (other MOTU models may need different hex payloads)
+- MOTU UltraLite mk5 (other MOTU models may need different parameter values)
 - MOTU must be accessible on your network
 - The active config must use a managed source name
 
 ### Configuration
 
-The installer will prompt for your MOTU's IP address. To find it, push the
-UltraLite mk5's left front-panel knob to open the device info list; one entry
-is the IP address (a self-assigned `169.254.x.x`, usually `169.254.51.193`
-here). The UltraLite has no web interface: port 80 answers nothing, and all
-control goes over the binary WebSocket on port 1280 that CueMix 5 uses.
-
-To change the IP later, edit `~/camilladsp/cdsp-automation.env`:
+To find the MOTU's IP address, push the UltraLite mk5's left front-panel knob
+to open the device info list; one entry is the IP address (a self-assigned
+`169.254.x.x`, usually `169.254.51.193` here). The UltraLite has no web
+interface: port 80 answers nothing, and all control goes over the binary
+WebSocket on port 1280 that CueMix 5 uses. Set it in
+`~/camilladsp/cdsp-automation.env`:
 
 ```text
 MOTU_WS_URL=ws://YOUR_MOTU_IP:1280
-MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source
 ```
 
 Clock ownership is independent of sample rate. Sources may all run at 48 kHz;
@@ -381,42 +386,11 @@ the config identity still selects the correct clock. The config's identity
 comes from the speaker catalog, so an operator config mapped to any filename
 (not only `<speaker>-<source>.yml`) still selects the right clock.
 
-The last requested clock choice is persisted at `MOTU_CLOCK_STATE_PATH` so
-service restarts do not send a redundant command that makes the interface
-re-lock and briefly mute. That file is a cache of what was asked for, not
-proof of what the device did: the daemon reads the clock source back from the
-state the MOTU pushes to every new WebSocket client (it sends nothing to read),
-corrects the cache when the device disagrees (someone changed it in CueMix 5),
-and re-sends a command the device never applied - at most once per
-`MOTU_CLOCK_REWRITE_INTERVAL`, since every write re-locks the clock audibly.
-If the device cannot be read, the daemon falls back to the cached value.
-
-The UltraLite serves one WebSocket client at a time, so each read-back briefly
-displaces the source switcher's meter connection (or an open CueMix 5), which
-reconnects on its own; that is why a confirmed clock is re-checked only every
-few minutes. Optional keys:
+Switcher keys:
 
 ```text
-MOTU_CLOCK_READBACK_TIMEOUT=3
-MOTU_CLOCK_VERIFY_INTERVAL=300
-MOTU_CLOCK_READBACK_RETRY_INTERVAL=300
-MOTU_CLOCK_REWRITE_INTERVAL=30
-```
-
-When the Source Switcher is installed as well, it makes every clock write
-itself, and only into silence: inside its muted source transition, before the
-new config is loaded, it waits for CamillaDSP's mute ramp and output buffer
-to go quiet (confirmed on the playback meter), writes, and lets the interface
-re-lock before sound returns. A rolled-back transition puts the old clock
-back the same way. A write that failed - or that the daemon's read-back
-contradicts - is corrected later by the switcher in its own brief muted step,
-never on live audio. The daemon then only verifies: it reads the clock back
-and records what the device reports in the shared `MOTU_CLOCK_STATE_PATH`
-cache, and does not write the clock at all. Switcher keys:
-
-```text
-# auto: drive the clock whenever the MOTU Clock Sync unit is installed
-SOURCE_MOTU_CLOCK=auto
+# false leaves the MOTU clock alone
+SOURCE_MOTU_CLOCK=true
 # re-lock time allowed before the new graph is loaded on the interface
 MOTU_CLOCK_SETTLE_SECONDS=1.0
 # optional: silence confirmation and correction pacing
@@ -425,7 +399,11 @@ MOTU_CLOCK_SILENT_DB=-100
 MOTU_CLOCK_RETRY_SECONDS=30
 ```
 
-`MOTU_DATASTORE_URL` is no longer read; an existing line for it can be removed.
+Earlier releases ran a separate `cdsp-motu-sync` service; an install or update
+removes it. Its keys (`MOTU_CLOCK_STATE_PATH`, `MOTU_CLOCK_*` read-back
+intervals, `MOTU_ACCESS_PATH`, `MOTU_ACCESS_WINDOW_SECONDS`,
+`MOTU_DATASTORE_URL`) are no longer read and can be removed from the env file;
+`SOURCE_MOTU_CLOCK=auto` still means on.
 
 
 ---
@@ -581,7 +559,7 @@ you want that trade-off; every other utility works without it.
 Out of the box it binds **every interface on port 8088 with no
 authentication** — the historical behaviour, kept as the default so that
 upgrading an existing install does not take its UI away. Two settings in
-`~/camilladsp/cdsp-automation.env` narrow that, and menu option 12 offers the
+`~/camilladsp/cdsp-automation.env` narrow that, and menu option 11 offers the
 first one before it installs anything:
 
 | Setting | Default | Effect |
@@ -631,22 +609,22 @@ The installer menu provides these options:
 1. **Install All Utilities** - Recommended for first-time setup
 2. **Update Utilities** - Downloads latest scripts and updates pycamilladsp
 3. **Install Trigger Control** - GPIO relay control only
-4. **Install MOTU Clock Sync** - MOTU clock management only
-5. **Install Source Switcher** - Config switching only
-6. **Install Remote Control** - Bluetooth/USB remote control (also installs
-   option 5, which it requires)
-7. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
-8. **Show Service Status** - Check if services are running
-9. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the
-   CamillaDSP fader (also installs option 5, which it requires)
-10. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build.
-    Requires `camilladsp.service` to start `/usr/local/bin/camilladsp`.
-11. **Uninstall All Utilities** - Remove the services, units and sudoers rules.
+4. **Install Source Switcher** - Config switching, plus the MOTU clock, meters
+   and main volume
+5. **Install Remote Control** - Bluetooth/USB remote control (also installs
+   option 4, which it requires)
+6. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
+7. **Show Service Status** - Check if services are running
+8. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the
+   CamillaDSP fader (also installs option 4, which it requires)
+9. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build.
+   Requires `camilladsp.service` to start `/usr/local/bin/camilladsp`.
+10. **Uninstall All Utilities** - Remove the services, units and sudoers rules.
     Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
-12. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
-    also installs option 5, which it requires)
+11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
+    also installs option 4, which it requires)
 
-Options 6, 9 and 12 install the source switcher when it is missing, because
+Options 5, 8 and 11 install the source switcher when it is missing, because
 the components they install cannot unmute without it. The switcher is the only
 writer of the audio-ready token that permits an unmute, and the only thing that
 applies persisted Bass/Treble/EQ edits to the running engine, so installing any
@@ -656,12 +634,12 @@ switcher under "Also installed, because the components you chose require it"
 in its closing summary. Installing the switcher does not give it its source
 configs - you still have to create them, or its service will not run.
 
-Options 11 and 12 ask for a `y/N` confirmation before acting: one removes every
-managed service, the other exposes a root web server. Option 12 first prints
+Options 10 and 11 ask for a `y/N` confirmation before acting: one removes every
+managed service, the other exposes a root web server. Option 11 first prints
 the address it is about to bind to and whether a token is configured, and
 offers to move the UI to `127.0.0.1` before you say yes.
 
-Options 1, 2, 6, 9 and 12 end with a summary listing anything that was pulled
+Options 1, 2, 5, 8 and 11 end with a summary listing anything that was pulled
 in as a dependency and any component that was skipped or failed, and no longer
 abandon the rest of the run when one of them cannot be installed.
 
@@ -675,7 +653,6 @@ abandon the rest of the run when one of them cannot be installed.
 
 **System services:**
 - `cdsp-trigger.service`
-- `cdsp-motu-sync.service`
 - `cdsp-source-switcher.service`
 - `cdsp-remote.service`
 - `airplay-volume-bridge.service`
@@ -696,7 +673,6 @@ abandon the rest of the run when one of them cannot be installed.
 
 ```bash
 systemctl status cdsp-trigger
-systemctl status cdsp-motu-sync
 systemctl status cdsp-source-switcher
 systemctl status cdsp-remote
 ```
@@ -705,7 +681,6 @@ systemctl status cdsp-remote
 
 ```bash
 journalctl -u cdsp-trigger -f
-journalctl -u cdsp-motu-sync -f
 journalctl -u cdsp-source-switcher -f
 journalctl -u cdsp-remote -f
 ```
@@ -714,7 +689,6 @@ journalctl -u cdsp-remote -f
 
 ```bash
 journalctl -u cdsp-trigger -n 100
-journalctl -u cdsp-motu-sync -n 100
 journalctl -u cdsp-source-switcher -n 100
 journalctl -u cdsp-remote -n 100
 ```
@@ -748,7 +722,7 @@ python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in 
 
 Your remote should appear in the list. If not:
 - Check Bluetooth connection: `bluetoothctl devices Connected`
-- Re-pair the remote using the installer (option 7)
+- Re-pair the remote using the installer (option 6)
 
 **Check if the device name matches:**
 
@@ -803,7 +777,7 @@ journalctl -u cdsp-trigger -n 100
 
 Look for error messages about GPIO access or CamillaDSP connection.
 
-### MOTU Clock Sync Not Working
+### MOTU Clock Not Switching
 
 **Verify MOTU IP address:**
 
@@ -813,7 +787,7 @@ ping 169.254.51.193  # Or your MOTU's IP
 
 **Check the MOTU control WebSocket is reachable** (an UltraLite mk5 serves no
 HTTP, so `curl` to port 80 always reports an empty reply; like any client,
-this briefly displaces the source switcher's meter connection):
+this briefly displaces the source switcher's connection):
 
 ```bash
 timeout 2 bash -c '</dev/tcp/169.254.51.193/1280' && echo open
@@ -822,16 +796,16 @@ timeout 2 bash -c '</dev/tcp/169.254.51.193/1280' && echo open
 **Check logs:**
 
 ```bash
-journalctl -u cdsp-motu-sync -n 100
+journalctl -u cdsp-source-switcher -n 100 | grep MOTU
 ```
 
 **For other MOTU models:**
 
-The payloads and read-back values come from MOTU's CueMix 5 app, whose
+The parameter ids and values come from MOTU's CueMix 5 app, whose
 unobfuscated JavaScript defines every device parameter (for the UltraLite,
 `dev.js`: `kClockSource` is id 11 with Internal=3, S/PDIF=0, Optical=2). Other
 MOTU gen5 models may differ; check the matching `dev_*.js`, then update
-`CLOCK_PAYLOADS` and `MOTU_CLOCK_SOURCE_VALUES` in `clock_sync.py` together.
+`MOTU_CLOCK_WRITES` and `MOTU_CLOCK_NAMES` in `source_switcher.py` together.
 MOTU's AVB interfaces use a different (HTTP datastore) API and are not
 supported.
 
@@ -896,14 +870,14 @@ amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
 For TOSLINK meter detection, check that the MOTU WebSocket is reachable:
 
 ```bash
-journalctl -u cdsp-source-switcher -n 100 | grep "MOTU meters"
+journalctl -u cdsp-source-switcher -n 100 | grep "MOTU connected"
 ```
 
 ---
 
 ## Can I Use Just One Utility?
 
-**Some of them.** Trigger control and MOTU clock sync are genuinely standalone.
+**Some of them.** Trigger control is genuinely standalone.
 The remote, the AirPlay/Spotify volume bridge and the web control UI are not:
 they all ask `require_audio_unmute_allowed()` for permission before unmuting,
 and only the source switcher ever grants it by publishing the audio-ready
@@ -911,8 +885,7 @@ token. The switcher is also the only thing that applies a persisted
 Bass/Treble/EQ edit to the running engine. So:
 
 - Install only **Trigger Control** for amp power management
-- Install only **MOTU Clock Sync** for clock source automation
-- Install only **Source Switcher** for config switching
+- Install only **Source Switcher** for config switching and MOTU clock control
 - **Remote Control**, **AirPlay + Spotify Volume Sync** and the **Web Control
   UI** each require **Source Switcher**. The installer adds it for you rather
   than leaving you with a component that can never unmute and whose tone edits

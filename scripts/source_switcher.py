@@ -28,12 +28,7 @@ from audio_eq import (
     effective_preamp_db,
     status_payload,
 )
-from motu_access import AccessUnavailable, MotuAccess
-
-try:
-    import clock_sync
-except ImportError:  # websocket-client missing: no MOTU control at all
-    clock_sync = None
+import motu_volume
 from speaker_config import (
     compile_profile_config,
     config_digest,
@@ -131,15 +126,23 @@ CONFIG_APPLY_POLL_INTERVAL = float(
 AUDIO_THRESHOLD_DB = float(os.environ.get("SOURCE_AUDIO_THRESHOLD_DB", "-80"))
 DEBUG_MODE = env_bool("SOURCE_DEBUG", False)
 MOTU_WS_URL = os.environ.get("MOTU_WS_URL", "ws://169.254.51.193:1280")
-# Whether the switcher changes the MOTU clock itself, inside the muted
-# transition.  "auto" follows the MOTU Clock Sync install: that unit's
-# presence is what says this rig's clock is ours to drive.
-SOURCE_MOTU_CLOCK = os.environ.get("SOURCE_MOTU_CLOCK", "auto").strip().lower()
-MOTU_CLOCK_UNIT_PATH = Path(
-    os.environ.get(
-        "MOTU_CLOCK_UNIT_PATH", "/etc/systemd/system/cdsp-motu-sync.service"
-    )
-)
+# Whether the switcher changes the MOTU clock to follow the source, inside its
+# muted transition.  Only an explicit off turns it off; the historical "auto"
+# (which followed a separate clock unit that no longer exists) means on.
+SOURCE_MOTU_CLOCK = os.environ.get("SOURCE_MOTU_CLOCK", "on").strip().lower()
+# MOTU UltraLite mk5 clock source (CueMix 5 dev.js): parameter 11,
+# ``kClockSource``, one byte; ``kClockSources`` Internal=3, S/PDIF=0,
+# Optical=2.  The writes are CueMix 5's own encoding: id 11, index 0,
+# length 1, value.
+MOTU_CLOCK_SOURCE_PARAM = 11
+MOTU_CLOCK_NAMES = {3: "internal", 2: "optical", 0: "spdif"}
+MOTU_CLOCK_WRITES = {
+    "internal": bytes.fromhex("000b0000000103"),
+    "optical": bytes.fromhex("000b0000000102"),
+}
+# How long a fresh MOTU connection gets to push its state dump (every
+# parameter, then the first meter frame).
+MOTU_STATE_TIMEOUT = float(os.environ.get("SOURCE_MOTU_STATE_TIMEOUT", "3.0"))
 # How long the MOTU gets to re-lock before the new graph is loaded on it.
 MOTU_CLOCK_SETTLE_SECONDS = float(os.environ.get("MOTU_CLOCK_SETTLE_SECONDS", "1.0"))
 # Extra time allowed, past the mute ramp and output buffer, for the playback
@@ -318,23 +321,48 @@ def iso226_capability_available() -> bool:
     return _iso226_capability_result
 
 
-class MotuMeterReader:
-    """Read passive meter frames from MOTU UltraLite mk5 CueMix WebSocket."""
+METER_FRAME_HEADER = bytes.fromhex("17700000")
 
-    def __init__(self, url: str, access: MotuAccess | None = None) -> None:
+
+def _is_timeout(exc: Exception) -> bool:
+    timeout_type = getattr(websocket, "WebSocketTimeoutException", TimeoutError)
+    return isinstance(exc, (TimeoutError, timeout_type))
+
+
+class MotuConnection:
+    """The one connection to the MOTU UltraLite mk5 CueMix WebSocket.
+
+    The device serves one WebSocket client at a time and drops the older one
+    on every new connection, so everything this rig does with the MOTU goes
+    over this socket, from this process: the passive meter frames that detect
+    TOSLINK and analog input, the clock-source write inside a muted
+    transition, and the main volume the control UI asks for.  CueMix 5 itself
+    reads meters and writes parameters over its one socket the same way.
+
+    Nothing is ever asked for.  The device pushes its whole parameter set to
+    every new client, then its meter stream and any parameter that changes;
+    the clock source and main volume are taken from those pushes.  While
+    disconnected they are unknown (None): CueMix may have changed them.
+    """
+
+    def __init__(self, url: str) -> None:
         self.url = url
         self.ws = None
         self.last_pairs: dict[int, tuple[int, int]] = {}
         self.last_seen = 0.0
         self.next_connect_attempt = 0.0
         self.next_error_log = 0.0
-        self.connected_at = 0.0
-        # The extra MOTU accesses (clock writes and read-backs, control-UI
-        # volume) are recorded in a shared file; see motu_access.py.
-        self.access = access or MotuAccess()
-        self.forgiven_access: float | None = None
+        self.clock: str | None = None
+        self.trim: int | None = None
+        self.group: int | None = None
+        # False after our own trim write until the device pushes a level.
+        self.trim_confirmed = False
+        self.volume_error: str | None = None
+        self.volume_result: dict | None = None
 
     def close(self) -> None:
+        self.clock = self.trim = self.group = None
+        self.trim_confirmed = False
         if self.ws is None:
             return
         try:
@@ -349,116 +377,219 @@ class MotuMeterReader:
             print(message, flush=True)
             self.next_error_log = now + 30
 
-    def connect(self) -> bool:
+    def connect(self, force: bool = False) -> bool:
+        """Connect unless connected or backing off; ``force`` skips the backoff.
+
+        A new connection first takes the state dump the device pushes (up to
+        its first meter frame), so the clock and main volume are known before
+        anything depends on them.
+        """
         now = time.monotonic()
         if self.ws is not None:
             return True
-        if now < self.next_connect_attempt:
+        if now < self.next_connect_attempt and not force:
             return False
+        self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
 
         if websocket is None:
-            self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
-            self.log_error(
-                "MOTU meter connection unavailable: install websocket-client"
-            )
+            self.log_error("MOTU connection unavailable: install websocket-client")
             return False
-
-        def attempt():
+        try:
             ws = websocket.WebSocket()
             ws.settimeout(1)
             ws.connect(self.url, timeout=1)
-            ws.settimeout(0.05)
-            return ws
-
-        # A clock read-back, clock write or UI volume access in progress holds
-        # the device; connecting now would reset it.  Wait a pass instead,
-        # without the backoff: the device is there, just busy.
-        connect_when_idle = getattr(self.access, "connect_when_idle", None)
-        try:
-            if connect_when_idle is None:
-                went, ws = True, attempt()
-            else:
-                went, ws = connect_when_idle(attempt)
         except Exception as exc:
-            self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
             self.close()
-            self.log_error(f"MOTU meter connection failed: {exc}")
+            self.log_error(f"MOTU connection failed: {exc}")
             return False
-        if not went:
-            return False
-        self.next_connect_attempt = now + MOTU_CONNECT_RETRY_SECONDS
         self.ws = ws
-        self.connected_at = now
-        print(f"MOTU meters connected: {self.url}", flush=True)
-        return True
+        self.volume_error = None
+        print(f"MOTU connected: {self.url}", flush=True)
+        self._receive(time.monotonic() + MOTU_STATE_TIMEOUT, state_dump=True)
+        return self.ws is not None
 
-    def read(self) -> dict[int, tuple[int, int]]:
-        if not self.connect():
-            return (
-                self.last_pairs
-                if time.monotonic() - self.last_seen <= MOTU_METER_MAX_AGE
-                else {}
-            )
-
-        deadline = time.monotonic() + MOTU_READ_WINDOW_SECONDS
-        while time.monotonic() < deadline and self.ws is not None:
+    def _receive(self, deadline: float, *, state_dump: bool = False) -> None:
+        """Take frames until ``deadline``; a pause in the stream ends a meter
+        read early, the first meter frame ends a state dump."""
+        while self.ws is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
             try:
+                self.ws.settimeout(remaining if state_dump else 0.05)
                 _opcode, data = self.ws.recv_data(control_frame=True)
-            except websocket.WebSocketTimeoutException:
-                break
             except Exception as exc:
+                if _is_timeout(exc):
+                    return
                 self.close()
-                # A drop a recorded access explains is expected every clock
-                # read-back; only an unexplained one is worth an error line.
-                if not self.forgive_coordinated_kick():
-                    self.log_error(f"MOTU meter read failed: {exc}")
-                break
-
-            # MOTU meter frames are binary. A text frame here is never a valid
-            # meter payload; encoding it as UTF-8 would corrupt any byte >= 0x80
-            # (multi-byte), so decode 1:1 via latin-1 to preserve raw bytes.
+                self.log_error(f"MOTU read failed: {exc}")
+                return
+            # MOTU frames are binary. A text frame here is never valid; encoding
+            # it as UTF-8 would corrupt any byte >= 0x80 (multi-byte), so decode
+            # 1:1 via latin-1 to preserve raw bytes.
             payload = (
                 data.encode("latin-1") if isinstance(data, str) else bytes(data or b"")
             )
-            if len(payload) != 104 or payload[:4] != bytes.fromhex("17700000"):
-                continue
+            if self._take_frame(payload) and state_dump:
+                return
 
+    def _take_frame(self, payload: bytes) -> bool:
+        """Record one pushed frame; True for a meter frame."""
+        if len(payload) == 104 and payload[:4] == METER_FRAME_HEADER:
             body = payload[4:]
             self.last_pairs = {
                 pair: (body[pair * 2], body[pair * 2 + 1])
                 for pair in range(len(body) // 2)
             }
             self.last_seen = time.monotonic()
+            return True
+        value = motu_volume.decode_byte_push(payload, MOTU_CLOCK_SOURCE_PARAM)
+        if value is not None:
+            clock = MOTU_CLOCK_NAMES.get(value, f"source {value}")
+            if self.clock is not None and clock != self.clock:
+                print(f"MOTU reports clock source {clock}", flush=True)
+            self.clock = clock
+            return False
+        trim = motu_volume.decode_main_trim(payload)
+        if trim is not None and trim <= motu_volume.MAIN_TRIM_MAX_ATTENUATION:
+            self.trim = trim
+            self.trim_confirmed = True
+            return False
+        group = motu_volume.decode_main_group(payload)
+        if group is not None:
+            self.group = group
+        return False
 
+    def read(self) -> dict[int, tuple[int, int]]:
+        """Meter pairs, after taking whatever the device pushed since last time."""
+        if self.connect():
+            self._receive(time.monotonic() + MOTU_READ_WINDOW_SECONDS)
         if time.monotonic() - self.last_seen > MOTU_METER_MAX_AGE:
             return {}
         return self.last_pairs
 
-
-    def forgive_coordinated_kick(self) -> bool:
-        """Reconnect on the next pass when a recorded MOTU access explains
-        the drop, instead of after the SOURCE_MOTU_CONNECT_RETRY_SECONDS
-        backoff.
-
-        The device serves one client at a time, so every extra access drops
-        this connection. The backoff exists for a device that is absent; a
-        drop caused by an access recorded after this connection was made says
-        the device is right there. Without this, an access followed within
-        ~10 s by another (a UI volume change, then a clock write for a switch
-        to TOSLINK) keeps the meters dark ~10 s and TOSLINK drops. Each
-        recorded access forgives at most one drop, and an unexplained drop (or
-        an unreadable record) keeps the backoff. Returns whether it forgave.
-        """
+    def _send(self, frame: bytes) -> str | None:
+        """Write one frame; the error, or None once it left this host."""
         try:
-            at, kind = self.access.last_access()
-        except AccessUnavailable:
+            self.ws.send(frame, opcode=motu_volume.OPCODE_BINARY)
+        except Exception as exc:
+            # The frame may or may not have reached the device, so nothing
+            # it reported before is known to hold any more.  Reconnecting
+            # brings a fresh state dump that settles it.
+            self.close()
+            return str(exc)
+        return None
+
+    def set_clock(self, clock: str) -> bool:
+        """Write ``clock`` on the open connection; True once it left this host.
+
+        The caller has already checked the device does not report ``clock``
+        (every write re-locks the interface and clicks), holds the mute, and
+        afterwards calls :meth:`verify_clock` once the re-lock has settled.
+        """
+        frame = MOTU_CLOCK_WRITES.get(clock)
+        if frame is None or self.ws is None:
+            print(f"MOTU clock not set to {clock}: MOTU not connected", flush=True)
             return False
-        if at is None or at < self.connected_at or at == self.forgiven_access:
+        error = self._send(frame)
+        if error is not None:
+            print(f"MOTU clock write to {clock} failed: {error}", flush=True)
             return False
-        self.forgiven_access = at
-        self.next_connect_attempt = time.monotonic()
-        print(f"MOTU meters displaced by a {kind} access; reconnecting", flush=True)
+        print(f"MOTU clock source set to {clock}", flush=True)
+        self.clock = clock
         return True
+
+    def verify_clock(self, clock: str) -> bool:
+        """Reconnect, so the state dump - not our own belief - names the clock.
+
+        A device that did not take the write then reports its real clock, and
+        the switcher's next clock correction sees the difference.
+        """
+        self.close()
+        if not self.connect(force=True):
+            print(f"MOTU clock {clock} unconfirmed: MOTU not connected", flush=True)
+            return False
+        if self.clock != clock:
+            print(f"MOTU clock is {self.clock}, not {clock}", flush=True)
+            return False
+        return True
+
+    def serve_volume_request(self) -> None:
+        """Apply the control UI's pending main-volume request, if any, and
+        publish the level for it."""
+        request = motu_volume.take_request()
+        if request is not None:
+            result = self._apply_volume(request)
+            result["id"] = request.get("id")
+            self.volume_result = result
+        reason = self.volume_error
+        if reason is None and self.ws is None:
+            reason = "the MOTU is not connected"
+        elif reason is None and (self.trim is None or self.group is None):
+            reason = "the MOTU did not report its main volume"
+        payload = motu_volume.status_payload(
+            self.trim,
+            self.group,
+            confirmed=self.trim_confirmed,
+            reason=reason,
+            result=self.volume_result,
+        )
+        try:
+            _write_status_if_changed(motu_volume.STATUS_PATH, payload)
+        except OSError as exc:
+            self.log_error(f"MOTU volume status not written: {exc}")
+
+    def _apply_volume(self, request: dict) -> dict:
+        try:
+            target, expected = motu_volume.parse_request(request)
+        except (ValueError, motu_volume.MotuVolumeRefused) as exc:
+            return {"ok": False, "kind": "refused", "error": str(exc)}
+        if not self.connect(force=True):
+            return {"ok": False, "kind": "unavailable", "error": "the MOTU is not connected"}
+        trim, group = self.trim, self.group
+        if trim is None or group is None:
+            return {
+                "ok": False,
+                "kind": "unavailable",
+                "error": "the MOTU did not report its main volume",
+            }
+        if (group & motu_volume.REQUIRED_MAIN_GROUP) != motu_volume.REQUIRED_MAIN_GROUP:
+            return {
+                "ok": False,
+                "kind": "refused",
+                "error": (
+                    f"main group 0x{group:04x} does not cover every analog output;"
+                    " refusing a change that would unbalance the crossover"
+                ),
+            }
+        if trim != expected:
+            return {
+                "ok": False,
+                "kind": "conflict",
+                "error": (
+                    f"the MOTU is at {motu_volume.attenuation_to_db(trim):.0f} dB, "
+                    f"not {motu_volume.attenuation_to_db(expected):.0f} dB; nothing written"
+                ),
+            }
+        if target != trim:
+            error = self._send(motu_volume.encode_main_trim_write(target))
+            if error is not None:
+                # Never resend on a guess; the next state dump settles it.
+                self.volume_error = f"MOTU main volume write outcome unknown: {error}"
+                return {"ok": False, "kind": "unavailable", "error": self.volume_error}
+            print(
+                f"MOTU main volume {motu_volume.attenuation_to_db(trim):.0f} dB"
+                f" -> {motu_volume.attenuation_to_db(target):.0f} dB",
+                flush=True,
+            )
+            # A send that did not raise is not proof the device took it; its
+            # next push of the level confirms it.
+            self.trim = target
+            self.trim_confirmed = False
+        return {"ok": True, "written": target != trim}
+
+
+_motu: MotuConnection | None = None
 
 
 def meter_pairs_active(
@@ -1352,11 +1483,7 @@ def ensure_current_speaker_audio_eq(cdsp: CamillaClient, current_speaker: str) -
 
 
 def _owns_motu_clock() -> bool:
-    if clock_sync is None or SOURCE_MOTU_CLOCK in {"0", "false", "no", "off"}:
-        return False
-    if SOURCE_MOTU_CLOCK in {"1", "true", "yes", "on"}:
-        return True
-    return MOTU_CLOCK_UNIT_PATH.exists()
+    return _motu is not None and SOURCE_MOTU_CLOCK not in {"0", "false", "no", "off"}
 
 
 def _output_drain_times(config: object) -> tuple[float, float]:
@@ -1445,20 +1572,28 @@ def _await_output_silence(cdsp: CamillaClient) -> bool:
 
 
 def _set_motu_clock_muted(cdsp: CamillaClient, clock: str) -> bool:
-    """The one managed clock write: silence first, then write, then settle.
+    """The one managed clock write: silence first, then write, settle, verify.
 
-    The caller holds the audio-control lock and has requested mute.
+    The caller holds the audio-control lock and has requested mute.  Returns
+    whether the clock is (or was just written to) ``clock``; a write the
+    device then does not report is left to ClockReconciler.
     """
-    assert clock_sync is not None
+    motu = _motu
+    assert motu is not None
+    # Callers connect first (forced past the backoff); a device still not
+    # there is not worth waiting for silence.
+    if not motu.connect():
+        print(f"MOTU clock not set to {clock}: MOTU not connected", flush=True)
+        return False
+    if motu.clock == clock:
+        return True
     if not _await_output_silence(cdsp):
         print(f"MOTU clock not set to {clock}: output did not go silent", flush=True)
         return False
-    if not clock_sync.set_motu_clock(clock):
+    if not motu.set_clock(clock):
         return False
-    # The shared cache is how clock_sync learns this write was made; from
-    # here on it only verifies.
-    clock_sync.persist_clock(clock)
     time.sleep(MOTU_CLOCK_SETTLE_SECONDS)
+    motu.verify_clock(clock)
     return True
 
 
@@ -1477,18 +1612,18 @@ def _switch_motu_clock(cdsp: CamillaClient, target: dict | None) -> str | None:
     transition rolls back, or None when nothing was changed.
 
     A failed write does not fail the transition: the audio path itself is
-    fine.  The cache then still disagrees with the source, and
-    ``reconcile_motu_clock`` retries -- muted again, from the switcher, never
-    from clock_sync.  A clock the cache already names is not written again:
-    every write re-locks and clicks.
+    fine.  The device then still reports the old clock, and ClockReconciler
+    retries -- muted again.  A clock the device already reports is not
+    written again: every write re-locks and clicks.
     """
     if not target or not _owns_motu_clock():
         return None
     desired = _desired_clock(target.get("source"))
     if desired is None:
         return None
-    assert clock_sync is not None
-    believed = clock_sync.read_persisted_clock()
+    assert _motu is not None
+    _motu.connect(force=True)
+    believed = _motu.clock
     if believed == desired:
         return None
     if not _set_motu_clock_muted(cdsp, desired):
@@ -1503,9 +1638,10 @@ def _switch_motu_clock(cdsp: CamillaClient, target: dict | None) -> str | None:
 
 def _restore_motu_clock(cdsp: CamillaClient, previous_clock: str | None) -> None:
     """Best-effort return of the clock during a muted rollback."""
-    if previous_clock is None or clock_sync is None:
+    if previous_clock not in MOTU_CLOCK_WRITES or _motu is None:
         return
     try:
+        _motu.connect(force=True)
         if not _set_motu_clock_muted(cdsp, previous_clock):
             print(f"MOTU clock not restored to {previous_clock}", flush=True)
     except Exception as exc:
@@ -1515,9 +1651,10 @@ def _restore_motu_clock(cdsp: CamillaClient, previous_clock: str | None) -> None
 class ClockReconciler:
     """Correct a clock that disagrees with the live source, outside a switch.
 
-    The disagreement shows up in the shared cache: a transition whose clock
-    write failed leaves the old value there, and clock_sync writes back what
-    the device really reports.  The correction is its own small muted
+    The disagreement shows up in what the MOTU reports on the switcher's
+    connection: a transition whose clock write failed or did not take, or a
+    clock changed from CueMix 5.  Nothing is done while the clock is unknown
+    (the MOTU is not connected).  The correction is its own small muted
     transaction under the audio-control lock -- mute, wait for silence,
     write, settle, restore the previous mute -- and is attempted at most once
     per MOTU_CLOCK_RETRY_SECONDS.  It never runs while readiness is withheld:
@@ -1533,16 +1670,14 @@ class ClockReconciler:
         desired = _desired_clock(source)
         if desired is None:
             return
-        assert clock_sync is not None
-        if clock_sync.read_persisted_clock() == desired:
+        assert _motu is not None
+        if _motu.clock is None or _motu.clock == desired:
             return
         self.next_attempt = now + MOTU_CLOCK_RETRY_SECONDS
         with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
             if audio_inhibit_active(
                 AUDIO_READY_PATH, cdsp, generation=engine_generation()
             ):
-                return
-            if clock_sync.read_persisted_clock() == desired:
                 return
             previous_mute = bool(cdsp.volume.main_mute())
             cdsp.volume.set_main_mute(True)
@@ -2134,11 +2269,9 @@ def main() -> int:
     with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
         set_audio_inhibit(AUDIO_READY_PATH)
     cdsp = CamillaClient(CAMILLA_IP, CAMILLA_PORT)
-    motu = (
-        MotuMeterReader(MOTU_WS_URL)
-        if TOSLINK_MOTU_METERS or ANALOG_MOTU_METERS
-        else None
-    )
+    # The one MOTU client on this host: meters, clock and main volume.
+    global _motu
+    _motu = motu = MotuConnection(MOTU_WS_URL)
     probes: dict[str, ProbeRecord] = {}
     last_arbitration: float | None = None
     toslink_active_timer = 0.0
@@ -2341,8 +2474,8 @@ def main() -> int:
                         pass
                     print(f"Audio EQ ensure failed: {exc}", flush=True)
 
-            # A clock this pass finds wrong (a failed in-transition write, or
-            # a read-back that contradicted one) is corrected muted, here.
+            # A clock the MOTU reports wrong (a failed in-transition write, or
+            # one changed from CueMix 5) is corrected muted, here.
             if not inhibited:
                 try:
                     clock_reconciler.run(cdsp, current_source, now)
@@ -2366,7 +2499,8 @@ def main() -> int:
                         "supported_sources"
                     ]
                 )
-            meter_pairs = motu.read() if motu is not None else {}
+            meter_pairs = motu.read()
+            motu.serve_volume_request()
             toslink_meter_active = TOSLINK_MOTU_METERS and "toslink" in supported_sources and meter_pairs_active(
                 meter_pairs,
                 TOSLINK_METER_PAIRS,

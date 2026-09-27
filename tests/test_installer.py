@@ -85,24 +85,20 @@ create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
             '"$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py"', refresh
         )
 
-    def test_state_storage_prepares_configured_lock_and_clock_parents(self) -> None:
+    def test_state_storage_prepares_configured_lock_parents(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         storage = installer.split("ensure_audio_state_storage()", 1)[1].split(
             "create_unit()", 1
         )[0]
 
         self.assertIn(
-            "MOTU_CLOCK_STATE_PATH=/var/lib/cdsp-automation/motu-clock-source",
-            installer,
-        )
-        self.assertIn(
             'ensure_user_writable_dir "$(dirname "$audio_control_lock_path")"',
             storage,
         )
-        self.assertIn(
-            'ensure_user_writable_dir "$(dirname "$motu_clock_state_path")"',
-            storage,
-        )
+        # The switcher keeps no MOTU state on disk: the device's own state
+        # push names its clock, and nothing coordinates a second client.
+        self.assertNotIn("MOTU_CLOCK_STATE_PATH", installer)
+        self.assertNotIn("motu_access", storage)
 
     def test_default_env_points_the_control_ui_at_the_installed_base_dir(self) -> None:
         """The UI unit has no User=, so it cannot resolve these from $HOME."""
@@ -305,8 +301,6 @@ if confirm_control_ui_exposure; then echo GATE=ACTED; else echo GATE=CANCELLED; 
                     [
                         f"AUDIO_EQ_PATH={state}/audio-eq.json",
                         f"AUDIO_CONTROL_LOCK_PATH={state}/audio-control.lock",
-                        f"MOTU_CLOCK_STATE_PATH={state}/motu-clock-source",
-                        f"MOTU_ACCESS_PATH={state}/motu-access.lock",
                         f"SPEAKER_SELECTION_PATH={state}/speaker-selection.json",
                         f"SPEAKER_TRANSITION_PATH={state}/speaker-transition.json",
                         f"SPEAKER_AUDIO_DIR={state}/speaker-audio",
@@ -361,9 +355,6 @@ ensure_audio_state_storage
                 state / "audio-eq.json.lock",
                 state / "audio-control.lock",
                 state / "speaker-selection.json.lock",
-                # Written by clock_sync and the switcher (install user) and by
-                # the root control UI.
-                state / "motu-access.lock",
             ):
                 self.assertTrue(lock.is_file(), lock)
                 self.assertEqual(lock.stat().st_mode & 0o777, 0o660)
@@ -404,7 +395,6 @@ ensure_audio_state_storage
                         f'record() {{ printf "%s\\n" "$1" >> {log!s}; }}',
                         "prepare_install() { record prepare; }",
                         "install_trigger() { record trigger; }",
-                        "install_motu_sync() { record motu; }",
                         "install_source_switcher() { record switcher; }",
                         "install_remote() { record remote; }",
                         "install_airplay_volume_bridge() { record airplay; }",
@@ -421,7 +411,6 @@ ensure_audio_state_storage
                 [
                     "prepare",
                     "trigger",
-                    "motu",
                     "switcher",
                     "remote",
                     "airplay",
@@ -441,7 +430,6 @@ ensure_audio_state_storage
                         f'record() {{ printf "%s\\n" "$1" >> {log!s}; }}',
                         "prepare_install() { record prepare; }",
                         "install_trigger() { record trigger; }",
-                        "install_motu_sync() { :; }",
                         "install_source_switcher() { :; }",
                         "install_remote() { :; }",
                         "install_airplay_volume_bridge() { return 1; }",
@@ -595,7 +583,6 @@ ensure_audio_state_storage
                         f'record() {{ printf "%s\\n" "$1" >> {log!s}; }}',
                         "prepare_install() { record prepare; }",
                         "install_trigger() { record trigger; }",
-                        "install_motu_sync() { record motu; }",
                         "install_source_switcher() { record switcher; "
                         "SOURCE_SWITCHER_INSTALLED_THIS_RUN=1; }",
                         'install_remote() { ensure_source_switcher "Remote Control"; '
@@ -615,7 +602,6 @@ ensure_audio_state_storage
                 [
                     "prepare",
                     "trigger",
-                    "motu",
                     "switcher",
                     "remote",
                     "airplay",
@@ -632,10 +618,10 @@ ensure_audio_state_storage
     ) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
         dispatch = installer.split('read -r -p "Enter your choice: "', 1)[1]
-        # Options 6 and 12 can now pull a component in, so they gained the
-        # summary that already closed options 1, 2 and 9.
+        # Options 5 and 11 can now pull a component in, so they gained the
+        # summary that already closed options 1, 2 and 8.
         self.assertIn(
-            "6) reset_install_notes; prepare_install; install_remote; "
+            "5) reset_install_notes; prepare_install; install_remote; "
             "print_install_summary ;;",
             dispatch,
         )
@@ -644,7 +630,7 @@ ensure_audio_state_storage
             dispatch,
         )
         menu = self._run("print_menu")
-        self.assertIn("Options 6, 9 and 12 also install option 5", menu)
+        self.assertIn("Options 5, 8 and 11 also install option 4", menu)
         self.assertIn("permit an unmute", menu)
         # Every dependent routes through the one helper.
         for component in (
@@ -675,7 +661,6 @@ ensure_audio_state_storage
                     [
                         "prepare_install() { :; }",
                         "install_trigger() { :; }",
-                        "install_motu_sync() { :; }",
                         "install_source_switcher() { :; }",
                         "install_remote() { :; }",
                         "install_airplay_volume_bridge() { :; }",
@@ -733,7 +718,7 @@ ensure_audio_state_storage
             self.assertNotIn("build_camilladsp_iso226", calls)
             self.assertIn("refresh", calls)
             self.assertIn("left running untouched", output)
-            self.assertIn("menu option 10", output)
+            self.assertIn("menu option 9", output)
 
     def test_spotify_sync_skips_loudly_when_raspotify_is_absent(self) -> None:
         """No unit means no clone, no cargo, and no aborted installer."""
@@ -757,7 +742,7 @@ ensure_audio_state_storage
                 env={"HOME": directory, "CDSP_AUTOMATION_BASE_DIR": directory},
             )
             self.assertIn("Spotify volume sync: SKIPPED", output)
-            self.assertIn("re-run menu option 9", output)
+            self.assertIn("re-run menu option 8", output)
             self.assertIn("status=0", output)
             self.assertFalse(sentinel.exists())
 
@@ -800,7 +785,6 @@ ensure_audio_state_storage
                 steps,
                 [
                     "unit:cdsp-trigger",
-                    "unit:cdsp-motu-sync",
                     "unit:cdsp-source-switcher",
                     "receiver-sudoers",
                     "unit:airplay-volume-bridge",
@@ -811,6 +795,54 @@ ensure_audio_state_storage
                     "ui",
                 ],
             )
+
+    def test_update_retires_the_old_motu_clock_sync_service(self) -> None:
+        """The switcher is now the MOTU's only client: an update on a Pi that
+        still runs cdsp-motu-sync stops, disables and removes it first."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unit_dir = root / "units"
+            scripts = root / "site" / "scripts"
+            for path in (unit_dir, scripts):
+                path.mkdir(parents=True)
+            (unit_dir / "cdsp-motu-sync.service").write_text("[Unit]\n", encoding="utf-8")
+            for stale in ("clock_sync.py", "motu_access.py", "source_switcher.py"):
+                (scripts / stale).write_text("", encoding="utf-8")
+            log = root / "calls.log"
+            self._run(
+                "\n".join(
+                    [
+                        f'record() {{ printf "%s\\n" "$*" >> {log!s}; }}',
+                        "systemctl() { :; }",
+                        'sudo() { if [[ "$1" == rm ]]; then command "$@"; '
+                        'else record "$@"; fi; }',
+                        'create_unit() { record "unit:$3"; }',
+                        "refresh_installed_units",
+                    ]
+                ),
+                env={
+                    "HOME": str(root),
+                    "CDSP_AUTOMATION_BASE_DIR": str(root / "site"),
+                    "CDSP_AUTOMATION_SYSTEMD_UNIT_DIR": str(unit_dir),
+                },
+            )
+            calls = log.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(
+                calls[:3],
+                [
+                    "systemctl stop cdsp-motu-sync.service",
+                    "systemctl disable cdsp-motu-sync.service",
+                    "systemctl daemon-reload",
+                ],
+            )
+            self.assertFalse((unit_dir / "cdsp-motu-sync.service").exists())
+            self.assertFalse((scripts / "clock_sync.py").exists())
+            self.assertFalse((scripts / "motu_access.py").exists())
+            self.assertTrue((scripts / "source_switcher.py").exists())
+        installer = INSTALLER.read_text(encoding="utf-8")
+        sudoers = installer.split("install_remote_sudoers() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("motu", sudoers)
+        self.assertNotIn("cdsp-motu-sync", installer.split("CDSP_SERVICES=(", 1)[1].split(")", 1)[0])
 
     def test_refresh_rebuilds_spotify_sync_from_the_installed_dropin(self) -> None:
         installer = INSTALLER.read_text(encoding="utf-8")
@@ -1026,15 +1058,20 @@ ensure_audio_state_storage
         # The split that was deliberately not attempted in this pass.
         self.assertIn("narrowly scoped privileged", technical)
 
-    def test_menu_lists_uninstall_at_eleven_and_the_ui_at_twelve(self) -> None:
+    def test_menu_lists_uninstall_at_ten_and_the_ui_at_eleven(self) -> None:
         output = self._run("print_menu")
-        self.assertIn("11) Uninstall All Utilities", output)
-        self.assertIn("12) Install Web Control UI (optional)", output)
+        # The owner deploys with `printf "2\n0\n" | bash install.sh`.
+        self.assertIn("2)  Update Utilities", output)
+        self.assertIn("4)  Install Source Switcher", output)
+        self.assertIn("10) Uninstall All Utilities", output)
+        self.assertIn("11) Install Web Control UI (optional)", output)
+        self.assertNotIn("12)", output)
+        self.assertNotIn("MOTU Clock Sync", output)
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         technical = (REPOSITORY / "TECHNICAL.md").read_text(encoding="utf-8")
-        self.assertIn("11. **Uninstall All Utilities**", readme)
-        self.assertIn("12. **Install Web Control UI**", readme)
-        self.assertIn("menu option 12", technical)
+        self.assertIn("10. **Uninstall All Utilities**", readme)
+        self.assertIn("11. **Install Web Control UI**", readme)
+        self.assertIn("menu option 11", technical)
 
     def test_destructive_and_exposing_options_require_an_explicit_yes(self) -> None:
         for answer, expected in (("y\n", "ACTED"), ("n\n", "Cancelled"), ("", "Cancelled")):
@@ -1059,11 +1096,11 @@ ensure_audio_state_storage
         installer = INSTALLER.read_text(encoding="utf-8")
         dispatch = installer.split("read -r -p \"Enter your choice: \"", 1)[1]
         self.assertIn(
-            '11) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all;',
+            '10) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all;',
             dispatch,
         )
         self.assertIn(
-            "12) if confirm_control_ui_exposure; then prepare_install; install_control_ui;",
+            "11) if confirm_control_ui_exposure; then prepare_install; install_control_ui;",
             dispatch,
         )
         # The gate is still an explicit y/N, it just names the exposure first.
@@ -1204,7 +1241,7 @@ ensure_audio_state_storage
             )
             (base / "cdsp-automation.env").write_text("", encoding="utf-8")
             services = [
-                "cdsp-trigger", "cdsp-motu-sync", "cdsp-source-switcher",
+                "cdsp-trigger", "cdsp-source-switcher",
                 "airplay-volume-bridge", "cdsp-remote", "cdsp-control-ui",
             ]
             listed = "\n".join(f"{s}.service enabled enabled" for s in services)
