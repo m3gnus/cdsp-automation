@@ -257,7 +257,7 @@ buttons a job, write `/etc/cdsp-automation/remote-keymap.json` (start from
 and restart the remote:
 
 ```bash
-~/camilladsp/venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
 sudo install -m 0644 remote-keymap.json /etc/cdsp-automation/remote-keymap.json
 sudo systemctl restart cdsp-remote
 ```
@@ -267,7 +267,7 @@ Stop the service and let the remote tell you:
 
 ```bash
 sudo systemctl stop cdsp-remote
-~/camilladsp/venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
 # press each button; Ctrl+C when done
 sudo systemctl start cdsp-remote
 ```

@@ -267,3 +267,11 @@ def test_print_keymap_writes_clean_json(tmp_path: Path, capsys) -> None:
         "hold": "restart_services",
         "long_hold": "shutdown",
     }
+
+
+def test_learn_reads_remote_name_from_the_env_file(tmp_path: Path) -> None:
+    env = tmp_path / "cdsp-automation.env"
+    env.write_text("# settings\nREMOTE_NAME=My Remote Keyboard\nPOWER_GPIO=4\n")
+    with mock.patch.object(cdsp_remote, "ENV_FILE", env):
+        assert cdsp_remote.env_file_value("REMOTE_NAME") == "My Remote Keyboard"
+        assert cdsp_remote.env_file_value("MISSING") is None

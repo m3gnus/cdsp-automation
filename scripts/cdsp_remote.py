@@ -29,6 +29,7 @@ from settings import (
     AUDIO_EQ_PATH,
     CDSP_HOST,
     CDSP_PORT,
+    ENV_FILE,
     REMOTE_KEYMAP_PATH,
     SPEAKER_AUDIO_DIR,
     SPEAKER_SELECTION_PATH,
@@ -532,6 +533,24 @@ async def handle_remote_events(device) -> None:
             dispatcher = remote_keymap.KeyDispatcher(keymap)
 
 
+def env_file_value(key: str) -> str | None:
+    """``key`` from the env file, for a run from a shell rather than the unit.
+
+    The unit loads the file with EnvironmentFile=; a person running --learn
+    by hand has not, and the file's values may contain spaces, so sourcing
+    it in a shell is not an option.
+    """
+    try:
+        lines = ENV_FILE.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        name, separator, value = line.partition("=")
+        if separator and name.strip() == key:
+            return value.strip()
+    return None
+
+
 def learn_keys() -> int:
     """Print every key a remote sends, and what the key map does with it.
 
@@ -540,6 +559,9 @@ def learn_keys() -> int:
     "... Consumer Control"), without grabbing them.  The running service
     grabs the keyboard device, so stop it first.
     """
+    global REMOTE_NAME
+    if "REMOTE_NAME" not in os.environ:
+        REMOTE_NAME = env_file_value("REMOTE_NAME") or REMOTE_NAME
     base = REMOTE_NAME
     for suffix in (" Keyboard", " Mouse", " Consumer Control"):
         if base.endswith(suffix):
