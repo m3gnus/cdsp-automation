@@ -39,6 +39,8 @@ AUDIO_EQ_BACKUP_DIR = STATE_DIR / "audio-eq-backups"
 SPEAKER_SELECTION_PATH = STATE_DIR / "speaker-selection.json"
 SPEAKER_AUDIO_DIR = STATE_DIR / "speaker-audio"
 SPEAKER_GENERATED_DIR = STATE_DIR / "generated-configs"
+# The level each speaker/source pair was last played at (source_volume.py).
+SOURCE_VOLUME_PATH = STATE_DIR / "source-volume.json"
 # Written by the ISO 226 engine installer once the engine it built is running.
 ISO226_CAPABILITY_PATH = STATE_DIR / "iso226-engine.json"
 

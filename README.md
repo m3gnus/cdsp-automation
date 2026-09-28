@@ -411,6 +411,13 @@ Automatically switches between CamillaDSP configs based on which audio source is
 When no automatic source is active, the switcher keeps the current config
 instead of forcing TOSLINK.
 
+**Per-source volume memory:** each source starts at the CamillaDSP and MOTU
+levels it last played at (per speaker), so the TV on TOSLINK comes back at the
+TV's level and AirPlay at AirPlay's. The profile and MOTU ceilings still
+apply. The dashboard's "Per-source volume" card shows the remembered levels
+and lets you set where a source that is not playing will start. Set
+`SOURCE_VOLUME_MEMORY=0` in `~/camilladsp/cdsp-automation.env` to turn it off.
+
 ### Critical Configuration Requirements
 
 **You MUST create three config files with exact names:**

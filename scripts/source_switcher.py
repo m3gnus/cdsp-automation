@@ -29,6 +29,7 @@ from audio_eq import (
     status_payload,
 )
 import motu_volume
+import source_volume
 import settings
 from settings import (
     AUDIO_CONTROL_LOCK_PATH,
@@ -169,6 +170,8 @@ STREAMER_CFG = os.path.join(CONFIG_DIR, "streamer.yml")
 GADGET_CFG = os.path.join(CONFIG_DIR, "gadget.yml")
 ANALOG_CFG = os.path.join(CONFIG_DIR, "analog.yml")
 AUDIO_EQ_REAPPLY_SECONDS = 1.0
+# How often a playing source's levels are recorded in the per-source memory.
+SOURCE_VOLUME_RECORD_SECONDS = 10.0
 CONFIG_VALIDATE_TIMEOUT = 10.0
 # CamillaDSP's own ceiling, and therefore the ceiling for anything that
 # declares no cap of its own (the default speaker's full configs).
@@ -380,6 +383,38 @@ class MotuConnection:
             return False
         if self.clock != clock:
             print(f"MOTU clock is {self.clock}, not {clock}", flush=True)
+            return False
+        return True
+
+    def level_db(self) -> float | None:
+        """The main volume the device itself last reported, in dB, else None.
+
+        A level we wrote but the device has not pushed back is not reported:
+        the per-source memory records only what the MOTU confirmed.
+        """
+        if self.ws is None or self.trim is None or not self.trim_confirmed:
+            return None
+        return motu_volume.attenuation_to_db(self.trim)
+
+    def restore_level(self, volume_db: float, *, undo: bool = False) -> bool:
+        """Move the main volume to ``volume_db`` (clamped to the ceiling).
+
+        For the per-source memory, inside a muted transition.  Only on an open
+        connection whose level the device confirmed, through the same checks
+        as a UI request (ceiling, main group, expected level): never on a
+        guess, and never by opening a connection mid-transition.  ``undo``
+        takes back our own write of a moment ago, which the device may not
+        have pushed back yet.
+        """
+        current = self.level_db()
+        if undo and current is None and self.ws is not None and self.trim is not None:
+            current = motu_volume.attenuation_to_db(self.trim)
+        if current is None:
+            print("MOTU main volume not restored: level unknown", flush=True)
+            return False
+        result = self._apply_volume({"volume_db": volume_db, "expected_db": current})
+        if not result.get("ok"):
+            print(f"MOTU main volume not restored: {result.get('error')}", flush=True)
             return False
         return True
 
@@ -1344,6 +1379,39 @@ def _require_selection_unchanged(target: dict | None, moment: str) -> None:
         raise RuntimeError(f"speaker selection changed {moment}")
 
 
+def _remember_levels(speaker: str, source: str, cdsp_db: float | None) -> None:
+    """Record ``speaker``/``source``'s CamillaDSP and confirmed MOTU levels."""
+    motu_db = _motu.level_db() if _motu is not None else None
+    if source_volume.remember(speaker, source, cdsp_db=cdsp_db, motu_db=motu_db):
+        levels = [f"CamillaDSP {cdsp_db:+.1f}dB"] if cdsp_db is not None else []
+        if motu_db is not None:
+            levels.append(f"MOTU {motu_db:+.0f}dB")
+        print(f"Remembered {source}/{speaker}: {', '.join(levels)}", flush=True)
+
+
+def _pair_levels(
+    outgoing: tuple[str, str] | None,
+    incoming: tuple[str, str] | None,
+    cdsp_db: float,
+) -> dict[str, float]:
+    """Record the outgoing pair's levels; return what the incoming remembers.
+
+    Nothing happens for a re-apply of the same pair.  The memory is a
+    convenience: a failure here is logged and never fails the transition.
+    """
+    if outgoing is None or incoming is None or outgoing == incoming:
+        return {}
+    try:
+        _remember_levels(outgoing[1], outgoing[0], cdsp_db)
+    except Exception as exc:
+        print(f"Source volume not remembered: {exc}", flush=True)
+    try:
+        return source_volume.remembered(incoming[1], incoming[0])
+    except Exception as exc:
+        print(f"Source volume memory unreadable: {exc}", flush=True)
+        return {}
+
+
 def apply_config(
     cdsp: CamillaClient,
     file_path: str,
@@ -1351,6 +1419,7 @@ def apply_config(
     *,
     target: dict | None = None,
     restore_mute: bool | None = None,
+    remember_volumes: bool = False,
 ) -> None:
     """Switch configs muted, under the audio-control lock.
 
@@ -1359,6 +1428,11 @@ def apply_config(
     the live one read here before muting.  Every other volume/mute writer
     takes the same lock, so none of them can act mid-transition.  On any
     failure the previous config is reloaded and the engine is left muted.
+
+    ``remember_volumes`` (the caller has a verified outgoing config) records
+    the outgoing speaker/source pair's levels and starts the incoming pair at
+    the ones it remembers, while muted and still under every ceiling.  A
+    failure puts the previous levels back along with the previous config.
     """
     if not os.path.exists(file_path):
         raise FileNotFoundError(file_path)
@@ -1373,6 +1447,17 @@ def apply_config(
         previous_volume = float(cdsp.volume.main_volume())
         cdsp.volume.set_main_mute(True)
         previous_clock: str | None = None
+        start_levels: dict[str, float] = {}
+        if remember_volumes and target:
+            start_levels = _pair_levels(
+                managed_config_identity(previous_path),
+                (target["source"], target["speaker"]),
+                previous_volume,
+            )
+        previous_motu_db = (
+            _motu.level_db() if remember_volumes and _motu is not None else None
+        )
+        levels_changed = motu_written = False
         try:
             if target and target.get("selection_revision") is not None:
                 locks.enter_context(speaker_selection_lock(SPEAKER_SELECTION_PATH))
@@ -1403,14 +1488,28 @@ def apply_config(
                 ensure_audio_eq(cdsp)
             _require_selection_unchanged(target, "before unmute")
             maximum = target_volume_limit(target)
-            restored_volume = min(previous_volume, maximum)
-            if restored_volume != previous_volume:
+            start_volume = start_levels.get("cdsp_db", previous_volume)
+            if start_volume != previous_volume:
                 print(
-                    f"Volume clamped for speaker profile: {previous_volume:+.1f} "
+                    f"Volume for {target['source']}/{target['speaker']}: "
+                    f"{start_volume:+.1f}dB (remembered)",
+                    flush=True,
+                )
+            restored_volume = min(start_volume, maximum)
+            if restored_volume != start_volume:
+                print(
+                    f"Volume clamped for speaker profile: {start_volume:+.1f} "
                     f"-> {restored_volume:+.1f}dB",
                     flush=True,
                 )
+            levels_changed = True
             cdsp.volume.set_main_volume(restored_volume)
+            if (
+                "motu_db" in start_levels
+                and _motu is not None
+                and start_levels["motu_db"] != previous_motu_db
+            ):
+                motu_written = _motu.restore_level(start_levels["motu_db"])
             if target:
                 _write_speaker_status(
                     {
@@ -1450,6 +1549,15 @@ def apply_config(
             except Exception:
                 pass
             rollback_ok = False
+            if levels_changed:
+                # The previous config comes back at its own levels, so an
+                # unmute after the failure is never louder than before it.
+                try:
+                    cdsp.volume.set_main_volume(previous_volume)
+                except Exception:
+                    pass
+                if motu_written and previous_motu_db is not None:
+                    _motu.restore_level(previous_motu_db, undo=True)
             _restore_motu_clock(cdsp, previous_clock)
             if previous_path and os.path.exists(previous_path):
                 try:
@@ -1849,6 +1957,13 @@ def main() -> int:
         applied = True
         restore_mute = None
 
+    def remember_volumes() -> bool:
+        # Only a config this connection applied has levels worth keeping: an
+        # unverified engine may be sitting at the fail-safe ceiling.
+        return applied and source_volume.enabled()
+
+    next_volume_record = 0.0
+
     while True:
         try:
             if not cdsp.is_connected():
@@ -1956,7 +2071,11 @@ def main() -> int:
                         )
                     raise
                 apply_config(
-                    cdsp, target["path"], target=target, restore_mute=restore_mute
+                    cdsp,
+                    target["path"],
+                    target=target,
+                    restore_mute=restore_mute,
+                    remember_volumes=remember_volumes(),
                 )
                 applied_ok()
                 time.sleep(CHECK_INTERVAL)
@@ -2013,6 +2132,21 @@ def main() -> int:
                 )
             meter_pairs = motu.read()
             motu.serve_volume_request()
+            if (
+                remember_volumes()
+                and current_source
+                and current_speaker
+                and now >= next_volume_record
+            ):
+                next_volume_record = now + SOURCE_VOLUME_RECORD_SECONDS
+                try:
+                    _remember_levels(
+                        current_speaker,
+                        current_source,
+                        float(cdsp.volume.main_volume()),
+                    )
+                except Exception as exc:
+                    print(f"Source volume not remembered: {exc}", flush=True)
             toslink_meter_active = TOSLINK_MOTU_METERS and "toslink" in supported_sources and meter_pairs_active(
                 meter_pairs,
                 TOSLINK_METER_PAIRS,
@@ -2151,7 +2285,11 @@ def main() -> int:
                     current_config, target["path"]
                 ):
                     apply_config(
-                        cdsp, target["path"], target=target, restore_mute=restore_mute
+                        cdsp,
+                        target["path"],
+                        target=target,
+                        restore_mute=restore_mute,
+                        remember_volumes=remember_volumes(),
                     )
                     applied_ok()
                 elif DEBUG_MODE:
@@ -2196,6 +2334,7 @@ def main() -> int:
                     settle_time=1.5 if decision.source == "gadget" else SETTLE_TIME,
                     target=target,
                     restore_mute=restore_mute,
+                    remember_volumes=remember_volumes(),
                 )
                 applied_ok()
                 if decision.manual:

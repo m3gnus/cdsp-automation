@@ -1500,7 +1500,82 @@ def test_camilla_volume_slider_stays_linear_to_match_the_airplay_mapping() -> No
 
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-    assert "configure_shairport.py motu_volume.py web_ui.py" in installer
+    assert "configure_shairport.py motu_volume.py source_volume.py diagnose.py web_ui.py" in installer
     assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
     assert "motu_access.py motu_volume.py" not in installer and "MOTU_ACCESS" not in installer
     assert "clock_sync.py source_switcher.py" not in installer
+
+
+# --------------------------------------------------------------------------
+# Per-source volume memory
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def _source_volume_site(tmp_path: Path, *, live: str | None = "streamer"):
+    import source_volume
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"applied": "kantarellen", "source": live, "ok": True})
+    )
+    with (
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
+        patch.object(web_ui, "SPEAKER_STATUS_PATH", status_path),
+    ):
+        yield source_volume
+
+
+def test_source_volume_edit_sets_and_forgets_a_source_that_is_not_playing(
+    tmp_path: Path,
+) -> None:
+    with _source_volume_site(tmp_path) as source_volume:
+        speaker = web_ui.current_speaker_selection()["selected"]
+        handler = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "toslink", "cdsp_db": -30, "motu_db": -8}).encode(),
+        )
+        handler.do_POST()
+        assert handler.status == HTTPStatus.OK
+        body = handler.response_body()["source_volume"]
+        assert body["live"] is None or body["live"] == "streamer"
+        assert body["sources"]["toslink"]["cdsp_db"] == -30.0
+        assert source_volume.remembered(speaker, "toslink") == {
+            "cdsp_db": -30.0,
+            "motu_db": -8.0,
+        }
+        forget = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "toslink", "forget": True}).encode(),
+        )
+        forget.do_POST()
+        assert forget.status == HTTPStatus.OK
+        assert source_volume.remembered(speaker, "toslink") == {}
+
+
+def test_source_volume_edit_refuses_the_playing_source_and_bad_input(
+    tmp_path: Path,
+) -> None:
+    with _source_volume_site(tmp_path, live="streamer") as source_volume:
+        speaker = web_ui.current_speaker_selection()["selected"]
+        (tmp_path / "status.json").write_text(
+            json.dumps({"applied": speaker, "source": "streamer", "ok": True})
+        )
+        live = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "streamer", "cdsp_db": -3}).encode(),
+        )
+        live.do_POST()
+        assert live.status == HTTPStatus.CONFLICT
+        assert source_volume.remembered(speaker, "streamer") == {}
+        for bad in (
+            {"source": "../x", "cdsp_db": -3},
+            {"source": "toslink"},
+            {"source": "toslink", "cdsp_db": float("nan")},
+            {"source": "toslink", "cdsp_db": True},
+        ):
+            handler = _post(
+                "/api/source-volume", body=json.dumps(bad).encode()
+            )
+            handler.do_POST()
+            assert handler.status == HTTPStatus.BAD_REQUEST, bad

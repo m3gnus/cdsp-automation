@@ -25,6 +25,7 @@ from typing import Any, Iterator
 import yaml
 
 import motu_volume
+import source_volume
 from settings import (
     AIRPLAY_VOLUME_STATUS_PATH,
     AUDIO_CONTROL_LOCK_PATH,
@@ -297,6 +298,12 @@ HTML = r"""<!doctype html>
     nav button:hover { color: var(--ink); }
     nav button.active { color: var(--ink); background: var(--raised); border-color: var(--line2); }
 
+    /* ---------- per-source volume ---------- */
+    .sv-grid { display: grid; grid-template-columns: minmax(70px,1fr) 92px 78px auto; gap: 6px 8px; align-items: center; }
+    .sv-grid .h { font: 10px/1.2 var(--mono); letter-spacing: 1.2px; text-transform: uppercase; color: var(--faint); }
+    .sv-grid .num { width: 100%; }
+    .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
+
     main { max-width: 1180px; margin: 0 auto; padding: clamp(16px, 3vw, 30px) clamp(14px, 4vw, 28px) 60px; }
     section { display: none; }
     section.active { display: block; animation: fade 0.25s ease; }
@@ -522,6 +529,11 @@ HTML = r"""<!doctype html>
             <div class="sub2" id="motuCaption"></div>
           </div>
           <div class="card">
+            <div class="cap">Per-source volume <span id="svBadge" class="badge">—</span></div>
+            <div id="sourceVolumePanel"></div>
+            <div class="sub2" id="sourceVolumeCaption"></div>
+          </div>
+          <div class="card">
             <div class="cap">Speaker profile</div>
             <div id="dashboardSpeaker" class="speaker-summary"></div>
           </div>
@@ -591,6 +603,7 @@ HTML = r"""<!doctype html>
 
   <script>
     let signalTarget = 0;
+    let lastStatus = null;
     let audioState = null;
     let audioLoaded = false;
     let audioSaveTimer = null;
@@ -1256,6 +1269,54 @@ HTML = r"""<!doctype html>
       }
     }
 
+    /* ---------------- per-source volume ---------------- */
+    const svDb = v => v == null ? "" : Number(v).toFixed(1);
+    function renderSourceVolume(data) {
+      const sv = data.source_volume || {};
+      const panel = qs("#sourceVolumePanel"), badge = qs("#svBadge");
+      if (!panel) return;
+      if (sv.error) {
+        badge.textContent = "error"; badge.className = "badge bad";
+        panel.innerHTML = `<div class="sub2 bad">${esc(sv.error)}</div>`;
+        return;
+      }
+      badge.textContent = sv.enabled ? "on" : "off";
+      badge.className = "badge " + (sv.enabled ? "ok" : "warn");
+      // Never rebuild under a field being typed into.
+      if (panel.contains(document.activeElement)) return;
+      const available = (data.source || {}).available || {};
+      const rows = Object.entries(sv.sources || {})
+        .filter(([key]) => available[key]?.exists || sv.live === key)
+        .map(([key, item]) => {
+          const live = sv.live === key;
+          const dis = live ? "disabled" : "";
+          const remembered = item.cdsp_db != null || item.motu_db != null;
+          return `<div>${esc(item.label)}</div>
+            <input class="num" type="number" step="0.5" min="-80" max="0" placeholder="—" value="${svDb(item.cdsp_db)}" data-sv-source="${esc(key)}" data-sv-key="cdsp_db" ${dis} aria-label="${esc(item.label)} CamillaDSP start level">
+            <input class="num" type="number" step="1" min="-100" max="0" placeholder="—" value="${item.motu_db == null ? "" : Number(item.motu_db).toFixed(0)}" data-sv-source="${esc(key)}" data-sv-key="motu_db" ${dis} aria-label="${esc(item.label)} MOTU start level">
+            ${live ? `<span class="live">● live</span>` : `<button class="btn sm ghost" data-sv-forget="${esc(key)}" ${remembered ? "" : "disabled"}>Forget</button>`}`;
+        });
+      panel.innerHTML = rows.length
+        ? `<div class="sv-grid"><div class="h">source</div><div class="h">Camilla dB</div><div class="h">MOTU dB</div><div></div>${rows.join("")}</div>`
+        : `<div class="sub2">No sources available.</div>`;
+      qsa("[data-sv-key]").forEach(i => i.addEventListener("change", e => {
+        const v = e.target.value.trim();
+        if (v === "") return;
+        editSourceVolume({ source: e.target.dataset.svSource, [e.target.dataset.svKey]: Number(v) });
+      }));
+      qsa("[data-sv-forget]").forEach(b => b.addEventListener("click", () => editSourceVolume({ source: b.dataset.svForget, forget: true })));
+      qs("#sourceVolumeCaption").innerHTML = sv.enabled
+        ? `Each source starts at the level it last played at (speaker <b>${esc(sv.speaker)}</b>). Set a level for a source that is not playing to choose where it starts; ceilings still apply.`
+        : `Off: SOURCE_VOLUME_MEMORY is disabled in the env file, so the volume carries over between sources.`;
+    }
+    async function editSourceVolume(payload) {
+      try {
+        const d = await api("/api/source-volume", { method: "POST", body: JSON.stringify(payload) });
+        document.activeElement?.blur?.();
+        renderSourceVolume({ source_volume: d.source_volume, source: lastStatus?.source });
+      } catch (e) { toast(e.message); }
+    }
+
     /* ---------------- actions ---------------- */
     async function setVolume(payload) { try { await api("/api/camilla/volume", { method: "POST", body: JSON.stringify(payload) }); await load(); } catch (e) { toast(e.message); } }
     function currentVolumeInput() { return Number(qs("#volNum").value); }
@@ -1302,6 +1363,8 @@ HTML = r"""<!doctype html>
       renderHero(data);
       renderSource(data);
       renderVolume(data);
+      lastStatus = data;
+      renderSourceVolume(data);
       if (Number(data.camilla?.sample_rate)>0) eqSampleRate=Number(data.camilla.sample_rate);
       if (data.speaker) { speakerState=data.speaker; renderSpeakerProfiles(); }
       renderSystem(data);
@@ -1817,6 +1880,59 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
         "config_file": config_file,
         "available": source_availability(),
     }
+
+
+def source_volume_payload() -> dict[str, Any]:
+    """What the per-source volume memory holds for the selected speaker."""
+    speaker = current_speaker_selection()["selected"]
+    remembered = source_volume.read_state()["speakers"].get(speaker, {})
+    status = _read_json_object(SPEAKER_STATUS_PATH)
+    live = status.get("source") if status.get("applied") == speaker else None
+    return {
+        "enabled": source_volume.enabled(),
+        "speaker": speaker,
+        "live": live if isinstance(live, str) else None,
+        "sources": {
+            key: {"label": label, **remembered.get(key, {})}
+            for key, label in SOURCE_CHOICES.items()
+        },
+    }
+
+
+def _optional_level(payload: dict[str, Any], key: str) -> float | None:
+    if payload.get(key) is None:
+        return None
+    return _finite_volume(payload[key])
+
+
+def edit_source_volume(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set or forget the levels a source that is not playing will start at.
+
+    The playing source's levels are recorded from the live controls by the
+    switcher; editing them here would be overwritten seconds later, so it is
+    refused with a pointer to the real controls.
+    """
+    source = payload.get("source")
+    if source not in SOURCE_CHOICES:
+        raise ValueError("source not allowed")
+    current = source_volume_payload()
+    if source == current["live"]:
+        raise RequestRefused(
+            HTTPStatus.CONFLICT,
+            f"{SOURCE_CHOICES[source]} is playing: use the volume controls; "
+            "its levels are remembered from them",
+        )
+    if payload.get("forget") is True:
+        source_volume.forget(current["speaker"], source)
+    else:
+        cdsp_db = _optional_level(payload, "cdsp_db")
+        motu_db = _optional_level(payload, "motu_db")
+        if cdsp_db is None and motu_db is None:
+            raise ValueError("cdsp_db or motu_db is required")
+        source_volume.remember(
+            current["speaker"], source, cdsp_db=cdsp_db, motu_db=motu_db
+        )
+    return source_volume_payload()
 
 
 def _backup_file(
@@ -2352,12 +2468,17 @@ class Handler(BaseHTTPRequestHandler):
                 speaker = speaker_payload()
             except Exception as exc:
                 speaker = {"error": str(exc)}
+            try:
+                volumes = source_volume_payload()
+            except Exception as exc:
+                volumes = {"error": str(exc)}
             self.send_json(
                 {
                     "services": services,
                     "camilla": camilla,
                     "source": source,
                     "speaker": speaker,
+                    "source_volume": volumes,
                     "remote": remote_status(services),
                 }
             )
@@ -2440,6 +2561,15 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/speaker":
                 self.send_json({"ok": True, "speaker": select_speaker(payload)})
+                return
+
+            if parsed.path == "/api/source-volume":
+                try:
+                    volumes = edit_source_volume(payload)
+                except RequestRefused as refusal:
+                    self.send_json({"ok": False, "error": str(refusal)}, refusal.status)
+                    return
+                self.send_json({"ok": True, "source_volume": volumes})
                 return
 
             if parsed.path == "/api/amps/off":

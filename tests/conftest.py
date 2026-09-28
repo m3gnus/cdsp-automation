@@ -36,3 +36,11 @@ def hermetic_motu_volume_files(tmp_path, monkeypatch):
 
     monkeypatch.setattr(motu_volume, "REQUEST_PATH", tmp_path / "motu-volume-request.json")
     monkeypatch.setattr(motu_volume, "STATUS_PATH", tmp_path / "motu-volume.json")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_source_volume_file(tmp_path, monkeypatch):
+    """Keep the per-source volume memory out of /var/lib/cdsp-automation."""
+    import source_volume
+
+    monkeypatch.setattr(source_volume, "STATE_PATH", tmp_path / "source-volume.json")

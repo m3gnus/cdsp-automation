@@ -450,3 +450,46 @@ def test_an_unreachable_motu_is_not_written_and_not_waited_for() -> None:
             assert not source_switcher._set_motu_clock_muted(SimpleNamespace(), "optical")
     silence.assert_not_called()
     assert motu.clock is None and device.sent == []
+
+
+# ------------------------------------------------ per-source volume memory
+
+
+def test_restore_level_writes_a_remembered_level_on_the_open_connection() -> None:
+    device = Device()
+    with switcher_on(device) as motu:
+        assert motu.connect()
+        assert motu.level_db() == -6.0
+        assert motu.restore_level(-20.0)
+    assert device.sent == [motu_volume.encode_main_trim_write(20)]
+    assert device.connections == 1  # never reconnects mid-transition
+    assert motu.level_db() is None  # sent, not yet confirmed by the device
+
+
+def test_restore_level_honours_the_ceiling(monkeypatch) -> None:
+    monkeypatch.setenv("MOTU_MAIN_VOLUME_MAX_DB", "-10")
+    device = Device()
+    with switcher_on(device) as motu:
+        assert motu.connect()
+        assert motu.restore_level(0.0)
+    assert device.sent == [motu_volume.encode_main_trim_write(10)]
+
+
+def test_restore_level_never_writes_on_an_unknown_level() -> None:
+    device = Device()
+    with switcher_on(device) as motu:
+        assert not motu.restore_level(-20.0)  # not connected
+    assert device.sent == [] and device.connections == 0
+
+
+def test_restore_level_undo_takes_back_an_unconfirmed_write() -> None:
+    device = Device()
+    with switcher_on(device) as motu:
+        assert motu.connect()
+        assert motu.restore_level(-20.0)
+        assert not motu.restore_level(-6.0)  # unconfirmed: not a guess
+        assert motu.restore_level(-6.0, undo=True)
+    assert device.sent == [
+        motu_volume.encode_main_trim_write(20),
+        motu_volume.encode_main_trim_write(6),
+    ]

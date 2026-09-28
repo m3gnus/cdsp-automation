@@ -8,7 +8,8 @@ Shared paths (state under `/var/lib/cdsp-automation`, site files under
 top. Only what varies per site is read from `cdsp-automation.env`, which every
 unit loads with `EnvironmentFile=`: `CDSP_HOST`, `CDSP_PORT`,
 `CDSP_CONFIG_DIR` (the env file is its sibling), `SOURCE_OVERRIDE_PATH`,
-`POWER_GPIO`, `MOTU_WS_URL`, `MOTU_MAIN_VOLUME_MAX_DB`, `REMOTE_NAME`,
+`POWER_GPIO`, `MOTU_WS_URL`, `MOTU_MAIN_VOLUME_MAX_DB`,
+`SOURCE_VOLUME_MEMORY`, `REMOTE_NAME`,
 `REMOTE_VOLUME_MIN`/`MAX`, `AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`,
 `AIRPLAY_INTERRUPTED_LMS_PLAYERS`, `SPOTIFY_ALSA_DEVICE`, `SITE_NAME` and
 `INSTALLATION_UI_HOST`/`PORT`/`TOKEN`. Other keys in the file are ignored.
@@ -111,6 +112,31 @@ a successful apply that recorded a ceiling (no status, `ok` not true, a missing
 or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
+
+### Per-source volume memory
+
+Each speaker/source pair remembers the CamillaDSP Main level and the MOTU main
+output level it last played at, in `SOURCE_VOLUME_PATH`
+(`scripts/source_volume.py`). Inside a source or speaker transition, while
+muted and under the audio-control lock, the switcher records the outgoing
+pair's levels and starts the incoming pair at the ones it remembers; the
+CamillaDSP level is still clamped to the new profile's ceiling and the MOTU
+level to `MOTU_MAIN_VOLUME_MAX_DB`, and the MOTU is written only on an open
+connection whose level the device confirmed, with the usual main-group and
+expected-level checks. A pair with nothing remembered keeps the level that
+was playing. A transition that fails puts the previous levels back with the
+previous config, so an unmute after a rollback is never louder than before.
+
+While a source plays, its levels are recorded every
+`SOURCE_VOLUME_RECORD_SECONDS` (10 s), and only when they changed. Nothing is
+recorded until a config has been applied on the current CamillaDSP connection,
+so a fail-safe ceiling is never remembered as a level. The memory is a
+convenience: an unreadable or unwritable file is logged and never fails a
+transition. The control UI shows the remembered levels and edits those of
+sources that are not playing (`POST /api/source-volume`). Set
+`SOURCE_VOLUME_MEMORY=0` to carry the volume over between sources instead.
+A network receiver that sends its own volume when a session starts (AirPlay)
+still sets the level after the switch, as it always has.
 
 I've created Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control runs on its own. The source switcher is the control core, and the MOTU's only client (clock, meters, main volume): it is the only thing that applies a persisted tone/EQ or speaker change and the only publisher of the volume ceiling, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
 
