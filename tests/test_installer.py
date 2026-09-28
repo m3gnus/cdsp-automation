@@ -1022,12 +1022,14 @@ ensure_audio_state_storage
         self.assertIn("4)  Install Source Switcher", output)
         self.assertIn("10) Uninstall All Utilities", output)
         self.assertIn("11) Install Web Control UI (optional)", output)
-        self.assertNotIn("12)", output)
+        self.assertIn("12) Run Health Check (diagnose)", output)
+        self.assertNotIn("13)", output)
         self.assertNotIn("MOTU Clock Sync", output)
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         technical = (REPOSITORY / "TECHNICAL.md").read_text(encoding="utf-8")
         self.assertIn("10. **Uninstall All Utilities**", readme)
         self.assertIn("11. **Install Web Control UI**", readme)
+        self.assertIn("12. **Run Health Check**", readme)
         self.assertIn("menu option 11", technical)
 
     def test_destructive_and_exposing_options_require_an_explicit_yes(self) -> None:

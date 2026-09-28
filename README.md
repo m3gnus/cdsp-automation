@@ -64,6 +64,25 @@ chmod +x install.sh
   individually - but note that options 5, 8 and 11 also install the source
   switcher, which they require for their volume ceiling and tone changes
 
+## Health check
+
+When something sounds wrong, after an OS upgrade, or before asking for help,
+run the health check: installer option **12**, the **Services** tab's "Run
+health check" button in the control UI, or directly:
+
+```bash
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/diagnose.py          # add --json for a machine-readable report
+```
+
+It checks the Python version, free disk space and Raspberry Pi under-voltage /
+throttling, the env file, every service (including restart loops), the
+CamillaDSP connection and state, that every source config passes
+`camilladsp -c`, the speaker profile and its source bases, the last transition,
+that the shared audio-control lock is free and writable, the MOTU link (by ping
+and from what the switcher reports: it never connects to the MOTU itself, which
+would drop the switcher), the remote and its key map, and recent errors in the
+journal. It only reads, and exits 1 when any check failed.
+
 ## Audio control architecture
 
 The source switcher is the only writer of the active CamillaDSP configuration.
@@ -639,6 +658,8 @@ The installer menu provides these options:
     Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
 11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
     also installs option 4, which it requires)
+12. **Run Health Check** - Read-only report on services, configs, the audio
+    lock, the MOTU link, the remote and power (see "Health check")
 
 Options 5, 8 and 11 install the source switcher when it is missing, because
 the components they install depend on it. The switcher is the only thing that

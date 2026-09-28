@@ -1579,3 +1579,23 @@ def test_source_volume_edit_refuses_the_playing_source_and_bad_input(
             )
             handler.do_POST()
             assert handler.status == HTTPStatus.BAD_REQUEST, bad
+
+
+def test_health_check_endpoint_is_guarded_and_returns_every_check() -> None:
+    import diagnose
+
+    checks = [diagnose.Check("System", "Python", diagnose.OK, "3.11")]
+    with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+        refused = _post("/api/diagnose")
+        with patch.object(diagnose, "diagnose", return_value=checks) as run:
+            refused.do_POST()
+        assert refused.status == HTTPStatus.UNAUTHORIZED
+        run.assert_not_called()
+        handler = _post("/api/diagnose", token="s3cret-value")
+        with patch.object(diagnose, "diagnose", return_value=checks):
+            handler.do_POST()
+    assert handler.status == HTTPStatus.OK
+    assert handler.response_body()["checks"] == [
+        {"group": "System", "name": "Python", "status": "ok", "detail": "3.11"}
+    ]
+    assert 'id="runDiagnose"' in web_ui.HTML

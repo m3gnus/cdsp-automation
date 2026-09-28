@@ -719,6 +719,16 @@ refresh_installed_units() {
   fi
 }
 
+run_diagnose() {
+  if [[ ! -x "$VENV_DIR/bin/python3" || ! -f "$SCRIPTS_DIR/diagnose.py" ]]; then
+    echo "The health check needs the installed utilities: choose option 1 or 2 first."
+    return 0
+  fi
+  echo ""
+  # Read-only; a failed check sets the exit status, which the menu ignores.
+  "$VENV_DIR/bin/python3" "$SCRIPTS_DIR/diagnose.py" || true
+}
+
 show_status() {
   echo ""
   echo "============================================="
@@ -949,6 +959,7 @@ CamillaDSP Utilities - Choose an Option
 9)  Install ISO 226 Loudness Engine
 10) Uninstall All Utilities
 11) Install Web Control UI (optional)
+12) Run Health Check (diagnose)
 0)  Exit
 Options 5, 8 and 11 also install option 4 when it is missing: the Source
 Switcher is the only thing that applies tone/EQ and speaker changes.
@@ -974,6 +985,7 @@ main() {
       9) prepare_install; install_iso226_engine ;;
       10) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
       11) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
+      12) run_diagnose ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac

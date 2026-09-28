@@ -304,6 +304,8 @@ HTML = r"""<!doctype html>
     .sv-grid .num { width: 100%; }
     .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
 
+    .diag-row { display: grid; grid-template-columns: 18px minmax(120px, 220px) 1fr; gap: 8px; align-items: baseline; padding: 3px 0; }
+
     main { max-width: 1180px; margin: 0 auto; padding: clamp(16px, 3vw, 30px) clamp(14px, 4vw, 28px) 60px; }
     section { display: none; }
     section.active { display: block; animation: fade 0.25s ease; }
@@ -576,7 +578,12 @@ HTML = r"""<!doctype html>
       </section>
 
       <section id="services">
-        <div class="shead"><span class="ix">01</span><h2>Systemd services</h2><span class="rule"></span></div>
+        <div class="shead"><span class="ix">01</span><h2>Health check</h2><span class="rule"></span></div>
+        <div class="card" style="margin-bottom:12px">
+          <div class="row"><button class="btn primary" id="runDiagnose">Run health check</button><span class="sub2" id="diagnoseSummary">Checks services, configs, the audio lock, the MOTU link, the remote and power. Takes a few seconds.</span></div>
+          <div id="diagnoseReport"></div>
+        </div>
+        <div class="shead"><span class="ix">02</span><h2>Systemd services</h2><span class="rule"></span></div>
         <div id="servicesTable"></div>
       </section>
 
@@ -1346,6 +1353,24 @@ HTML = r"""<!doctype html>
       } catch (err) { toast(err.message); }
       finally { b.disabled = false; }
     }
+    async function runDiagnose() {
+      const b = qs("#runDiagnose"); b.disabled = true;
+      qs("#diagnoseSummary").textContent = "running…";
+      try {
+        const d = await api("/api/diagnose", { method: "POST", body: "{}" });
+        const marks = { ok: ["✔", "ok"], warn: ["!", "warn"], fail: ["✘", "bad"], info: ["·", "faint"] };
+        let group = null; const rows = [];
+        for (const c of d.checks) {
+          if (c.group !== group) { group = c.group; rows.push(`<div class="cap" style="margin-top:12px">${esc(group)}</div>`); }
+          const [mark, cls] = marks[c.status] || ["?", "warn"];
+          rows.push(`<div class="diag-row"><span class="${cls}">${mark}</span><b>${esc(c.name)}</b><span class="sub2">${esc(c.detail)}</span></div>`);
+        }
+        qs("#diagnoseReport").innerHTML = rows.join("");
+        const n = s => d.checks.filter(c => c.status === s).length;
+        qs("#diagnoseSummary").innerHTML = `<span class="ok">${n("ok")} ok</span> · <span class="warn">${n("warn")} warning(s)</span> · <span class="bad">${n("fail")} failure(s)</span>`;
+      } catch (e) { qs("#diagnoseSummary").textContent = e.message; }
+      finally { b.disabled = false; }
+    }
     async function refreshLogs() {
       const unit = qs("#logUnit").value || "camilladsp.service";
       try { const d = await api(`/api/logs?unit=${encodeURIComponent(unit)}`); qs("#logBox").textContent = d.logs || "—"; }
@@ -1403,6 +1428,7 @@ HTML = r"""<!doctype html>
     qsa("nav button").forEach(b => b.addEventListener("click", () => { location.hash = b.dataset.tab; }));
     window.addEventListener("hashchange", () => activateTab(location.hash.slice(1)));
     qs("#refreshLogs").addEventListener("click", refreshLogs);
+    qs("#runDiagnose").addEventListener("click", runDiagnose);
     qs("#logUnit").addEventListener("change", refreshLogs);
     qs("#ampOff").addEventListener("click", ampsOff);
     qs("#eqAdd").addEventListener("click", () => {
@@ -2570,6 +2596,19 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"ok": False, "error": str(refusal)}, refusal.status)
                     return
                 self.send_json({"ok": True, "source_volume": volumes})
+                return
+
+            if parsed.path == "/api/diagnose":
+                # A POST, though it only reads: it runs camilladsp -c on every
+                # config, so the token guard applies to it.
+                import dataclasses
+
+                import diagnose
+
+                checks = diagnose.diagnose()
+                self.send_json(
+                    {"ok": True, "checks": [dataclasses.asdict(c) for c in checks]}
+                )
                 return
 
             if parsed.path == "/api/amps/off":
