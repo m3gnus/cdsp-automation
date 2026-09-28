@@ -1500,7 +1500,7 @@ def test_camilla_volume_slider_stays_linear_to_match_the_airplay_mapping() -> No
 
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-    assert "configure_shairport.py motu_volume.py source_volume.py diagnose.py web_ui.py" in installer
+    assert "configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py" in installer
     assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
     assert "motu_access.py motu_volume.py" not in installer and "MOTU_ACCESS" not in installer
     assert "clock_sync.py source_switcher.py" not in installer

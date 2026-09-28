@@ -368,7 +368,23 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 - **Recovery controls stay available** - A failed CamillaDSP connection does not block the HID event loop, so the power-button restart and shutdown actions still work
 - **Throttled idle logging** - The remote is checked every two seconds while asleep, but unchanged "not found" status is logged only every five minutes
 
-**Button mapping:**
+**Key map:** what each button does is data, not code. `remote_keymap.py`
+validates `REMOTE_KEYMAP_PATH` (`/etc/cdsp-automation/remote-keymap.json`) and
+turns key events into actions with one pure `KeyDispatcher`: a key with only a
+`press` acts on key-down (with `repeat`, on every second auto-repeat too); a
+key with a hold acts on release when it was a short press, fires its `hold`
+once at `hold_seconds`, and, when it also has a `long_hold`, fires the `hold`
+only on release so that holding on to the long hold never triggers both.
+`restart_services` and `shutdown` are refused on a press. A missing file means
+the built-in map below; an invalid one is logged and the built-in map stays in
+force. `next_source` and the `source_*` actions write the same override file
+the control UI writes (reusing its availability rule, so both offer the same
+sources), `motu_volume_*` goes through the switcher's MOTU request file, and
+`amps_off` sends the trigger's `SIGUSR1` directly: every daemon runs as the
+install user, so none of these needs a new sudo rule. `--learn` prints the key
+names a remote sends; `--print-keymap` prints the map in force.
+
+**Built-in button mapping:**
 
 | Button | Press | Hold |
 |--------|-------|------|

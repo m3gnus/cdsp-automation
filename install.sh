@@ -258,7 +258,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py diagnose.py web_ui.py; do
+  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"

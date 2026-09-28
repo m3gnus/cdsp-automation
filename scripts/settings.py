@@ -48,6 +48,8 @@ SITE_CONFIG_DIR = Path("/etc/cdsp-automation")
 SPEAKER_PROFILE_DIR = SITE_CONFIG_DIR / "speaker-profiles"
 SPEAKER_CATALOG_PATH = SITE_CONFIG_DIR / "speaker-catalog.json"
 SOURCE_BASE_DIR = SITE_CONFIG_DIR / "source-bases"
+# Optional: the HID remote's button map (remote_keymap.py).
+REMOTE_KEYMAP_PATH = SITE_CONFIG_DIR / "remote-keymap.json"
 
 SWITCHER_RUN_DIR = Path("/run/cdsp-source-switcher")
 AUDIO_EQ_STATUS_PATH = SWITCHER_RUN_DIR / "audio-eq-status.json"

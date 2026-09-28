@@ -246,8 +246,54 @@ REMOTE_VOLUME_MIN=-80
 REMOTE_VOLUME_MAX=0
 ```
 
-Tone steps (0.5 dB, ±6 dB), the 1 dB volume step and the button hold times are
-fixed in `cdsp_remote.py`.
+The tone range (±6 dB) is fixed in `cdsp_remote.py`; the steps, hold times and
+buttons come from the key map below.
+
+### Custom button mapping
+
+The table above is the built-in key map. To change it, or to give spare
+buttons a job, write `/etc/cdsp-automation/remote-keymap.json` (start from
+`remote-keymap.example.json` in this repository, or print the map in force)
+and restart the remote:
+
+```bash
+~/camilladsp/venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
+sudo install -m 0644 remote-keymap.json /etc/cdsp-automation/remote-keymap.json
+sudo systemctl restart cdsp-remote
+```
+
+**Finding your buttons' names.** Every remote sends different key names.
+Stop the service and let the remote tell you:
+
+```bash
+sudo systemctl stop cdsp-remote
+~/camilladsp/venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
+# press each button; Ctrl+C when done
+sudo systemctl start cdsp-remote
+```
+
+It prints lines like `KEY_HOMEPAGE  pressed  [HID Remote01 Keyboard] -> not mapped`.
+Only keys from the `REMOTE_NAME` device can be used; keys that arrive on a
+sibling device (for example "... Consumer Control") are marked unusable.
+
+Each key takes a `press` action (add `"repeat": true` to repeat while held), a
+`hold` (after `hold_seconds`, default 1 s) and a `long_hold` (after
+`long_hold_seconds`, default 10 s). Actions:
+
+| Action | Does |
+|--------|------|
+| `volume_up`, `volume_down`, `mute` | CamillaDSP Main fader (`volume_step_db`) |
+| `bass_up`, `bass_down`, `treble_up`, `treble_down`, `tone_reset` | Tone shelves (`tone_step_db`) |
+| `motu_volume_up`, `motu_volume_down` | MOTU main output (`motu_step_db`) |
+| `next_source` | Auto → each available source → Auto |
+| `source_auto`, `source_streamer`, `source_gadget`, `source_toslink`, `source_analog` | Pin a source, or go back to automatic |
+| `amps_off` | Same as the control UI's "Turn amps off now" |
+| `status` | Log the current state |
+| `restart_services`, `shutdown` | Hold / long hold only |
+
+Speaker-profile changes are deliberately not available on the remote: they
+need the matching passive speakers connected, which the control UI makes you
+confirm. An invalid key map is logged and the built-in map stays in force.
 
 `REMOTE_VOLUME_MAX` can only lower the ceiling. The real maximum comes from the
 speaker profile that is currently applied, so a profile capped at -20 dB stays

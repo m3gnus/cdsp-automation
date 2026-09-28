@@ -1,0 +1,22 @@
+{
+  "volume_step_db": 1.0,
+  "tone_step_db": 0.5,
+  "motu_step_db": 1.0,
+  "hold_seconds": 1.0,
+  "long_hold_seconds": 10.0,
+  "keys": {
+    "KEY_VOLUMEUP": {"press": "volume_up", "repeat": true},
+    "KEY_VOLUMEDOWN": {"press": "volume_down", "repeat": true},
+    "KEY_MUTE": {"press": "mute"},
+    "KEY_UP": {"press": "treble_up"},
+    "KEY_DOWN": {"press": "treble_down"},
+    "KEY_RIGHT": {"press": "bass_up"},
+    "KEY_LEFT": {"press": "bass_down"},
+    "KEY_ENTER": {"press": "status", "hold": "tone_reset"},
+    "KEY_POWER": {"hold": "restart_services", "long_hold": "shutdown"},
+    "KEY_HOMEPAGE": {"press": "next_source", "hold": "source_auto"},
+    "KEY_BACK": {"press": "amps_off"},
+    "KEY_MENU": {"press": "motu_volume_up"},
+    "KEY_COMPOSE": {"press": "motu_volume_down"}
+  }
+}
