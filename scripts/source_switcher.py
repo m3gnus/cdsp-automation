@@ -1390,8 +1390,8 @@ def _remember_levels(speaker: str, source: str, cdsp_db: float | None) -> None:
 
 
 def _pair_levels(
-    outgoing: tuple[str, str] | None,
-    incoming: tuple[str, str] | None,
+    previous_path: str | None,
+    incoming: tuple[str, str],
     cdsp_db: float,
 ) -> dict[str, float]:
     """Record the outgoing pair's levels; return what the incoming remembers.
@@ -1399,7 +1399,12 @@ def _pair_levels(
     Nothing happens for a re-apply of the same pair.  The memory is a
     convenience: a failure here is logged and never fails the transition.
     """
-    if outgoing is None or incoming is None or outgoing == incoming:
+    try:
+        outgoing = managed_config_identity(previous_path)
+    except Exception as exc:
+        print(f"Source volume memory skipped: {exc}", flush=True)
+        return {}
+    if outgoing is None or outgoing == incoming:
         return {}
     try:
         _remember_levels(outgoing[1], outgoing[0], cdsp_db)
@@ -1450,7 +1455,7 @@ def apply_config(
         start_levels: dict[str, float] = {}
         if remember_volumes and target:
             start_levels = _pair_levels(
-                managed_config_identity(previous_path),
+                previous_path,
                 (target["source"], target["speaker"]),
                 previous_volume,
             )

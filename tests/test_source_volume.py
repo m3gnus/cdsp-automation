@@ -231,3 +231,11 @@ def test_a_broken_memory_never_fails_the_switch(tmp_path: Path) -> None:
         _switch(tmp_path, client, remember=True)
     assert client.volume.volume == -40
     assert client.volume.mute is False
+
+
+def test_an_unidentifiable_previous_config_skips_the_memory(tmp_path: Path) -> None:
+    source_volume.remember("kantarellen", "toslink", cdsp_db=-25)
+    with patch.object(
+        switcher, "managed_config_identity", side_effect=OSError("unreadable")
+    ):
+        assert switcher._pair_levels("/x.yml", ("toslink", "kantarellen"), -40) == {}
