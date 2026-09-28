@@ -1051,24 +1051,48 @@ HTML = r"""<!doctype html>
       const spotifyIdle=audioBridge.spotify_configured&&audioBridge.live&&spotifyBridge.receiver_socket===true&&!spotifyReady;
       const spotifyLabel=!audioBridge.spotify_configured?"Spotify sync not configured":spotifyReady?"Spotify ↔ master live":spotifyIdle?"Spotify ready · waiting for sender":"Spotify receiver unavailable";
       qs("#volumeArchitecture").innerHTML = `<div class="cap">Volume architecture</div><div class="val sm" style="margin-top:8px">One shared CamillaDSP master</div>
-        <div class="sub2">Web UI, HID remote and network players change the same fader. MOTU trims and amplifier gains remain calibration stages.</div>
+        <div class="sub2">Web UI, HID remote and network players change the same fader. The MOTU main output scales everything after it (loudness compensation follows it too); amplifier gains remain calibration stages.</div>
         <div class="row" style="margin-top:12px"><span class="badge ${airplayReady?"ok":"warn"}">${audioBridge.airplay_configured?(airplayReady?"AirPlay → master live":"AirPlay receiver unavailable"):"AirPlay sync not configured"}</span><span class="badge ${spotifyReady?"ok":"warn"}">${spotifyLabel}</span></div>
         <div class="sub2" style="margin-top:8px">Both receivers pass audio at unity. Spotify Connect mirrors changes in both directions once a sender connects; until then its receiver remains ready but volume sync is idle. AirPlay source changes control the master, but AirPlay cannot update the sender’s exact slider value when volume is changed here.</div>`;
       const l=audioState.loudness;
       qs("#loudnessPlan").innerHTML = `<div class="cap">ISO 226 loudness</div><div class="val sm" style="margin-top:8px">Fader-linked calibration</div>
         <label class="row" style="margin-top:12px"><span class="switch"><input data-loudness-check="enabled" type="checkbox" ${l.enabled?"checked":""} ${audioCapability.available?"":"disabled"}><span></span></span> Enabled</label>
-        <div class="sub2" style="margin-top:8px">Set the master where you normally listen, play a 1 kHz sine, and enter the SPL you measure at the listening position. Phon equals SPL only at 1 kHz — a reading taken on music or noise will not give the right number. Compensation then follows the Main fader inside CamillaDSP.</div>
+        <div class="sub2" style="margin-top:8px">Set the master where you normally listen, play a 1 kHz sine, and enter the SPL you measure at the listening position. Phon equals SPL only at 1 kHz — a reading taken on music or noise will not give the right number. Compensation then follows the Main fader inside CamillaDSP and, once its calibration level is set, the MOTU main output.</div>
         <label class="sub2" style="display:block;margin-top:12px">Reference listening level (phon)<input data-loudness="reference_phon" type="number" min="40" max="90" step="1" value="${l.reference_phon}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Reference master volume (dB)<input data-loudness="reference_volume_db" type="number" min="-60" max="0" step="0.5" value="${l.reference_volume_db}" style="margin-top:4px"></label>
+        <label class="sub2" style="display:block;margin-top:10px">MOTU main output at calibration (dB)<input id="loudnessMotu" type="number" min="-100" max="0" step="1" placeholder="not included" value="${l.reference_motu_db ?? ""}" style="margin-top:4px"></label>
+        <div class="row" style="margin-top:8px"><button class="btn sm" id="loudnessUseCurrent" type="button">Use current levels</button><span class="sub2" id="loudnessMotuNote">${loudnessMotuNote(l)}</span></div>
         <label class="sub2" style="display:block;margin-top:10px">Strength<input data-loudness="strength" type="range" min="0" max="1" step="0.05" value="${l.strength}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Maximum bass boost (dB)<input data-loudness="max_bass_boost_db" type="number" min="0" max="18" step="0.5" value="${l.max_bass_boost_db}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Maximum treble boost (dB)<input data-loudness="max_treble_boost_db" type="number" min="0" max="12" step="0.5" value="${l.max_treble_boost_db}" style="margin-top:4px"></label>
         <div class="row" style="margin-top:12px"><span class="badge ${l.enabled?"ok":audioCapability.available?"":"warn"}">${l.enabled?"Custom DSP engine active":audioCapability.available?"Ready when enabled":"Install custom DSP engine first"}</span></div>`;
       qsa("[data-loudness]").forEach(el => el.addEventListener("input", e => { audioState.loudness[e.target.dataset.loudness]=Number(e.target.value); scheduleAudioSave(); }));
       qsa("[data-loudness-check]").forEach(el => el.addEventListener("change", e => { audioState.loudness[e.target.dataset.loudnessCheck]=e.target.checked; scheduleAudioSave(); }));
+      // Empty means "leave the MOTU out", the behaviour before it was followed.
+      qs("#loudnessMotu").addEventListener("change", e => {
+        const raw = e.target.value.trim();
+        audioState.loudness.reference_motu_db = raw === "" ? null : Number(raw);
+        qs("#loudnessMotuNote").textContent = loudnessMotuNote(audioState.loudness);
+        scheduleAudioSave();
+      });
+      qs("#loudnessUseCurrent").addEventListener("click", () => {
+        const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+        if (c.volume_db == null) { toast("The CamillaDSP volume is not known yet."); return; }
+        audioState.loudness.reference_volume_db = Math.round(Number(c.volume_db) * 2) / 2;
+        audioState.loudness.reference_motu_db = (motu && motu.known) ? Number(motu.volume_db) : null;
+        if (!(motu && motu.known)) toast("MOTU level unknown: calibrating on the fader only.");
+        renderAudioEditor(); scheduleAudioSave();
+      });
       const stateEl=qs("#eqApplyState");
       stateEl.textContent = status.error ? `error · ${status.error}` : (status.converged ? `live · revision ${audioState.revision}` : `applying · revision ${audioState.revision}`);
       stateEl.style.color = status.error ? "var(--bad)" : (status.converged ? "var(--ok)" : "var(--warn)");
+    }
+
+    function loudnessMotuNote(l) {
+      if (l.reference_motu_db == null) return "MOTU changes are not compensated.";
+      if (!(motu && motu.known)) return "Follows the MOTU; its level is unknown right now.";
+      const offset = Number(motu.volume_db) - Number(l.reference_motu_db);
+      return offset === 0 ? "MOTU at its calibration level." : `MOTU ${offset > 0 ? "+" : ""}${offset.toFixed(0)} dB from calibration: compensation adjusted.`;
     }
 
     function renderSpeakerProfiles() {

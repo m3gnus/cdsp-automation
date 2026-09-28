@@ -113,6 +113,29 @@ or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
 
+### Loudness follows the MOTU
+
+The Iso226 filter derives the listening level from its fader alone:
+`phon = reference_phon + fader − reference_level`. The MOTU main output sits
+after CamillaDSP, so the switcher folds it in by moving the reference: with a
+calibrated `loudness.reference_motu_db`, `audio_eq.loudness_reference_level()`
+writes `reference_level = reference_volume_db − (motu − reference_motu_db)`,
+clamped to the engine's −100…20 range. The MOTU level is the switcher's own
+reading (`source_switcher.motu_loudness_db()`: the level on its connection,
+including a write of its own the device has not pushed back yet, and the last
+level seen while disconnected). `ensure_audio_eq` recomputes the overlay each
+pass, so a MOTU change from the UI, the remote or the front-panel knob reaches
+the engine within `AUDIO_EQ_REAPPLY_SECONDS`; inside a transition the
+remembered MOTU level is restored before the overlay is re-asserted, so the
+engine unmutes with the right reference. Without `reference_motu_db` (the
+default, and every state written before it existed) the reference is used
+as entered.
+
+A reference change arrives as a live `SetConfig` parameter update. The engine
+patch applies it like a fader move: `update_parameters` only marks the filter
+for redesign, and the next chunk crossfades from the old cascade to the new
+one (`parameter_change_is_crossfaded` asserts the output does not step).
+
 ### Per-source volume memory
 
 Each speaker/source pair remembers the CamillaDSP Main level and the MOTU main

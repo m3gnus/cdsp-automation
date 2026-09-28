@@ -168,9 +168,22 @@ phon equals SPL only at 1 kHz, so an SPL reading taken on music or broadband
 noise will not give the right reference and a several-dB error here shifts the
 whole compensation curve. Reference phon is limited to 40–90 because ISO
 226:2003 defines the contours no higher (and only to 80 phon above 4 kHz, so
-81–90 already extrapolates the top of the curve). Fixed MOTU and amplifier trims
-remain calibration stages; day-to-day volume belongs to the CamillaDSP Main
-fader.
+81–90 already extrapolates the top of the curve). Amplifier gains remain
+calibration stages.
+
+**The MOTU main output is part of the calibration.** Enter the MOTU level you
+calibrated at under "MOTU main output at calibration" (or press "Use current
+levels" while both the fader and the MOTU are where you measured). From then on
+the compensation follows both: the engine takes the listening level as
+`reference phon + (fader − reference fader) + (MOTU − reference MOTU)`, so a
+TV source that plays with the MOTU at 0 dB instead of -6 dB, or the MOTU turned
+up for a party, gets exactly the correction its real loudness calls for. Leave
+the field empty to calibrate on the fader alone, as before. A MOTU change
+reaches the loudness curve within about a second (immediately on a source
+switch, before the sound comes back). An engine built from this repository's
+patch crossfades the curve to its new shape; an engine built before this
+change swaps it abruptly, which can click once per MOTU change, so rebuild it
+with installer option **9** (an ordinary update never rebuilds the engine).
 
 The implementation uses the established ISO 226:2003 coefficient model as a
 practical approximation to the 2023 revision. The published revision analysis

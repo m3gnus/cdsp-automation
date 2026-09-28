@@ -1083,6 +1083,25 @@ def _submit_audio_overlay(cdsp: CamillaClient, updated: dict) -> None:
         time.sleep(poll_interval)
 
 
+_last_motu_loudness_db: float | None = None
+
+
+def motu_loudness_db() -> float | None:
+    """The MOTU main level the loudness reference follows, in dB.
+
+    The level on the switcher's open connection, including a write of ours
+    the device has not pushed back yet (the loudness should follow what was
+    just asked for).  While the MOTU is disconnected, the last level seen:
+    CueMix could have moved it, but guessing "calibrated" instead would swing
+    the loudness correction on every reconnect.  None until one is seen.
+    """
+    global _last_motu_loudness_db
+    trim = getattr(_motu, "trim", None) if getattr(_motu, "ws", None) is not None else None
+    if isinstance(trim, int):
+        _last_motu_loudness_db = motu_volume.attenuation_to_db(trim)
+    return _last_motu_loudness_db
+
+
 def ensure_audio_eq(
     cdsp: CamillaClient,
     *,
@@ -1102,6 +1121,7 @@ def ensure_audio_eq(
     config = cdsp.config.active()
     if not config:
         return
+    motu_db = motu_loudness_db()
     if speaker_id != DEFAULT_SPEAKER_ID:
         profile = load_profile(SPEAKER_PROFILE_DIR, speaker_id)
         if profile["bypass_user_eq"]:
@@ -1109,7 +1129,7 @@ def ensure_audio_eq(
             safe_state["enabled"] = False
             safe_state["loudness"]["enabled"] = False
             safe_state["preamp_db"] = 0.0
-            updated, _preamp = apply_audio_overlay(config, safe_state)
+            updated, _preamp = apply_audio_overlay(config, safe_state, motu_db=motu_db)
             if not _configs_equivalent(config, updated):
                 _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
@@ -1123,7 +1143,7 @@ def ensure_audio_eq(
         if not iso226_capability_available():
             safe_state = copy.deepcopy(state)
             safe_state["loudness"]["enabled"] = False
-            updated, preamp = apply_audio_overlay(config, safe_state)
+            updated, preamp = apply_audio_overlay(config, safe_state, motu_db=motu_db)
             if not _configs_equivalent(config, updated):
                 _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
@@ -1138,7 +1158,7 @@ def ensure_audio_eq(
                 }
             )
             return
-    updated, preamp = apply_audio_overlay(config, state)
+    updated, preamp = apply_audio_overlay(config, state, motu_db=motu_db)
     changed = not _configs_equivalent(config, updated)
     if changed:
         _submit_audio_overlay(cdsp, updated)
@@ -1482,6 +1502,15 @@ def apply_config(
             _await_reload(cdsp, file_path, settle_time)
             _require_selection_unchanged(target, "during config transition")
 
+            # The MOTU level first: the loudness reference below follows it.
+            if (
+                "motu_db" in start_levels
+                and _motu is not None
+                and start_levels["motu_db"] != previous_motu_db
+            ):
+                levels_changed = True
+                motu_written = _motu.restore_level(start_levels["motu_db"])
+
             # Re-assert the owned EQ overlay before sound returns.
             if target:
                 ensure_audio_eq(
@@ -1509,12 +1538,6 @@ def apply_config(
                 )
             levels_changed = True
             cdsp.volume.set_main_volume(restored_volume)
-            if (
-                "motu_db" in start_levels
-                and _motu is not None
-                and start_levels["motu_db"] != previous_motu_db
-            ):
-                motu_written = _motu.restore_level(start_levels["motu_db"])
             if target:
                 _write_speaker_status(
                     {
