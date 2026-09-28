@@ -8,7 +8,8 @@ Shared paths (state under `/var/lib/cdsp-automation`, site files under
 top. Only what varies per site is read from `cdsp-automation.env`, which every
 unit loads with `EnvironmentFile=`: `CDSP_HOST`, `CDSP_PORT`,
 `CDSP_CONFIG_DIR` (the env file is its sibling), `SOURCE_OVERRIDE_PATH`,
-`POWER_GPIO`, `MOTU_WS_URL`, `MOTU_MAIN_VOLUME_MAX_DB`, `REMOTE_NAME`,
+`POWER_GPIO`, `MOTU_WS_URL`, `MOTU_MAIN_VOLUME_MAX_DB`,
+`SOURCE_VOLUME_MEMORY`, `REMOTE_NAME`,
 `REMOTE_VOLUME_MIN`/`MAX`, `AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`,
 `AIRPLAY_INTERRUPTED_LMS_PLAYERS`, `SPOTIFY_ALSA_DEVICE`, `SITE_NAME` and
 `INSTALLATION_UI_HOST`/`PORT`/`TOKEN`. Other keys in the file are ignored.
@@ -111,6 +112,54 @@ a successful apply that recorded a ceiling (no status, `ok` not true, a missing
 or malformed value) means the most restrictive sane ceiling
 (`speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB`), never 0 dB. `REMOTE_VOLUME_MAX`
 survives as a deployment's own preference but can only tighten that ceiling.
+
+### Loudness follows the MOTU
+
+The Iso226 filter derives the listening level from its fader alone:
+`phon = reference_phon + fader − reference_level`. The MOTU main output sits
+after CamillaDSP, so the switcher folds it in by moving the reference: with a
+calibrated `loudness.reference_motu_db`, `audio_eq.loudness_reference_level()`
+writes `reference_level = reference_volume_db − (motu − reference_motu_db)`,
+clamped to the engine's −100…20 range. The MOTU level is the switcher's own
+reading (`source_switcher.motu_loudness_db()`: the level on its connection,
+including a write of its own the device has not pushed back yet, and the last
+level seen while disconnected). `ensure_audio_eq` recomputes the overlay each
+pass, so a MOTU change from the UI, the remote or the front-panel knob reaches
+the engine within `AUDIO_EQ_REAPPLY_SECONDS`; inside a transition the
+remembered MOTU level is restored before the overlay is re-asserted, so the
+engine unmutes with the right reference. Without `reference_motu_db` (the
+default, and every state written before it existed) the reference is used
+as entered.
+
+A reference change arrives as a live `SetConfig` parameter update. The engine
+patch applies it like a fader move: `update_parameters` only marks the filter
+for redesign, and the next chunk crossfades from the old cascade to the new
+one (`parameter_change_is_crossfaded` asserts the output does not step).
+
+### Per-source volume memory
+
+Each speaker/source pair remembers the CamillaDSP Main level and the MOTU main
+output level it last played at, in `SOURCE_VOLUME_PATH`
+(`scripts/source_volume.py`). Inside a source or speaker transition, while
+muted and under the audio-control lock, the switcher records the outgoing
+pair's levels and starts the incoming pair at the ones it remembers; the
+CamillaDSP level is still clamped to the new profile's ceiling and the MOTU
+level to `MOTU_MAIN_VOLUME_MAX_DB`, and the MOTU is written only on an open
+connection whose level the device confirmed, with the usual main-group and
+expected-level checks. A pair with nothing remembered keeps the level that
+was playing. A transition that fails puts the previous levels back with the
+previous config, so an unmute after a rollback is never louder than before.
+
+While a source plays, its levels are recorded every
+`SOURCE_VOLUME_RECORD_SECONDS` (10 s), and only when they changed. Nothing is
+recorded until a config has been applied on the current CamillaDSP connection,
+so a fail-safe ceiling is never remembered as a level. The memory is a
+convenience: an unreadable or unwritable file is logged and never fails a
+transition. The control UI shows the remembered levels and edits those of
+sources that are not playing (`POST /api/source-volume`). Set
+`SOURCE_VOLUME_MEMORY=0` to carry the volume over between sources instead.
+A network receiver that sends its own volume when a session starts (AirPlay)
+still sets the level after the switch, as it always has.
 
 I've created Python utilities that automate common tasks when using CamillaDSP on a Raspberry Pi. Trigger control runs on its own. The source switcher is the control core, and the MOTU's only client (clock, meters, main volume): it is the only thing that applies a persisted tone/EQ or speaker change and the only publisher of the volume ceiling, so the remote control (and the AirPlay/Spotify volume bridge and web UI described later) require it.
 
@@ -342,7 +391,23 @@ The script uses the `evdev` library to capture raw input events from the HID dev
 - **Recovery controls stay available** - A failed CamillaDSP connection does not block the HID event loop, so the power-button restart and shutdown actions still work
 - **Throttled idle logging** - The remote is checked every two seconds while asleep, but unchanged "not found" status is logged only every five minutes
 
-**Button mapping:**
+**Key map:** what each button does is data, not code. `remote_keymap.py`
+validates `REMOTE_KEYMAP_PATH` (`/etc/cdsp-automation/remote-keymap.json`) and
+turns key events into actions with one pure `KeyDispatcher`: a key with only a
+`press` acts on key-down (with `repeat`, on every second auto-repeat too); a
+key with a hold acts on release when it was a short press, fires its `hold`
+once at `hold_seconds`, and, when it also has a `long_hold`, fires the `hold`
+only on release so that holding on to the long hold never triggers both.
+`restart_services` and `shutdown` are refused on a press. A missing file means
+the built-in map below; an invalid one is logged and the built-in map stays in
+force. `next_source` and the `source_*` actions write the same override file
+the control UI writes (reusing its availability rule, so both offer the same
+sources), `motu_volume_*` goes through the switcher's MOTU request file, and
+`amps_off` sends the trigger's `SIGUSR1` directly: every daemon runs as the
+install user, so none of these needs a new sudo rule. `--learn` prints the key
+names a remote sends; `--print-keymap` prints the map in force.
+
+**Built-in button mapping:**
 
 | Button | Press | Hold |
 |--------|-------|------|
@@ -405,6 +470,27 @@ state files and is composed into the live config by the source switcher.
 The unit deliberately runs as root because the UI starts, stops and restarts
 services. Users who do not want a root web
 service simply skip this component — nothing else depends on it.
+
+### Home screen and live updates
+
+The page is installable as a home-screen app: `/manifest.webmanifest`
+(standalone, `start_url` `/#home`) and icons drawn by the server itself
+(`/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/apple-touch-icon.png`, PNGs
+encoded with `zlib`, so the UI stays one stdlib file). There is no service
+worker: browsers only register one in a secure context, and the UI is plain
+HTTP on the LAN.
+
+`GET /api/events` is a Server-Sent Events stream of `live_snapshot()`: the
+CamillaDSP level, volume, mute, state, ceiling, the source and override mode,
+and the switcher's published MOTU status. All streams share one snapshot,
+refreshed at most every `LIVE_INTERVAL_SECONDS` (0.5 s) on the same
+persistent read-only CamillaDSP client as the level meter, and a message is
+sent only when it changed (a comment line every 15 s keeps idle connections
+open). At most `LIVE_MAX_STREAMS` (8) streams are served, each ends after 30
+minutes (EventSource reconnects by itself), and the page closes its stream
+while hidden. With the stream connected the page drops its 800 ms level poll
+and runs the full status sweep every 20 s instead of every 5 s. Like every
+GET it is ungated; it only reads.
 
 ### Request guards
 

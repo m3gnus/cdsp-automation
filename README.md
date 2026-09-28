@@ -64,6 +64,25 @@ chmod +x install.sh
   individually - but note that options 5, 8 and 11 also install the source
   switcher, which they require for their volume ceiling and tone changes
 
+## Health check
+
+When something sounds wrong, after an OS upgrade, or before asking for help,
+run the health check: installer option **12**, the **Services** tab's "Run
+health check" button in the control UI, or directly:
+
+```bash
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/diagnose.py          # add --json for a machine-readable report
+```
+
+It checks the Python version, free disk space and Raspberry Pi under-voltage /
+throttling, the env file, every service (including restart loops), the
+CamillaDSP connection and state, that every source config passes
+`camilladsp -c`, the speaker profile and its source bases, the last transition,
+that the shared audio-control lock is free and writable, the MOTU link (by ping
+and from what the switcher reports: it never connects to the MOTU itself, which
+would drop the switcher), the remote and its key map, and recent errors in the
+journal. It only reads, and exits 1 when any check failed.
+
 ## Audio control architecture
 
 The source switcher is the only writer of the active CamillaDSP configuration.
@@ -149,9 +168,22 @@ phon equals SPL only at 1 kHz, so an SPL reading taken on music or broadband
 noise will not give the right reference and a several-dB error here shifts the
 whole compensation curve. Reference phon is limited to 40–90 because ISO
 226:2003 defines the contours no higher (and only to 80 phon above 4 kHz, so
-81–90 already extrapolates the top of the curve). Fixed MOTU and amplifier trims
-remain calibration stages; day-to-day volume belongs to the CamillaDSP Main
-fader.
+81–90 already extrapolates the top of the curve). Amplifier gains remain
+calibration stages.
+
+**The MOTU main output is part of the calibration.** Enter the MOTU level you
+calibrated at under "MOTU main output at calibration" (or press "Use current
+levels" while both the fader and the MOTU are where you measured). From then on
+the compensation follows both: the engine takes the listening level as
+`reference phon + (fader − reference fader) + (MOTU − reference MOTU)`, so a
+TV source that plays with the MOTU at 0 dB instead of -6 dB, or the MOTU turned
+up for a party, gets exactly the correction its real loudness calls for. Leave
+the field empty to calibrate on the fader alone, as before. A MOTU change
+reaches the loudness curve within about a second (immediately on a source
+switch, before the sound comes back). An engine built from this repository's
+patch crossfades the curve to its new shape; an engine built before this
+change swaps it abruptly, which can click once per MOTU change, so rebuild it
+with installer option **9** (an ordinary update never rebuilds the engine).
 
 The implementation uses the established ISO 226:2003 coefficient model as a
 practical approximation to the 2023 revision. The published revision analysis
@@ -246,8 +278,54 @@ REMOTE_VOLUME_MIN=-80
 REMOTE_VOLUME_MAX=0
 ```
 
-Tone steps (0.5 dB, ±6 dB), the 1 dB volume step and the button hold times are
-fixed in `cdsp_remote.py`.
+The tone range (±6 dB) is fixed in `cdsp_remote.py`; the steps, hold times and
+buttons come from the key map below.
+
+### Custom button mapping
+
+The table above is the built-in key map. To change it, or to give spare
+buttons a job, write `/etc/cdsp-automation/remote-keymap.json` (start from
+`remote-keymap.example.json` in this repository, or print the map in force)
+and restart the remote:
+
+```bash
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
+sudo install -m 0644 remote-keymap.json /etc/cdsp-automation/remote-keymap.json
+sudo systemctl restart cdsp-remote
+```
+
+**Finding your buttons' names.** Every remote sends different key names.
+Stop the service and let the remote tell you:
+
+```bash
+sudo systemctl stop cdsp-remote
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
+# press each button; Ctrl+C when done
+sudo systemctl start cdsp-remote
+```
+
+It prints lines like `KEY_HOMEPAGE  pressed  [HID Remote01 Keyboard] -> not mapped`.
+Only keys from the `REMOTE_NAME` device can be used; keys that arrive on a
+sibling device (for example "... Consumer Control") are marked unusable.
+
+Each key takes a `press` action (add `"repeat": true` to repeat while held), a
+`hold` (after `hold_seconds`, default 1 s) and a `long_hold` (after
+`long_hold_seconds`, default 10 s). Actions:
+
+| Action | Does |
+|--------|------|
+| `volume_up`, `volume_down`, `mute` | CamillaDSP Main fader (`volume_step_db`) |
+| `bass_up`, `bass_down`, `treble_up`, `treble_down`, `tone_reset` | Tone shelves (`tone_step_db`) |
+| `motu_volume_up`, `motu_volume_down` | MOTU main output (`motu_step_db`) |
+| `next_source` | Auto → each available source → Auto |
+| `source_auto`, `source_streamer`, `source_gadget`, `source_toslink`, `source_analog` | Pin a source, or go back to automatic |
+| `amps_off` | Same as the control UI's "Turn amps off now" |
+| `status` | Log the current state |
+| `restart_services`, `shutdown` | Hold / long hold only |
+
+Speaker-profile changes are deliberately not available on the remote: they
+need the matching passive speakers connected, which the control UI makes you
+confirm. An invalid key map is logged and the built-in map stays in force.
 
 `REMOTE_VOLUME_MAX` can only lower the ceiling. The real maximum comes from the
 speaker profile that is currently applied, so a profile capped at -20 dB stays
@@ -411,6 +489,13 @@ Automatically switches between CamillaDSP configs based on which audio source is
 When no automatic source is active, the switcher keeps the current config
 instead of forcing TOSLINK.
 
+**Per-source volume memory:** each source starts at the CamillaDSP and MOTU
+levels it last played at (per speaker), so the TV on TOSLINK comes back at the
+TV's level and AirPlay at AirPlay's. The profile and MOTU ceilings still
+apply. The dashboard's "Per-source volume" card shows the remembered levels
+and lets you set where a source that is not playing will start. Set
+`SOURCE_VOLUME_MEMORY=0` in `~/camilladsp/cdsp-automation.env` to turn it off.
+
 ### Critical Configuration Requirements
 
 **You MUST create three config files with exact names:**
@@ -513,6 +598,25 @@ logs.
 The UI edits persistent state only; the source switcher remains the sole
 writer of the live CamillaDSP configuration.
 
+### On your phone
+
+The page opens on **Home**: a phone-sized remote with the playing source, a
+level meter, big volume buttons (hold to repeat), mute, source buttons, the
+MOTU main output and the amps-off button. The Dashboard, Audio, Services and
+Logs tabs are unchanged.
+
+Add it to your home screen to use it like an app, with its own icon and no
+browser bars: on iPhone, open `http://<pi>:8088` in Safari, then Share → Add
+to Home Screen; on Android, Chrome's ⋮ menu → Add to Home screen. (Browsers
+only offer a full offline "install" over HTTPS; this LAN page is served over
+plain HTTP, so it is a home-screen shortcut that opens full screen, which is
+all a local controller needs.)
+
+Volume, mute, source, the MOTU level and the input meter update live while
+the page is open, over one lightweight event stream (`/api/events`); the page
+closes it when the phone sleeps or the tab is hidden, and falls back to
+polling on a browser without it.
+
 ### Security Model
 
 Because it starts, stops and restarts system services, the
@@ -586,6 +690,8 @@ The installer menu provides these options:
     Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
 11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
     also installs option 4, which it requires)
+12. **Run Health Check** - Read-only report on services, configs, the audio
+    lock, the MOTU link, the remote and power (see "Health check")
 
 Options 5, 8 and 11 install the source switcher when it is missing, because
 the components they install depend on it. The switcher is the only thing that

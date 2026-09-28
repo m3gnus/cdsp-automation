@@ -15,8 +15,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import struct
 import urllib.parse
+import zlib
 from contextlib import contextmanager
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +28,7 @@ from typing import Any, Iterator
 import yaml
 
 import motu_volume
+import source_volume
 from settings import (
     AIRPLAY_VOLUME_STATUS_PATH,
     AUDIO_CONTROL_LOCK_PATH,
@@ -193,8 +197,16 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{{site}} — audio control</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="theme-color" content="#0b0c0e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="{{site}}">
   <style>
     :root {
       color-scheme: dark;
@@ -296,6 +308,42 @@ HTML = r"""<!doctype html>
     }
     nav button:hover { color: var(--ink); }
     nav button.active { color: var(--ink); background: var(--raised); border-color: var(--line2); }
+
+    /* ---------- per-source volume ---------- */
+    .sv-grid { display: grid; grid-template-columns: minmax(70px,1fr) 92px 78px auto; gap: 6px 8px; align-items: center; }
+    .sv-grid .h { font: 10px/1.2 var(--mono); letter-spacing: 1.2px; text-transform: uppercase; color: var(--faint); }
+    .sv-grid .num { width: 100%; }
+    .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
+
+    /* ---------- home (phone remote) ---------- */
+    body { -webkit-tap-highlight-color: transparent; padding-bottom: env(safe-area-inset-bottom); }
+    header { padding-top: max(14px, env(safe-area-inset-top)); }
+    .home { max-width: 520px; margin: 0 auto; }
+    .home-now { text-align: center; margin-bottom: 18px; }
+    .home-source { font-size: clamp(30px, 9vw, 44px); font-weight: 800; letter-spacing: 1px; margin: 6px 0 12px; }
+    .home-vol { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; }
+    .big-btn {
+      appearance: none; border: 1px solid var(--line2); background: var(--raised); color: var(--ink);
+      height: 88px; border-radius: 22px; font-size: 44px; line-height: 1; cursor: pointer;
+      touch-action: manipulation; user-select: none; -webkit-user-select: none;
+    }
+    .big-btn:active { background: var(--line2); }
+    .home-level { text-align: center; min-width: 130px; }
+    .home-db { font: 800 clamp(40px, 12vw, 56px)/1 var(--mono); }
+    .home-db.muted { color: var(--warn); text-decoration: line-through; }
+    .home-mute { width: 100%; margin-top: 16px; height: 56px; font-size: 16px; }
+    .btn.home-mute.is-muted { background: rgba(244,196,81,0.14); border-color: var(--warn); color: var(--warn); }
+    .home-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-top: 8px; }
+    .home-sources .btn { height: 56px; font-size: 15px; }
+    .home-sources .btn.on { border-color: var(--cool); background: rgba(77,141,255,0.14); }
+    .home-sources .btn.live::after { content: " ●"; color: var(--ok); }
+    .home-motu { display: grid; grid-template-columns: 72px 1fr 72px; gap: 10px; align-items: center; text-align: center; margin-top: 8px; }
+    .home-motu .btn { height: 52px; font-size: 24px; }
+    .home-amps { width: 100%; margin-top: 26px; height: 52px; }
+    .home-hint { margin-top: 18px; text-align: center; }
+    @media (display-mode: standalone) { .home-hint { display: none; } }
+
+    .diag-row { display: grid; grid-template-columns: 18px minmax(120px, 220px) 1fr; gap: 8px; align-items: baseline; padding: 3px 0; }
 
     main { max-width: 1180px; margin: 0 auto; padding: clamp(16px, 3vw, 30px) clamp(14px, 4vw, 28px) 60px; }
     section { display: none; }
@@ -494,14 +542,44 @@ HTML = r"""<!doctype html>
     </header>
 
     <nav id="nav">
-      <button class="active" data-tab="dashboard">Dashboard</button>
+      <button class="active" data-tab="home">Home</button>
+      <button data-tab="dashboard">Dashboard</button>
       <button data-tab="audio">Audio</button>
       <button data-tab="services">Services</button>
       <button data-tab="logs">Logs</button>
     </nav>
 
     <main>
-      <section id="dashboard" class="active">
+      <section id="home" class="active">
+        <div class="home">
+          <div class="home-now">
+            <div class="cap">Now playing <span id="homeLive" class="badge">—</span></div>
+            <div class="home-source" id="homeSource">—</div>
+            <div class="meter silent" id="homeMeter"><i></i></div>
+          </div>
+          <div class="home-vol">
+            <button class="big-btn" data-home-vol="-1" aria-label="Volume down">−</button>
+            <div class="home-level">
+              <div class="home-db" id="homeVol">—</div>
+              <div class="sub2" id="homeVolSub">dB</div>
+            </div>
+            <button class="big-btn" data-home-vol="1" aria-label="Volume up">+</button>
+          </div>
+          <button class="btn home-mute" id="homeMute">Mute</button>
+          <div class="cap" style="margin-top:22px">Source</div>
+          <div class="home-sources" id="homeSources"></div>
+          <div class="cap" style="margin-top:22px">MOTU main output</div>
+          <div class="home-motu">
+            <button class="btn" data-home-motu="-1" aria-label="MOTU down">−</button>
+            <div class="val sm" id="homeMotu">—</div>
+            <button class="btn" data-home-motu="1" aria-label="MOTU up">+</button>
+          </div>
+          <button class="btn danger home-amps" id="homeAmps">Turn amps off</button>
+          <div class="sub2 home-hint">Tip: add this page to your home screen (Share → Add to Home Screen on iPhone, ⋮ → Add to Home screen on Android) to use it like an app.</div>
+        </div>
+      </section>
+
+      <section id="dashboard">
         <div class="shead"><span class="ix">01</span><h2>Now</h2><span class="rule"></span></div>
         <div class="grid hero" id="heroGrid"></div>
 
@@ -520,6 +598,11 @@ HTML = r"""<!doctype html>
             <div class="cap">MOTU main output <span id="motuBadge" class="badge">—</span></div>
             <div id="motuPanel"></div>
             <div class="sub2" id="motuCaption"></div>
+          </div>
+          <div class="card">
+            <div class="cap">Per-source volume <span id="svBadge" class="badge">—</span></div>
+            <div id="sourceVolumePanel"></div>
+            <div class="sub2" id="sourceVolumeCaption"></div>
           </div>
           <div class="card">
             <div class="cap">Speaker profile</div>
@@ -564,7 +647,12 @@ HTML = r"""<!doctype html>
       </section>
 
       <section id="services">
-        <div class="shead"><span class="ix">01</span><h2>Systemd services</h2><span class="rule"></span></div>
+        <div class="shead"><span class="ix">01</span><h2>Health check</h2><span class="rule"></span></div>
+        <div class="card" style="margin-bottom:12px">
+          <div class="row"><button class="btn primary" id="runDiagnose">Run health check</button><span class="sub2" id="diagnoseSummary">Checks services, configs, the audio lock, the MOTU link, the remote and power. Takes a few seconds.</span></div>
+          <div id="diagnoseReport"></div>
+        </div>
+        <div class="shead"><span class="ix">02</span><h2>Systemd services</h2><span class="rule"></span></div>
         <div id="servicesTable"></div>
       </section>
 
@@ -591,6 +679,7 @@ HTML = r"""<!doctype html>
 
   <script>
     let signalTarget = 0;
+    let lastStatus = null;
     let audioState = null;
     let audioLoaded = false;
     let audioSaveTimer = null;
@@ -740,8 +829,8 @@ HTML = r"""<!doctype html>
         </div>
         <div class="tile">
           <div class="cap">Output</div>
-          <div class="val big">${vol}<span class="unit"> dB</span></div>
-          <div class="sub2">${c.muted ? '<span class="warn">muted</span>' : "unmuted"} · CamillaDSP <span class="${stCls}">${esc(state)}</span></div>
+          <div class="val big"><span id="heroVol">${vol}</span><span class="unit"> dB</span></div>
+          <div class="sub2"><span id="heroMute">${c.muted ? '<span class="warn">muted</span>' : "unmuted"}</span> · CamillaDSP <span class="${stCls}">${esc(state)}</span></div>
         </div>
         <div class="tile">
           <div class="cap">Active source</div>
@@ -757,6 +846,8 @@ HTML = r"""<!doctype html>
       const has = db != null && db > -200;
       const norm = has ? Math.max(0, Math.min(1, (db - lo) / (hi - lo))) : 0;
       signalTarget = norm;
+      const home = qs("#homeMeter");
+      if (home) { home.querySelector("i").style.width = (norm * 100).toFixed(1) + "%"; home.classList.toggle("silent", !has || norm < 0.02); }
       meter.querySelector("i").style.width = (norm * 100).toFixed(1) + "%";
       meter.classList.toggle("silent", !has || norm < 0.02);
       const badge = qs("#sigBadge");
@@ -960,24 +1051,48 @@ HTML = r"""<!doctype html>
       const spotifyIdle=audioBridge.spotify_configured&&audioBridge.live&&spotifyBridge.receiver_socket===true&&!spotifyReady;
       const spotifyLabel=!audioBridge.spotify_configured?"Spotify sync not configured":spotifyReady?"Spotify ↔ master live":spotifyIdle?"Spotify ready · waiting for sender":"Spotify receiver unavailable";
       qs("#volumeArchitecture").innerHTML = `<div class="cap">Volume architecture</div><div class="val sm" style="margin-top:8px">One shared CamillaDSP master</div>
-        <div class="sub2">Web UI, HID remote and network players change the same fader. MOTU trims and amplifier gains remain calibration stages.</div>
+        <div class="sub2">Web UI, HID remote and network players change the same fader. The MOTU main output scales everything after it (loudness compensation follows it too); amplifier gains remain calibration stages.</div>
         <div class="row" style="margin-top:12px"><span class="badge ${airplayReady?"ok":"warn"}">${audioBridge.airplay_configured?(airplayReady?"AirPlay → master live":"AirPlay receiver unavailable"):"AirPlay sync not configured"}</span><span class="badge ${spotifyReady?"ok":"warn"}">${spotifyLabel}</span></div>
         <div class="sub2" style="margin-top:8px">Both receivers pass audio at unity. Spotify Connect mirrors changes in both directions once a sender connects; until then its receiver remains ready but volume sync is idle. AirPlay source changes control the master, but AirPlay cannot update the sender’s exact slider value when volume is changed here.</div>`;
       const l=audioState.loudness;
       qs("#loudnessPlan").innerHTML = `<div class="cap">ISO 226 loudness</div><div class="val sm" style="margin-top:8px">Fader-linked calibration</div>
         <label class="row" style="margin-top:12px"><span class="switch"><input data-loudness-check="enabled" type="checkbox" ${l.enabled?"checked":""} ${audioCapability.available?"":"disabled"}><span></span></span> Enabled</label>
-        <div class="sub2" style="margin-top:8px">Set the master where you normally listen, play a 1 kHz sine, and enter the SPL you measure at the listening position. Phon equals SPL only at 1 kHz — a reading taken on music or noise will not give the right number. Compensation then follows the Main fader inside CamillaDSP.</div>
+        <div class="sub2" style="margin-top:8px">Set the master where you normally listen, play a 1 kHz sine, and enter the SPL you measure at the listening position. Phon equals SPL only at 1 kHz — a reading taken on music or noise will not give the right number. Compensation then follows the Main fader inside CamillaDSP and, once its calibration level is set, the MOTU main output.</div>
         <label class="sub2" style="display:block;margin-top:12px">Reference listening level (phon)<input data-loudness="reference_phon" type="number" min="40" max="90" step="1" value="${l.reference_phon}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Reference master volume (dB)<input data-loudness="reference_volume_db" type="number" min="-60" max="0" step="0.5" value="${l.reference_volume_db}" style="margin-top:4px"></label>
+        <label class="sub2" style="display:block;margin-top:10px">MOTU main output at calibration (dB)<input id="loudnessMotu" type="number" min="-100" max="0" step="1" placeholder="not included" value="${l.reference_motu_db ?? ""}" style="margin-top:4px"></label>
+        <div class="row" style="margin-top:8px"><button class="btn sm" id="loudnessUseCurrent" type="button">Use current levels</button><span class="sub2" id="loudnessMotuNote">${loudnessMotuNote(l)}</span></div>
         <label class="sub2" style="display:block;margin-top:10px">Strength<input data-loudness="strength" type="range" min="0" max="1" step="0.05" value="${l.strength}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Maximum bass boost (dB)<input data-loudness="max_bass_boost_db" type="number" min="0" max="18" step="0.5" value="${l.max_bass_boost_db}" style="margin-top:4px"></label>
         <label class="sub2" style="display:block;margin-top:10px">Maximum treble boost (dB)<input data-loudness="max_treble_boost_db" type="number" min="0" max="12" step="0.5" value="${l.max_treble_boost_db}" style="margin-top:4px"></label>
         <div class="row" style="margin-top:12px"><span class="badge ${l.enabled?"ok":audioCapability.available?"":"warn"}">${l.enabled?"Custom DSP engine active":audioCapability.available?"Ready when enabled":"Install custom DSP engine first"}</span></div>`;
       qsa("[data-loudness]").forEach(el => el.addEventListener("input", e => { audioState.loudness[e.target.dataset.loudness]=Number(e.target.value); scheduleAudioSave(); }));
       qsa("[data-loudness-check]").forEach(el => el.addEventListener("change", e => { audioState.loudness[e.target.dataset.loudnessCheck]=e.target.checked; scheduleAudioSave(); }));
+      // Empty means "leave the MOTU out", the behaviour before it was followed.
+      qs("#loudnessMotu").addEventListener("change", e => {
+        const raw = e.target.value.trim();
+        audioState.loudness.reference_motu_db = raw === "" ? null : Number(raw);
+        qs("#loudnessMotuNote").textContent = loudnessMotuNote(audioState.loudness);
+        scheduleAudioSave();
+      });
+      qs("#loudnessUseCurrent").addEventListener("click", () => {
+        const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+        if (c.volume_db == null) { toast("The CamillaDSP volume is not known yet."); return; }
+        audioState.loudness.reference_volume_db = Math.round(Number(c.volume_db) * 2) / 2;
+        audioState.loudness.reference_motu_db = (motu && motu.known) ? Number(motu.volume_db) : null;
+        if (!(motu && motu.known)) toast("MOTU level unknown: calibrating on the fader only.");
+        renderAudioEditor(); scheduleAudioSave();
+      });
       const stateEl=qs("#eqApplyState");
       stateEl.textContent = status.error ? `error · ${status.error}` : (status.converged ? `live · revision ${audioState.revision}` : `applying · revision ${audioState.revision}`);
       stateEl.style.color = status.error ? "var(--bad)" : (status.converged ? "var(--ok)" : "var(--warn)");
+    }
+
+    function loudnessMotuNote(l) {
+      if (l.reference_motu_db == null) return "MOTU changes are not compensated.";
+      if (!(motu && motu.known)) return "Follows the MOTU; its level is unknown right now.";
+      const offset = Number(motu.volume_db) - Number(l.reference_motu_db);
+      return offset === 0 ? "MOTU at its calibration level." : `MOTU ${offset > 0 ? "+" : ""}${offset.toFixed(0)} dB from calibration: compensation adjusted.`;
     }
 
     function renderSpeakerProfiles() {
@@ -1285,10 +1400,180 @@ HTML = r"""<!doctype html>
       } catch (err) { toast(err.message); }
       finally { b.disabled = false; }
     }
+    async function runDiagnose() {
+      const b = qs("#runDiagnose"); b.disabled = true;
+      qs("#diagnoseSummary").textContent = "running…";
+      try {
+        const d = await api("/api/diagnose", { method: "POST", body: "{}" });
+        const marks = { ok: ["✔", "ok"], warn: ["!", "warn"], fail: ["✘", "bad"], info: ["·", "faint"] };
+        let group = null; const rows = [];
+        for (const c of d.checks) {
+          if (c.group !== group) { group = c.group; rows.push(`<div class="cap" style="margin-top:12px">${esc(group)}</div>`); }
+          const [mark, cls] = marks[c.status] || ["?", "warn"];
+          rows.push(`<div class="diag-row"><span class="${cls}">${mark}</span><b>${esc(c.name)}</b><span class="sub2">${esc(c.detail)}</span></div>`);
+        }
+        qs("#diagnoseReport").innerHTML = rows.join("");
+        const n = s => d.checks.filter(c => c.status === s).length;
+        qs("#diagnoseSummary").innerHTML = `<span class="ok">${n("ok")} ok</span> · <span class="warn">${n("warn")} warning(s)</span> · <span class="bad">${n("fail")} failure(s)</span>`;
+      } catch (e) { qs("#diagnoseSummary").textContent = e.message; }
+      finally { b.disabled = false; }
+    }
     async function refreshLogs() {
       const unit = qs("#logUnit").value || "camilladsp.service";
       try { const d = await api(`/api/logs?unit=${encodeURIComponent(unit)}`); qs("#logBox").textContent = d.logs || "—"; }
       catch (e) { qs("#logBox").textContent = e.message; }
+    }
+
+    /* ---------------- per-source volume ---------------- */
+    const svDb = v => v == null ? "" : Number(v).toFixed(1);
+    function renderSourceVolume(data) {
+      const sv = data.source_volume || {};
+      const panel = qs("#sourceVolumePanel"), badge = qs("#svBadge");
+      if (!panel) return;
+      if (sv.error) {
+        badge.textContent = "error"; badge.className = "badge bad";
+        panel.innerHTML = `<div class="sub2 bad">${esc(sv.error)}</div>`;
+        return;
+      }
+      badge.textContent = sv.enabled ? "on" : "off";
+      badge.className = "badge " + (sv.enabled ? "ok" : "warn");
+      // Never rebuild under a field being typed into.
+      if (panel.contains(document.activeElement)) return;
+      const available = (data.source || {}).available || {};
+      const rows = Object.entries(sv.sources || {})
+        .filter(([key]) => available[key]?.exists || sv.live === key)
+        .map(([key, item]) => {
+          const live = sv.live === key;
+          const dis = live ? "disabled" : "";
+          const remembered = item.cdsp_db != null || item.motu_db != null;
+          return `<div>${esc(item.label)}</div>
+            <input class="num" type="number" step="0.5" min="-80" max="0" placeholder="—" value="${svDb(item.cdsp_db)}" data-sv-source="${esc(key)}" data-sv-key="cdsp_db" ${dis} aria-label="${esc(item.label)} CamillaDSP start level">
+            <input class="num" type="number" step="1" min="-100" max="0" placeholder="—" value="${item.motu_db == null ? "" : Number(item.motu_db).toFixed(0)}" data-sv-source="${esc(key)}" data-sv-key="motu_db" ${dis} aria-label="${esc(item.label)} MOTU start level">
+            ${live ? `<span class="live">● live</span>` : `<button class="btn sm ghost" data-sv-forget="${esc(key)}" ${remembered ? "" : "disabled"}>Forget</button>`}`;
+        });
+      panel.innerHTML = rows.length
+        ? `<div class="sv-grid"><div class="h">source</div><div class="h">Camilla dB</div><div class="h">MOTU dB</div><div></div>${rows.join("")}</div>`
+        : `<div class="sub2">No sources available.</div>`;
+      qsa("[data-sv-key]").forEach(i => i.addEventListener("change", e => {
+        const v = e.target.value.trim();
+        if (v === "") return;
+        editSourceVolume({ source: e.target.dataset.svSource, [e.target.dataset.svKey]: Number(v) });
+      }));
+      qsa("[data-sv-forget]").forEach(b => b.addEventListener("click", () => editSourceVolume({ source: b.dataset.svForget, forget: true })));
+      qs("#sourceVolumeCaption").innerHTML = sv.enabled
+        ? `Each source starts at the level it last played at (speaker <b>${esc(sv.speaker)}</b>). Set a level for a source that is not playing to choose where it starts; ceilings still apply.`
+        : `Off: SOURCE_VOLUME_MEMORY is disabled in the env file, so the volume carries over between sources.`;
+    }
+    async function editSourceVolume(payload) {
+      try {
+        const d = await api("/api/source-volume", { method: "POST", body: JSON.stringify(payload) });
+        document.activeElement?.blur?.();
+        renderSourceVolume({ source_volume: d.source_volume, source: lastStatus?.source });
+      } catch (e) { toast(e.message); }
+    }
+
+    /* ---------------- live updates (Server-Sent Events) ---------------- */
+    let live = null, liveSource = null, liveConnected = false;
+    function applyLive(d) {
+      live = d;
+      const c = d.camilla || {};
+      updateSignal(c.ok ? c.signal_db : null);
+      if (c.ok) {
+        const hv = qs("#heroVol"); if (hv) hv.textContent = Number(c.volume_db).toFixed(1);
+        const hm = qs("#heroMute"); if (hm) hm.innerHTML = c.muted ? '<span class="warn">muted</span>' : "unmuted";
+        const focus = document.activeElement;
+        if (qs("#volRange") && focus !== qs("#volRange") && focus !== qs("#volNum")) {
+          qs("#volRange").value = c.volume_db; qs("#volNum").value = Number(c.volume_db).toFixed(1);
+        }
+        if (qs("#muteToggle") && focus !== qs("#muteToggle")) qs("#muteToggle").checked = !!c.muted;
+      }
+      if (d.motu && motuTarget == null && !motuBusy) {
+        const changed = !motu || motu.known !== d.motu.known || motu.volume_db !== d.motu.volume_db || motu.confirmed !== d.motu.confirmed || motu.writable !== d.motu.writable;
+        motu = d.motu;
+        if (changed) renderMotu();
+      }
+      if (d.source && liveSource !== JSON.stringify(d.source)) {
+        liveSource = JSON.stringify(d.source);
+        if (lastStatus) { lastStatus.source = Object.assign({}, lastStatus.source, d.source); renderSource(lastStatus); }
+      }
+      renderHome();
+    }
+    let liveStream = null;
+    function startLive() {
+      if (!window.EventSource || liveStream) return;
+      liveStream = new EventSource("/api/events");
+      liveStream.onmessage = e => { liveConnected = true; try { applyLive(JSON.parse(e.data)); } catch (err) { /* keep last */ } };
+      liveStream.onerror = () => { liveConnected = false; };
+    }
+    function stopLive() { if (liveStream) { liveStream.close(); liveStream = null; } liveConnected = false; }
+
+    /* ---------------- home (phone remote) ---------------- */
+    const titleCase = v => v ? v[0].toUpperCase() + v.slice(1) : "—";
+    function renderHome() {
+      const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+      const src = Object.assign({}, lastStatus?.source || {}, live?.source || {});
+      const available = src.available || {};
+      qs("#homeSource").textContent = SOURCE_LABELS[src.current] || titleCase(src.current);
+      const badge = qs("#homeLive");
+      badge.textContent = src.mode && src.mode !== "auto" ? "manual" : "auto";
+      badge.className = "badge " + (src.mode && src.mode !== "auto" ? "warn" : "ok");
+      const vol = c.volume_db != null ? Number(c.volume_db) : null;
+      const homeVol = qs("#homeVol");
+      homeVol.textContent = vol == null ? "—" : vol.toFixed(1);
+      homeVol.classList.toggle("muted", !!c.muted);
+      qs("#homeVolSub").textContent = c.volume_max_db != null ? `dB · max ${Number(c.volume_max_db).toFixed(0)}` : "dB";
+      const mute = qs("#homeMute");
+      mute.textContent = c.muted ? "Muted · tap to unmute" : "Mute";
+      mute.classList.toggle("is-muted", !!c.muted);
+      const chips = [`<button class="btn ${!src.mode || src.mode === "auto" ? "on" : ""}" data-home-source="auto">Auto</button>`];
+      for (const [key, item] of Object.entries(available)) {
+        if (!item.exists) continue;
+        chips.push(`<button class="btn ${src.mode === key ? "on" : ""} ${src.current === key ? "live" : ""}" data-home-source="${esc(key)}">${esc(item.label)}</button>`);
+      }
+      const html = chips.join("");
+      if (qs("#homeSources").innerHTML !== html) {
+        qs("#homeSources").innerHTML = html;
+        qsa("[data-home-source]").forEach(b => b.addEventListener("click", homeSource));
+      }
+      const known = !!(motu && motu.known);
+      qs("#homeMotu").innerHTML = known ? `${motuDb(motuTarget ?? motu.volume_db)}<span class="unit"> dB</span>` : '<span class="faint">unknown</span>';
+      qsa("[data-home-motu]").forEach(b => { b.disabled = !(known && motu.writable); });
+    }
+    const SOURCE_LABELS = { streamer: "Streamer", gadget: "USB Gadget", toslink: "TOSLINK", analog: "Analog" };
+    async function homeSource(e) {
+      const btn = e.currentTarget; btn.disabled = true;
+      try { await api("/api/source", { method: "POST", body: JSON.stringify({ source: btn.dataset.homeSource }) }); await load(); }
+      catch (err) { toast(err.message); } finally { btn.disabled = false; }
+    }
+    /* Press and hold repeats, like the remote's volume keys. */
+    function holdRepeat(button, action) {
+      let timer = null, first = null;
+      const stop = () => { clearTimeout(first); clearInterval(timer); first = timer = null; };
+      button.addEventListener("pointerdown", e => {
+        e.preventDefault(); stop(); action();
+        first = setTimeout(() => { timer = setInterval(action, 180); }, 450);
+      });
+      ["pointerup", "pointerleave", "pointercancel"].forEach(ev => button.addEventListener(ev, stop));
+      button.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); action(); } });
+    }
+    let homeVolumeBusy = false, homeVolumePending = 0;
+    async function homeVolume(step) {
+      homeVolumePending += step;
+      if (homeVolumeBusy) return;
+      homeVolumeBusy = true;
+      try {
+        while (homeVolumePending !== 0) {
+          const delta = homeVolumePending; homeVolumePending = 0;
+          const d = await api("/api/camilla/volume", { method: "POST", body: JSON.stringify({ delta_db: delta }) });
+          const cam = d.camilla || {};
+          if (cam.volume_db != null) {
+            if (live && live.camilla) Object.assign(live.camilla, { volume_db: cam.volume_db, muted: cam.muted });
+            else if (lastStatus) lastStatus.camilla = Object.assign({}, lastStatus.camilla, cam);
+            renderHome();
+          }
+        }
+      } catch (err) { homeVolumePending = 0; toast(err.message); }
+      finally { homeVolumeBusy = false; }
     }
 
     /* ---------------- loop ---------------- */
@@ -1302,13 +1587,16 @@ HTML = r"""<!doctype html>
       renderHero(data);
       renderSource(data);
       renderVolume(data);
+      lastStatus = data;
+      renderSourceVolume(data);
+      renderHome();
       if (Number(data.camilla?.sample_rate)>0) eqSampleRate=Number(data.camilla.sample_rate);
       if (data.speaker) { speakerState=data.speaker; renderSpeakerProfiles(); }
       renderSystem(data);
     }
 
     async function pollLevels() {
-      if (document.hidden) return;
+      if (document.hidden || liveConnected) return;
       try { const d = await api("/api/levels"); updateSignal(d.signal_db); }
       catch (e) { /* keep last */ }
     }
@@ -1340,6 +1628,7 @@ HTML = r"""<!doctype html>
     qsa("nav button").forEach(b => b.addEventListener("click", () => { location.hash = b.dataset.tab; }));
     window.addEventListener("hashchange", () => activateTab(location.hash.slice(1)));
     qs("#refreshLogs").addEventListener("click", refreshLogs);
+    qs("#runDiagnose").addEventListener("click", runDiagnose);
     qs("#logUnit").addEventListener("change", refreshLogs);
     qs("#ampOff").addEventListener("click", ampsOff);
     qs("#eqAdd").addEventListener("click", () => {
@@ -1370,10 +1659,24 @@ HTML = r"""<!doctype html>
     setInterval(() => { if (motuTarget != null) renderMotuCaption(); }, 1000);
     // A backgrounded phone must not keep the Pi spawning a status sweep every
     // 5s; refresh immediately instead when the page becomes visible again.
+    // With the live stream connected the full sweep only has to catch what the
+    // stream does not carry (services, speaker, availability): every 20 s.
+    let refreshTick = 0;
     const refresh = () => { if (!document.hidden) load().catch(() => {}); };
-    setInterval(refresh, 5000);
-    document.addEventListener("visibilitychange", refresh);
+    setInterval(() => { refreshTick++; if (!liveConnected || refreshTick % 4 === 0) refresh(); }, 5000);
+    document.addEventListener("visibilitychange", () => { if (document.hidden) stopLive(); else { startLive(); refresh(); } });
     setInterval(pollLevels, 800);
+    startLive();
+    qsa("[data-home-vol]").forEach(b => holdRepeat(b, () => homeVolume(Number(b.dataset.homeVol))));
+    qsa("[data-home-motu]").forEach(b => holdRepeat(b, () => {
+      if (motu && motu.known && motu.writable) motuSetTarget((motuTarget ?? motu.volume_db) + MOTU_STEP_DB * Number(b.dataset.homeMotu), "nudge");
+      renderHome();
+    }));
+    qs("#homeMute").addEventListener("click", () => {
+      const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+      setVolume({ muted: !c.muted });
+    });
+    qs("#homeAmps").addEventListener("click", ampsOff);
   </script>
 </body>
 </html>
@@ -1623,6 +1926,203 @@ def camilla_levels() -> dict[str, Any]:
     return {"ok": True, "signal_db": max(finite) if finite else None}
 
 
+# ---- live state for the page's event stream (/api/events) ----
+# Every open page reads one shared snapshot, refreshed at most this often, on
+# the persistent read-only client above: cheap reads only (levels, volume,
+# mute, state, file path), never the full status sweep.
+LIVE_INTERVAL_SECONDS = 0.5
+# Each stream holds a handler thread; a few phones and a laptop is the use.
+LIVE_MAX_STREAMS = 8
+LIVE_KEEPALIVE_SECONDS = 15.0
+# A stream ends after this long; EventSource reconnects by itself, so a
+# forgotten tab cannot hold a thread for ever.
+LIVE_STREAM_SECONDS = 1800.0
+_live_lock = threading.Lock()
+_live_cache: tuple[float, dict[str, Any]] | None = None
+_live_identity: tuple[str | None, str | None] = (None, None)
+_live_streams = 0
+_live_streams_lock = threading.Lock()
+
+
+def _strongest_level(levels: Any) -> float | None:
+    finite = []
+    for level in levels:
+        if level is None:
+            continue
+        numeric = float(level)
+        if math.isfinite(numeric) and numeric > -999.0:
+            finite.append(numeric)
+    return max(finite) if finite else None
+
+
+def _read_live_camilla() -> dict[str, Any]:
+    global _levels_client
+    with _levels_lock:
+        try:
+            if _levels_client is None:
+                from camilladsp import CamillaClient
+
+                client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
+                client.connect()
+                _levels_client = client
+            client = _levels_client
+            return {
+                "ok": True,
+                "state": str(client.general.state()).replace("ProcessingState.", ""),
+                "config_file": client.config.file_path(),
+                "volume_db": client.volume.main_volume(),
+                "muted": client.volume.main_mute(),
+                "signal_db": _strongest_level(client.levels.playback_rms()),
+            }
+        except Exception:
+            try:
+                if _levels_client is not None:
+                    _levels_client.disconnect()
+            except Exception:
+                pass
+            _levels_client = None
+            return {"ok": False}
+
+
+def _live_source(config_file: Any) -> str | None:
+    """The playing source, recomputed only when the config path changes."""
+    global _live_identity
+    path = config_file if isinstance(config_file, str) else None
+    if _live_identity[0] != path:
+        current = None
+        if path:
+            try:
+                identity = managed_config_identity(path)
+                current = identity[0] if identity is not None else Path(path).stem
+            except Exception:
+                current = Path(path).stem
+        _live_identity = (path, current)
+    return _live_identity[1]
+
+
+def live_snapshot() -> dict[str, Any]:
+    """What changes second to second: level, volume, mute, source, MOTU."""
+    global _live_cache
+    with _live_lock:
+        now = time.monotonic()
+        if _live_cache is not None and now - _live_cache[0] < LIVE_INTERVAL_SECONDS * 0.8:
+            return _live_cache[1]
+        camilla = _read_live_camilla()
+        if camilla.get("ok"):
+            try:
+                camilla["volume_max_db"] = current_volume_max()
+            except Exception:
+                camilla["volume_max_db"] = None
+        snapshot = {
+            "camilla": camilla,
+            "source": {
+                "mode": read_source_override() or "auto",
+                "current": _live_source(camilla.get("config_file")),
+            },
+            "motu": motu_volume.read_status(),
+        }
+        _live_cache = (now, snapshot)
+        return snapshot
+
+
+def _claim_live_stream() -> bool:
+    global _live_streams
+    with _live_streams_lock:
+        if _live_streams >= LIVE_MAX_STREAMS:
+            return False
+        _live_streams += 1
+        return True
+
+
+def _release_live_stream() -> None:
+    global _live_streams
+    with _live_streams_lock:
+        _live_streams = max(0, _live_streams - 1)
+
+
+# ---- installable web app: manifest and icons ----
+THEME_COLOR = "#0b0c0e"
+ICON_BARS = (0.34, 0.62, 0.9, 0.7, 0.46)
+ICON_COOL = (0x4D, 0x8D, 0xFF)
+ICON_WARM = (0xFF, 0x9A, 0x45)
+
+
+def manifest() -> dict[str, Any]:
+    return {
+        "name": f"{SITE_NAME} audio control",
+        "short_name": SITE_NAME,
+        "start_url": "/#home",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": THEME_COLOR,
+        "theme_color": THEME_COLOR,
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+        ],
+    }
+
+
+def _icon_bars(size: int) -> list[tuple[int, int, int, int, tuple[int, int, int]]]:
+    """(x0, x1, y0, y1, colour) per bar, inside the maskable safe zone."""
+    safe = size * 0.6  # the maskable icon's guaranteed-visible circle, roughly
+    left = (size - safe) / 2
+    slot = safe / len(ICON_BARS)
+    bars = []
+    for index, height in enumerate(ICON_BARS):
+        mix = index / (len(ICON_BARS) - 1)
+        colour = tuple(round(c + (w - c) * mix) for c, w in zip(ICON_COOL, ICON_WARM))
+        x0 = round(left + slot * index + slot * 0.18)
+        x1 = round(left + slot * (index + 1) - slot * 0.18)
+        bar = safe * height
+        y1 = round(size / 2 + safe / 2)
+        bars.append((x0, x1, round(y1 - bar), y1, colour))
+    return bars
+
+
+@lru_cache(maxsize=4)
+def icon_png(size: int) -> bytes:
+    """The app icon as a PNG, drawn here so the UI stays one stdlib file."""
+    background = bytes(int(THEME_COLOR[i : i + 2], 16) for i in (1, 3, 5))
+    bars = _icon_bars(size)
+    rows = []
+    for y in range(size):
+        row = bytearray(background * size)
+        for x0, x1, y0, y1, colour in bars:
+            if y0 <= y < y1:
+                row[x0 * 3 : x1 * 3] = bytes(colour) * (x1 - x0)
+        rows.append(b"\x00" + bytes(row))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def icon_svg() -> str:
+    size = 512
+    rects = "".join(
+        f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="10" '
+        f'fill="rgb({c[0]},{c[1]},{c[2]})"/>'
+        for x0, x1, y0, y1, c in _icon_bars(size)
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}">'
+        f'<rect width="{size}" height="{size}" rx="96" fill="{THEME_COLOR}"/>{rects}</svg>'
+    )
+
+
 def camilla_status() -> dict[str, Any]:
     try:
         with camilla_client() as client:
@@ -1817,6 +2317,59 @@ def source_status(camilla: dict[str, Any]) -> dict[str, Any]:
         "config_file": config_file,
         "available": source_availability(),
     }
+
+
+def source_volume_payload() -> dict[str, Any]:
+    """What the per-source volume memory holds for the selected speaker."""
+    speaker = current_speaker_selection()["selected"]
+    remembered = source_volume.read_state()["speakers"].get(speaker, {})
+    status = _read_json_object(SPEAKER_STATUS_PATH)
+    live = status.get("source") if status.get("applied") == speaker else None
+    return {
+        "enabled": source_volume.enabled(),
+        "speaker": speaker,
+        "live": live if isinstance(live, str) else None,
+        "sources": {
+            key: {"label": label, **remembered.get(key, {})}
+            for key, label in SOURCE_CHOICES.items()
+        },
+    }
+
+
+def _optional_level(payload: dict[str, Any], key: str) -> float | None:
+    if payload.get(key) is None:
+        return None
+    return _finite_volume(payload[key])
+
+
+def edit_source_volume(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set or forget the levels a source that is not playing will start at.
+
+    The playing source's levels are recorded from the live controls by the
+    switcher; editing them here would be overwritten seconds later, so it is
+    refused with a pointer to the real controls.
+    """
+    source = payload.get("source")
+    if source not in SOURCE_CHOICES:
+        raise ValueError("source not allowed")
+    current = source_volume_payload()
+    if source == current["live"]:
+        raise RequestRefused(
+            HTTPStatus.CONFLICT,
+            f"{SOURCE_CHOICES[source]} is playing: use the volume controls; "
+            "its levels are remembered from them",
+        )
+    if payload.get("forget") is True:
+        source_volume.forget(current["speaker"], source)
+    else:
+        cdsp_db = _optional_level(payload, "cdsp_db")
+        motu_db = _optional_level(payload, "motu_db")
+        if cdsp_db is None and motu_db is None:
+            raise ValueError("cdsp_db or motu_db is required")
+        source_volume.remember(
+            current["speaker"], source, cdsp_db=cdsp_db, motu_db=motu_db
+        )
+    return source_volume_payload()
 
 
 def _backup_file(
@@ -2300,6 +2853,55 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_body(self, body: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_live_events(self) -> None:
+        """Stream live_snapshot() as Server-Sent Events while the page is open.
+
+        A message goes out only when something changed; a comment line keeps
+        idle proxies from closing the stream.  The page falls back to polling
+        when the stream is refused or unavailable.
+        """
+        if not _claim_live_stream():
+            self.send_json(
+                {"ok": False, "error": "too many live streams"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            self.close_connection = True
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+            started = last_write = time.monotonic()
+            last_body = None
+            while time.monotonic() - started < LIVE_STREAM_SECONDS:
+                body = json.dumps(live_snapshot(), separators=(",", ":"))
+                now = time.monotonic()
+                if body != last_body:
+                    self.wfile.write(f"data: {body}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_body, last_write = body, now
+                elif now - last_write >= LIVE_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_write = now
+                time.sleep(LIVE_INTERVAL_SECONDS)
+        except OSError:
+            pass  # the page closed or went to sleep
+        finally:
+            _release_live_stream()
+
     def refuse(self, refusal: RequestRefused) -> None:
         """Answer a guard rejection without draining the unread body."""
         # The body was never read, so this connection cannot be reused: the
@@ -2337,6 +2939,23 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        if parsed.path == "/manifest.webmanifest":
+            self.send_body(json.dumps(manifest()).encode("utf-8"), "application/manifest+json")
+            return
+
+        if parsed.path == "/icon.svg":
+            self.send_body(icon_svg().encode("utf-8"), "image/svg+xml")
+            return
+
+        icon_sizes = {"/icon-192.png": 192, "/icon-512.png": 512, "/apple-touch-icon.png": 180}
+        if parsed.path in icon_sizes:
+            self.send_body(icon_png(icon_sizes[parsed.path]), "image/png")
+            return
+
+        if parsed.path == "/api/events":
+            self.send_live_events()
+            return
+
         if parsed.path == "/api/status":
             services = service_status()
             camilla = camilla_status()
@@ -2352,12 +2971,17 @@ class Handler(BaseHTTPRequestHandler):
                 speaker = speaker_payload()
             except Exception as exc:
                 speaker = {"error": str(exc)}
+            try:
+                volumes = source_volume_payload()
+            except Exception as exc:
+                volumes = {"error": str(exc)}
             self.send_json(
                 {
                     "services": services,
                     "camilla": camilla,
                     "source": source,
                     "speaker": speaker,
+                    "source_volume": volumes,
                     "remote": remote_status(services),
                 }
             )
@@ -2440,6 +3064,28 @@ class Handler(BaseHTTPRequestHandler):
 
             if parsed.path == "/api/speaker":
                 self.send_json({"ok": True, "speaker": select_speaker(payload)})
+                return
+
+            if parsed.path == "/api/source-volume":
+                try:
+                    volumes = edit_source_volume(payload)
+                except RequestRefused as refusal:
+                    self.send_json({"ok": False, "error": str(refusal)}, refusal.status)
+                    return
+                self.send_json({"ok": True, "source_volume": volumes})
+                return
+
+            if parsed.path == "/api/diagnose":
+                # A POST, though it only reads: it runs camilladsp -c on every
+                # config, so the token guard applies to it.
+                import dataclasses
+
+                import diagnose
+
+                checks = diagnose.diagnose()
+                self.send_json(
+                    {"ok": True, "checks": [dataclasses.asdict(c) for c in checks]}
+                )
                 return
 
             if parsed.path == "/api/amps/off":

@@ -88,6 +88,9 @@ def default_audio_state() -> dict[str, Any]:
             "enabled": False,
             "reference_phon": 80.0,
             "reference_volume_db": -10.0,
+            # The MOTU main level the reference was measured at; None leaves
+            # the MOTU out of the calibration (the behaviour before it existed).
+            "reference_motu_db": None,
             "strength": 1.0,
             "max_bass_boost_db": 10.0,
             "max_treble_boost_db": 4.0,
@@ -244,6 +247,13 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
             ),
             "reference_volume_db": _number(
                 loudness_in.get("reference_volume_db", -10), "reference volume", -60, 0
+            ),
+            "reference_motu_db": (
+                None
+                if loudness_in.get("reference_motu_db") is None
+                else _number(
+                    loudness_in["reference_motu_db"], "reference MOTU level", -100, 0
+                )
             ),
             "strength": _number(
                 loudness_in.get("strength", 1), "loudness strength", 0, 1
@@ -481,10 +491,40 @@ def _program_channels(
     return sorted(channels)
 
 
+# The engine accepts reference levels in this range (Iso226 validate_config).
+ENGINE_REFERENCE_LEVEL_RANGE = (-100.0, 20.0)
+
+
+def loudness_reference_level(
+    loudness: dict[str, Any], motu_db: float | None
+) -> float:
+    """The fader level the engine should treat as the reference, in dB.
+
+    The engine derives the listening level from its own fader alone:
+    ``phon = reference_phon + fader - reference_level``.  The MOTU main output
+    sits after CamillaDSP, so every dB it is above the level the reference was
+    measured at is a dB louder in the room that the fader cannot see.  Moving
+    the reference down by that offset folds the MOTU into the same sum:
+    ``phon = reference_phon + (fader - reference_volume) + (motu - reference_motu)``.
+    Without a calibrated MOTU level, or while the MOTU level is unknown, the
+    reference is used as entered.
+    """
+    reference = float(loudness["reference_volume_db"])
+    calibrated = loudness.get("reference_motu_db")
+    if calibrated is None or motu_db is None:
+        return reference
+    low, high = ENGINE_REFERENCE_LEVEL_RANGE
+    return round(max(low, min(high, reference - (float(motu_db) - float(calibrated)))), 2)
+
+
 def apply_audio_overlay(
-    config: dict[str, Any], state: dict[str, Any]
+    config: dict[str, Any], state: dict[str, Any], *, motu_db: float | None = None
 ) -> tuple[dict[str, Any], float]:
-    """Compose the reserved user-EQ step into an active CamillaDSP config."""
+    """Compose the reserved user-EQ step into an active CamillaDSP config.
+
+    ``motu_db`` is the MOTU main output level now, which moves the loudness
+    reference (loudness_reference_level); None uses it as calibrated.
+    """
     state = normalize_audio_state(state)
     updated = _strip_overlay(config)
     preamp = effective_preamp_db(state)
@@ -496,7 +536,7 @@ def apply_audio_overlay(
         filters[name] = {
             "type": "Iso226",
             "parameters": {
-                "reference_level": loudness["reference_volume_db"],
+                "reference_level": loudness_reference_level(loudness, motu_db),
                 "reference_phon": loudness["reference_phon"],
                 "strength": loudness["strength"],
                 "max_bass_boost": loudness["max_bass_boost_db"],

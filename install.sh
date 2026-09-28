@@ -75,6 +75,9 @@ MOTU_WS_URL=ws://169.254.51.193:1280
 # MOTU main output level, set from the control UI.  It sits after CamillaDSP,
 # so the profile volume limits do not bound it: this ceiling does.
 MOTU_MAIN_VOLUME_MAX_DB=0
+# Start each source at the CamillaDSP and MOTU levels it last played at
+# (per speaker).  0 carries the volume over between sources instead.
+SOURCE_VOLUME_MEMORY=1
 AIRPLAY_VOLUME_MIN_DB=-50
 AIRPLAY_VOLUME_MAX_DB=0
 # Comma-separated LMS player names to stop when AirPlay or Spotify starts.
@@ -255,7 +258,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py web_ui.py; do
+  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -329,6 +332,7 @@ ensure_audio_state_storage() {
   for lock in \
     "$STATE_DIR/audio-eq.json.lock" \
     "$STATE_DIR/audio-control.lock" \
+    "$STATE_DIR/source-volume.json.lock" \
     "$STATE_DIR/speaker-selection.json.lock"; do
     if [[ ! -e "$lock" ]]; then
       sudo -u "$INSTALL_USER" touch "$lock"
@@ -715,6 +719,16 @@ refresh_installed_units() {
   fi
 }
 
+run_diagnose() {
+  if [[ ! -x "$VENV_DIR/bin/python3" || ! -f "$SCRIPTS_DIR/diagnose.py" ]]; then
+    echo "The health check needs the installed utilities: choose option 1 or 2 first."
+    return 0
+  fi
+  echo ""
+  # Read-only; a failed check sets the exit status, which the menu ignores.
+  "$VENV_DIR/bin/python3" "$SCRIPTS_DIR/diagnose.py" || true
+}
+
 show_status() {
   echo ""
   echo "============================================="
@@ -945,6 +959,7 @@ CamillaDSP Utilities - Choose an Option
 9)  Install ISO 226 Loudness Engine
 10) Uninstall All Utilities
 11) Install Web Control UI (optional)
+12) Run Health Check (diagnose)
 0)  Exit
 Options 5, 8 and 11 also install option 4 when it is missing: the Source
 Switcher is the only thing that applies tone/EQ and speaker changes.
@@ -970,6 +985,7 @@ main() {
       9) prepare_install; install_iso226_engine ;;
       10) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
       11) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
+      12) run_diagnose ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac

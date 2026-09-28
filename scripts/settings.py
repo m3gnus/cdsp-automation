@@ -39,6 +39,8 @@ AUDIO_EQ_BACKUP_DIR = STATE_DIR / "audio-eq-backups"
 SPEAKER_SELECTION_PATH = STATE_DIR / "speaker-selection.json"
 SPEAKER_AUDIO_DIR = STATE_DIR / "speaker-audio"
 SPEAKER_GENERATED_DIR = STATE_DIR / "generated-configs"
+# The level each speaker/source pair was last played at (source_volume.py).
+SOURCE_VOLUME_PATH = STATE_DIR / "source-volume.json"
 # Written by the ISO 226 engine installer once the engine it built is running.
 ISO226_CAPABILITY_PATH = STATE_DIR / "iso226-engine.json"
 
@@ -46,6 +48,8 @@ SITE_CONFIG_DIR = Path("/etc/cdsp-automation")
 SPEAKER_PROFILE_DIR = SITE_CONFIG_DIR / "speaker-profiles"
 SPEAKER_CATALOG_PATH = SITE_CONFIG_DIR / "speaker-catalog.json"
 SOURCE_BASE_DIR = SITE_CONFIG_DIR / "source-bases"
+# Optional: the HID remote's button map (remote_keymap.py).
+REMOTE_KEYMAP_PATH = SITE_CONFIG_DIR / "remote-keymap.json"
 
 SWITCHER_RUN_DIR = Path("/run/cdsp-source-switcher")
 AUDIO_EQ_STATUS_PATH = SWITCHER_RUN_DIR / "audio-eq-status.json"

@@ -57,10 +57,10 @@ index cbd4098..5173f01 100644
                          // A filter changed type, need to rebuild the pipeline
 diff --git a/src/filters/iso226.rs b/src/filters/iso226.rs
 new file mode 100644
-index 0000000..01a9863
+index 0000000..ab6ff84
 --- /dev/null
 +++ b/src/filters/iso226.rs
-@@ -0,0 +1,628 @@
+@@ -0,0 +1,687 @@
 +// CamillaDSP - A flexible tool for processing audio
 +// Copyright (C) 2026 Henrik Enquist
 +//
@@ -289,6 +289,9 @@ index 0000000..01a9863
 +    filters: Vec<biquad::Biquad>,
 +    /// Holds the old cascade's output while a changed chunk is crossfaded.
 +    scratch: Vec<PrcFmt>,
++    /// Set by a parameter change (a new reference level, say): the next chunk
++    /// is crossfaded to the redesigned cascade, exactly like a fader move.
++    redesign_pending: bool,
 +}
 +
 +impl Iso226 {
@@ -317,6 +320,7 @@ index 0000000..01a9863
 +            low_gain,
 +            filters,
 +            scratch: Vec::new(),
++            redesign_pending: false,
 +        }
 +    }
 +
@@ -348,6 +352,7 @@ index 0000000..01a9863
 +    fn update_and_crossfade(&mut self, volume: f32, waveform: &mut [PrcFmt]) -> Res<()> {
 +        let gains = cascade_gains(&self.conf, &self.solver, volume);
 +        self.current_volume = volume;
++        self.redesign_pending = false;
 +
 +        let mut saved = [(0.0 as PrcFmt, 0.0 as PrcFmt); NSHELF];
 +        for (state, filter) in saved.iter_mut().zip(self.filters.iter()) {
@@ -391,19 +396,20 @@ index 0000000..01a9863
 +
 +    fn process_waveform(&mut self, waveform: &mut [PrcFmt]) -> Res<()> {
 +        let volume = self.processing_params.current_volume(self.conf.fader());
-+        if (volume - self.current_volume).abs() >= VOLUME_EPSILON {
++        if self.redesign_pending || (volume - self.current_volume).abs() >= VOLUME_EPSILON {
 +            return self.update_and_crossfade(volume, waveform);
 +        }
 +        self.run_cascade(waveform)
 +    }
 +
++    /// A live parameter change (the source switcher moves `reference_level`
++    /// when the MOTU main output moves) is not applied on the spot: swapping
++    /// coefficients outright steps the output.  The next chunk crossfades to
++    /// the redesigned cascade instead.
 +    fn update_parameters(&mut self, filter: config::Filter) {
 +        if let config::Filter::Iso226 { parameters, .. } = filter {
 +            self.conf = parameters;
-+            let volume = self.processing_params.current_volume(self.conf.fader());
-+            self.current_volume = volume;
-+            let gains = cascade_gains(&self.conf, &self.solver, volume);
-+            self.apply_gains(gains);
++            self.redesign_pending = true;
 +        } else {
 +            panic!("Invalid config change!");
 +        }
@@ -665,6 +671,59 @@ index 0000000..01a9863
 +        assert!(
 +            step_at_change <= 2.0 * quiet_slew,
 +            "boundary step {step_at_change} vs natural slew {quiet_slew}"
++        );
++    }
++
++    /// A parameter change (a new reference level from a MOTU move) reaches the
++    /// output through the same crossfade as a fader move, and lands on exactly
++    /// the cascade a fresh filter with the new parameters would run.
++    #[test]
++    fn parameter_change_is_crossfaded() {
++        let rate = 48000;
++        let chunk = 1024;
++        let changed_at = 3;
++        let volume = -40.0;
++        let mut moved = conf();
++        moved.reference_level = -16.0; // the MOTU 6 dB above calibration
++        let omega = 2.0 * std::f64::consts::PI as PrcFmt * 40.0 / rate as PrcFmt;
++        let run = |change: bool| -> (Vec<PrcFmt>, Iso226) {
++            let params = Arc::new(ProcessingParameters::new(&[volume; 5], &[false; 5]));
++            let mut filter = Iso226::from_config("test", conf(), rate, params);
++            let mut output = Vec::new();
++            for index in 0..6 {
++                if index == changed_at && change {
++                    filter.update_parameters(config::Filter::Iso226 {
++                        description: None,
++                        parameters: moved.clone(),
++                    });
++                }
++                let mut block: Vec<PrcFmt> = (0..chunk)
++                    .map(|n| (omega * (index * chunk + n) as PrcFmt).sin())
++                    .collect();
++                filter.process_waveform(&mut block).unwrap();
++                output.extend_from_slice(&block);
++            }
++            (output, filter)
++        };
++        let (steady, _) = run(false);
++        let (changed, filter) = run(true);
++        let boundary = changed_at * chunk;
++        assert!(
++            (changed[boundary] - steady[boundary]).abs() < 1e-12,
++            "a parameter change stepped the output: {} vs {}", changed[boundary], steady[boundary]
++        );
++        let quiet_slew = (boundary - chunk + 1..boundary)
++            .map(|n| (steady[n] - steady[n - 1]).abs())
++            .fold(0.0 as PrcFmt, PrcFmt::max);
++        assert!((changed[boundary] - changed[boundary - 1]).abs() <= 2.0 * quiet_slew);
++        let fresh = cascade_gains(&moved, &build_solver(rate), volume);
++        assert!(!filter.redesign_pending);
++        for (got, want) in filter.gains.iter().zip(fresh.iter()) {
++            assert!((got - want).abs() < 1e-9, "settled on {got}, not {want}");
++        }
++        assert!(
++            (changed[boundary + chunk - 1] - steady[boundary + chunk - 1]).abs() > 1e-9,
++            "the new reference never took effect"
 +        );
 +    }
 +

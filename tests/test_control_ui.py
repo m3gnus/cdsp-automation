@@ -1500,7 +1500,193 @@ def test_camilla_volume_slider_stays_linear_to_match_the_airplay_mapping() -> No
 
 def test_installer_ships_the_motu_module_and_its_ceiling() -> None:
     installer = (Path(__file__).resolve().parents[1] / "install.sh").read_text()
-    assert "configure_shairport.py motu_volume.py web_ui.py" in installer
+    assert "configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py" in installer
     assert "\nMOTU_MAIN_VOLUME_MAX_DB=0\n" in installer
     assert "motu_access.py motu_volume.py" not in installer and "MOTU_ACCESS" not in installer
     assert "clock_sync.py source_switcher.py" not in installer
+
+
+# --------------------------------------------------------------------------
+# Per-source volume memory
+# --------------------------------------------------------------------------
+
+
+@contextmanager
+def _source_volume_site(tmp_path: Path, *, live: str | None = "streamer"):
+    import source_volume
+
+    status_path = tmp_path / "status.json"
+    status_path.write_text(
+        json.dumps({"applied": "kantarellen", "source": live, "ok": True})
+    )
+    with (
+        patch.object(web_ui, "SPEAKER_SELECTION_PATH", tmp_path / "selection.json"),
+        patch.object(web_ui, "SPEAKER_STATUS_PATH", status_path),
+    ):
+        yield source_volume
+
+
+def test_source_volume_edit_sets_and_forgets_a_source_that_is_not_playing(
+    tmp_path: Path,
+) -> None:
+    with _source_volume_site(tmp_path) as source_volume:
+        speaker = web_ui.current_speaker_selection()["selected"]
+        handler = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "toslink", "cdsp_db": -30, "motu_db": -8}).encode(),
+        )
+        handler.do_POST()
+        assert handler.status == HTTPStatus.OK
+        body = handler.response_body()["source_volume"]
+        assert body["live"] is None or body["live"] == "streamer"
+        assert body["sources"]["toslink"]["cdsp_db"] == -30.0
+        assert source_volume.remembered(speaker, "toslink") == {
+            "cdsp_db": -30.0,
+            "motu_db": -8.0,
+        }
+        forget = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "toslink", "forget": True}).encode(),
+        )
+        forget.do_POST()
+        assert forget.status == HTTPStatus.OK
+        assert source_volume.remembered(speaker, "toslink") == {}
+
+
+def test_source_volume_edit_refuses_the_playing_source_and_bad_input(
+    tmp_path: Path,
+) -> None:
+    with _source_volume_site(tmp_path, live="streamer") as source_volume:
+        speaker = web_ui.current_speaker_selection()["selected"]
+        (tmp_path / "status.json").write_text(
+            json.dumps({"applied": speaker, "source": "streamer", "ok": True})
+        )
+        live = _post(
+            "/api/source-volume",
+            body=json.dumps({"source": "streamer", "cdsp_db": -3}).encode(),
+        )
+        live.do_POST()
+        assert live.status == HTTPStatus.CONFLICT
+        assert source_volume.remembered(speaker, "streamer") == {}
+        for bad in (
+            {"source": "../x", "cdsp_db": -3},
+            {"source": "toslink"},
+            {"source": "toslink", "cdsp_db": float("nan")},
+            {"source": "toslink", "cdsp_db": True},
+        ):
+            handler = _post(
+                "/api/source-volume", body=json.dumps(bad).encode()
+            )
+            handler.do_POST()
+            assert handler.status == HTTPStatus.BAD_REQUEST, bad
+
+
+def test_health_check_endpoint_is_guarded_and_returns_every_check() -> None:
+    import diagnose
+
+    checks = [diagnose.Check("System", "Python", diagnose.OK, "3.11")]
+    with patch.dict(os.environ, {"INSTALLATION_UI_TOKEN": "s3cret-value"}):
+        refused = _post("/api/diagnose")
+        with patch.object(diagnose, "diagnose", return_value=checks) as run:
+            refused.do_POST()
+        assert refused.status == HTTPStatus.UNAUTHORIZED
+        run.assert_not_called()
+        handler = _post("/api/diagnose", token="s3cret-value")
+        with patch.object(diagnose, "diagnose", return_value=checks):
+            handler.do_POST()
+    assert handler.status == HTTPStatus.OK
+    assert handler.response_body()["checks"] == [
+        {"group": "System", "name": "Python", "status": "ok", "detail": "3.11"}
+    ]
+    assert 'id="runDiagnose"' in web_ui.HTML
+
+
+# --------------------------------------------------------------------------
+# Installable app and live updates
+# --------------------------------------------------------------------------
+
+
+class _DrivableGet(_DrivableHandler):
+    def __init__(self, path: str) -> None:
+        super().__init__(path, "Host: pi.local:8088\n\n", b"")
+        self.command = "GET"
+
+
+def test_manifest_and_icons_are_served_for_home_screen_install() -> None:
+    handler = _DrivableGet("/manifest.webmanifest")
+    handler.do_GET()
+    manifest = json.loads(handler.wfile.getvalue())
+    assert manifest["display"] == "standalone"
+    assert manifest["start_url"] == "/#home"
+    assert {icon["src"] for icon in manifest["icons"]} >= {"/icon-192.png", "/icon-512.png"}
+    for path, size in (("/icon-192.png", 192), ("/icon-512.png", 512), ("/apple-touch-icon.png", 180)):
+        icon = _DrivableGet(path)
+        icon.do_GET()
+        body = icon.wfile.getvalue()
+        assert icon.sent_headers["Content-Type"] == "image/png"
+        assert body[:8] == b"\x89PNG\r\n\x1a\n"
+        assert int.from_bytes(body[16:20], "big") == size
+    page = web_ui.HTML
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in page
+    assert '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' in page
+    assert 'data-tab="home"' in page and '<section id="home" class="active">' in page
+
+
+def test_live_stream_sends_changes_only_and_releases_its_slot() -> None:
+    snapshots = iter([{"v": 1}, {"v": 1}, {"v": 2}])
+
+    def snapshot():
+        try:
+            return next(snapshots)
+        except StopIteration:
+            raise BrokenPipeError("page closed") from None
+
+    handler = _DrivableGet("/api/events")
+    with (
+        patch.object(web_ui, "live_snapshot", side_effect=snapshot),
+        patch.object(web_ui.time, "sleep"),
+    ):
+        handler.do_GET()
+    text = handler.wfile.getvalue().decode()
+    assert handler.sent_headers["Content-Type"] == "text/event-stream"
+    assert text.count("data: ") == 2
+    assert 'data: {"v":1}' in text and 'data: {"v":2}' in text
+    assert web_ui._live_streams == 0
+
+
+def test_live_streams_are_capped() -> None:
+    with patch.object(web_ui, "_live_streams", web_ui.LIVE_MAX_STREAMS):
+        handler = _DrivableGet("/api/events")
+        with patch.object(web_ui, "live_snapshot") as snapshot:
+            handler.do_GET()
+        snapshot.assert_not_called()
+        assert handler.status == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_live_snapshot_is_shared_between_streams() -> None:
+    reads = []
+
+    def read():
+        reads.append(1)
+        return {"ok": True, "config_file": "/c/toslink.yml", "volume_db": -20.0}
+
+    with (
+        patch.object(web_ui, "_live_cache", None),
+        patch.object(web_ui, "_read_live_camilla", side_effect=read),
+        patch.object(web_ui, "current_volume_max", return_value=-3.0),
+        patch.object(web_ui, "read_source_override", return_value=None),
+        patch.object(web_ui, "_live_source", return_value="toslink"),
+        patch.object(web_ui.motu_volume, "read_status", return_value={"known": False}),
+    ):
+        first = web_ui.live_snapshot()
+        second = web_ui.live_snapshot()
+    assert first is second and len(reads) == 1
+    assert first["camilla"]["volume_max_db"] == -3.0
+    assert first["source"] == {"mode": "auto", "current": "toslink"}
+
+
+def test_page_falls_back_to_polling_without_the_stream() -> None:
+    page = web_ui.HTML
+    assert 'new EventSource("/api/events")' in page
+    assert "if (document.hidden || liveConnected) return;" in page
+    assert "if (document.hidden) stopLive(); else { startLive(); refresh(); }" in page
