@@ -15,8 +15,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import struct
 import urllib.parse
+import zlib
 from contextlib import contextmanager
+from functools import lru_cache
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -194,8 +197,16 @@ HTML = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>{{site}} — audio control</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <meta name="theme-color" content="#0b0c0e">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="{{site}}">
   <style>
     :root {
       color-scheme: dark;
@@ -303,6 +314,34 @@ HTML = r"""<!doctype html>
     .sv-grid .h { font: 10px/1.2 var(--mono); letter-spacing: 1.2px; text-transform: uppercase; color: var(--faint); }
     .sv-grid .num { width: 100%; }
     .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
+
+    /* ---------- home (phone remote) ---------- */
+    body { -webkit-tap-highlight-color: transparent; padding-bottom: env(safe-area-inset-bottom); }
+    header { padding-top: max(14px, env(safe-area-inset-top)); }
+    .home { max-width: 520px; margin: 0 auto; }
+    .home-now { text-align: center; margin-bottom: 18px; }
+    .home-source { font-size: clamp(30px, 9vw, 44px); font-weight: 800; letter-spacing: 1px; margin: 6px 0 12px; }
+    .home-vol { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; }
+    .big-btn {
+      appearance: none; border: 1px solid var(--line2); background: var(--raised); color: var(--ink);
+      height: 88px; border-radius: 22px; font-size: 44px; line-height: 1; cursor: pointer;
+      touch-action: manipulation; user-select: none; -webkit-user-select: none;
+    }
+    .big-btn:active { background: var(--line2); }
+    .home-level { text-align: center; min-width: 130px; }
+    .home-db { font: 800 clamp(40px, 12vw, 56px)/1 var(--mono); }
+    .home-db.muted { color: var(--warn); text-decoration: line-through; }
+    .home-mute { width: 100%; margin-top: 16px; height: 56px; font-size: 16px; }
+    .btn.home-mute.is-muted { background: rgba(244,196,81,0.14); border-color: var(--warn); color: var(--warn); }
+    .home-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-top: 8px; }
+    .home-sources .btn { height: 56px; font-size: 15px; }
+    .home-sources .btn.on { border-color: var(--cool); background: rgba(77,141,255,0.14); }
+    .home-sources .btn.live::after { content: " ●"; color: var(--ok); }
+    .home-motu { display: grid; grid-template-columns: 72px 1fr 72px; gap: 10px; align-items: center; text-align: center; margin-top: 8px; }
+    .home-motu .btn { height: 52px; font-size: 24px; }
+    .home-amps { width: 100%; margin-top: 26px; height: 52px; }
+    .home-hint { margin-top: 18px; text-align: center; }
+    @media (display-mode: standalone) { .home-hint { display: none; } }
 
     .diag-row { display: grid; grid-template-columns: 18px minmax(120px, 220px) 1fr; gap: 8px; align-items: baseline; padding: 3px 0; }
 
@@ -503,14 +542,44 @@ HTML = r"""<!doctype html>
     </header>
 
     <nav id="nav">
-      <button class="active" data-tab="dashboard">Dashboard</button>
+      <button class="active" data-tab="home">Home</button>
+      <button data-tab="dashboard">Dashboard</button>
       <button data-tab="audio">Audio</button>
       <button data-tab="services">Services</button>
       <button data-tab="logs">Logs</button>
     </nav>
 
     <main>
-      <section id="dashboard" class="active">
+      <section id="home" class="active">
+        <div class="home">
+          <div class="home-now">
+            <div class="cap">Now playing <span id="homeLive" class="badge">—</span></div>
+            <div class="home-source" id="homeSource">—</div>
+            <div class="meter silent" id="homeMeter"><i></i></div>
+          </div>
+          <div class="home-vol">
+            <button class="big-btn" data-home-vol="-1" aria-label="Volume down">−</button>
+            <div class="home-level">
+              <div class="home-db" id="homeVol">—</div>
+              <div class="sub2" id="homeVolSub">dB</div>
+            </div>
+            <button class="big-btn" data-home-vol="1" aria-label="Volume up">+</button>
+          </div>
+          <button class="btn home-mute" id="homeMute">Mute</button>
+          <div class="cap" style="margin-top:22px">Source</div>
+          <div class="home-sources" id="homeSources"></div>
+          <div class="cap" style="margin-top:22px">MOTU main output</div>
+          <div class="home-motu">
+            <button class="btn" data-home-motu="-1" aria-label="MOTU down">−</button>
+            <div class="val sm" id="homeMotu">—</div>
+            <button class="btn" data-home-motu="1" aria-label="MOTU up">+</button>
+          </div>
+          <button class="btn danger home-amps" id="homeAmps">Turn amps off</button>
+          <div class="sub2 home-hint">Tip: add this page to your home screen (Share → Add to Home Screen on iPhone, ⋮ → Add to Home screen on Android) to use it like an app.</div>
+        </div>
+      </section>
+
+      <section id="dashboard">
         <div class="shead"><span class="ix">01</span><h2>Now</h2><span class="rule"></span></div>
         <div class="grid hero" id="heroGrid"></div>
 
@@ -760,8 +829,8 @@ HTML = r"""<!doctype html>
         </div>
         <div class="tile">
           <div class="cap">Output</div>
-          <div class="val big">${vol}<span class="unit"> dB</span></div>
-          <div class="sub2">${c.muted ? '<span class="warn">muted</span>' : "unmuted"} · CamillaDSP <span class="${stCls}">${esc(state)}</span></div>
+          <div class="val big"><span id="heroVol">${vol}</span><span class="unit"> dB</span></div>
+          <div class="sub2"><span id="heroMute">${c.muted ? '<span class="warn">muted</span>' : "unmuted"}</span> · CamillaDSP <span class="${stCls}">${esc(state)}</span></div>
         </div>
         <div class="tile">
           <div class="cap">Active source</div>
@@ -777,6 +846,8 @@ HTML = r"""<!doctype html>
       const has = db != null && db > -200;
       const norm = has ? Math.max(0, Math.min(1, (db - lo) / (hi - lo))) : 0;
       signalTarget = norm;
+      const home = qs("#homeMeter");
+      if (home) { home.querySelector("i").style.width = (norm * 100).toFixed(1) + "%"; home.classList.toggle("silent", !has || norm < 0.02); }
       meter.querySelector("i").style.width = (norm * 100).toFixed(1) + "%";
       meter.classList.toggle("silent", !has || norm < 0.02);
       const badge = qs("#sigBadge");
@@ -1276,54 +1347,6 @@ HTML = r"""<!doctype html>
       }
     }
 
-    /* ---------------- per-source volume ---------------- */
-    const svDb = v => v == null ? "" : Number(v).toFixed(1);
-    function renderSourceVolume(data) {
-      const sv = data.source_volume || {};
-      const panel = qs("#sourceVolumePanel"), badge = qs("#svBadge");
-      if (!panel) return;
-      if (sv.error) {
-        badge.textContent = "error"; badge.className = "badge bad";
-        panel.innerHTML = `<div class="sub2 bad">${esc(sv.error)}</div>`;
-        return;
-      }
-      badge.textContent = sv.enabled ? "on" : "off";
-      badge.className = "badge " + (sv.enabled ? "ok" : "warn");
-      // Never rebuild under a field being typed into.
-      if (panel.contains(document.activeElement)) return;
-      const available = (data.source || {}).available || {};
-      const rows = Object.entries(sv.sources || {})
-        .filter(([key]) => available[key]?.exists || sv.live === key)
-        .map(([key, item]) => {
-          const live = sv.live === key;
-          const dis = live ? "disabled" : "";
-          const remembered = item.cdsp_db != null || item.motu_db != null;
-          return `<div>${esc(item.label)}</div>
-            <input class="num" type="number" step="0.5" min="-80" max="0" placeholder="—" value="${svDb(item.cdsp_db)}" data-sv-source="${esc(key)}" data-sv-key="cdsp_db" ${dis} aria-label="${esc(item.label)} CamillaDSP start level">
-            <input class="num" type="number" step="1" min="-100" max="0" placeholder="—" value="${item.motu_db == null ? "" : Number(item.motu_db).toFixed(0)}" data-sv-source="${esc(key)}" data-sv-key="motu_db" ${dis} aria-label="${esc(item.label)} MOTU start level">
-            ${live ? `<span class="live">● live</span>` : `<button class="btn sm ghost" data-sv-forget="${esc(key)}" ${remembered ? "" : "disabled"}>Forget</button>`}`;
-        });
-      panel.innerHTML = rows.length
-        ? `<div class="sv-grid"><div class="h">source</div><div class="h">Camilla dB</div><div class="h">MOTU dB</div><div></div>${rows.join("")}</div>`
-        : `<div class="sub2">No sources available.</div>`;
-      qsa("[data-sv-key]").forEach(i => i.addEventListener("change", e => {
-        const v = e.target.value.trim();
-        if (v === "") return;
-        editSourceVolume({ source: e.target.dataset.svSource, [e.target.dataset.svKey]: Number(v) });
-      }));
-      qsa("[data-sv-forget]").forEach(b => b.addEventListener("click", () => editSourceVolume({ source: b.dataset.svForget, forget: true })));
-      qs("#sourceVolumeCaption").innerHTML = sv.enabled
-        ? `Each source starts at the level it last played at (speaker <b>${esc(sv.speaker)}</b>). Set a level for a source that is not playing to choose where it starts; ceilings still apply.`
-        : `Off: SOURCE_VOLUME_MEMORY is disabled in the env file, so the volume carries over between sources.`;
-    }
-    async function editSourceVolume(payload) {
-      try {
-        const d = await api("/api/source-volume", { method: "POST", body: JSON.stringify(payload) });
-        document.activeElement?.blur?.();
-        renderSourceVolume({ source_volume: d.source_volume, source: lastStatus?.source });
-      } catch (e) { toast(e.message); }
-    }
-
     /* ---------------- actions ---------------- */
     async function setVolume(payload) { try { await api("/api/camilla/volume", { method: "POST", body: JSON.stringify(payload) }); await load(); } catch (e) { toast(e.message); } }
     function currentVolumeInput() { return Number(qs("#volNum").value); }
@@ -1377,6 +1400,158 @@ HTML = r"""<!doctype html>
       catch (e) { qs("#logBox").textContent = e.message; }
     }
 
+    /* ---------------- per-source volume ---------------- */
+    const svDb = v => v == null ? "" : Number(v).toFixed(1);
+    function renderSourceVolume(data) {
+      const sv = data.source_volume || {};
+      const panel = qs("#sourceVolumePanel"), badge = qs("#svBadge");
+      if (!panel) return;
+      if (sv.error) {
+        badge.textContent = "error"; badge.className = "badge bad";
+        panel.innerHTML = `<div class="sub2 bad">${esc(sv.error)}</div>`;
+        return;
+      }
+      badge.textContent = sv.enabled ? "on" : "off";
+      badge.className = "badge " + (sv.enabled ? "ok" : "warn");
+      // Never rebuild under a field being typed into.
+      if (panel.contains(document.activeElement)) return;
+      const available = (data.source || {}).available || {};
+      const rows = Object.entries(sv.sources || {})
+        .filter(([key]) => available[key]?.exists || sv.live === key)
+        .map(([key, item]) => {
+          const live = sv.live === key;
+          const dis = live ? "disabled" : "";
+          const remembered = item.cdsp_db != null || item.motu_db != null;
+          return `<div>${esc(item.label)}</div>
+            <input class="num" type="number" step="0.5" min="-80" max="0" placeholder="—" value="${svDb(item.cdsp_db)}" data-sv-source="${esc(key)}" data-sv-key="cdsp_db" ${dis} aria-label="${esc(item.label)} CamillaDSP start level">
+            <input class="num" type="number" step="1" min="-100" max="0" placeholder="—" value="${item.motu_db == null ? "" : Number(item.motu_db).toFixed(0)}" data-sv-source="${esc(key)}" data-sv-key="motu_db" ${dis} aria-label="${esc(item.label)} MOTU start level">
+            ${live ? `<span class="live">● live</span>` : `<button class="btn sm ghost" data-sv-forget="${esc(key)}" ${remembered ? "" : "disabled"}>Forget</button>`}`;
+        });
+      panel.innerHTML = rows.length
+        ? `<div class="sv-grid"><div class="h">source</div><div class="h">Camilla dB</div><div class="h">MOTU dB</div><div></div>${rows.join("")}</div>`
+        : `<div class="sub2">No sources available.</div>`;
+      qsa("[data-sv-key]").forEach(i => i.addEventListener("change", e => {
+        const v = e.target.value.trim();
+        if (v === "") return;
+        editSourceVolume({ source: e.target.dataset.svSource, [e.target.dataset.svKey]: Number(v) });
+      }));
+      qsa("[data-sv-forget]").forEach(b => b.addEventListener("click", () => editSourceVolume({ source: b.dataset.svForget, forget: true })));
+      qs("#sourceVolumeCaption").innerHTML = sv.enabled
+        ? `Each source starts at the level it last played at (speaker <b>${esc(sv.speaker)}</b>). Set a level for a source that is not playing to choose where it starts; ceilings still apply.`
+        : `Off: SOURCE_VOLUME_MEMORY is disabled in the env file, so the volume carries over between sources.`;
+    }
+    async function editSourceVolume(payload) {
+      try {
+        const d = await api("/api/source-volume", { method: "POST", body: JSON.stringify(payload) });
+        document.activeElement?.blur?.();
+        renderSourceVolume({ source_volume: d.source_volume, source: lastStatus?.source });
+      } catch (e) { toast(e.message); }
+    }
+
+    /* ---------------- live updates (Server-Sent Events) ---------------- */
+    let live = null, liveSource = null, liveConnected = false;
+    function applyLive(d) {
+      live = d;
+      const c = d.camilla || {};
+      updateSignal(c.ok ? c.signal_db : null);
+      if (c.ok) {
+        const hv = qs("#heroVol"); if (hv) hv.textContent = Number(c.volume_db).toFixed(1);
+        const hm = qs("#heroMute"); if (hm) hm.innerHTML = c.muted ? '<span class="warn">muted</span>' : "unmuted";
+        const focus = document.activeElement;
+        if (qs("#volRange") && focus !== qs("#volRange") && focus !== qs("#volNum")) {
+          qs("#volRange").value = c.volume_db; qs("#volNum").value = Number(c.volume_db).toFixed(1);
+        }
+        if (qs("#muteToggle") && focus !== qs("#muteToggle")) qs("#muteToggle").checked = !!c.muted;
+      }
+      if (d.motu && motuTarget == null && !motuBusy) {
+        const changed = !motu || motu.known !== d.motu.known || motu.volume_db !== d.motu.volume_db || motu.confirmed !== d.motu.confirmed || motu.writable !== d.motu.writable;
+        motu = d.motu;
+        if (changed) renderMotu();
+      }
+      if (d.source && liveSource !== JSON.stringify(d.source)) {
+        liveSource = JSON.stringify(d.source);
+        if (lastStatus) { lastStatus.source = Object.assign({}, lastStatus.source, d.source); renderSource(lastStatus); }
+      }
+      renderHome();
+    }
+    let liveStream = null;
+    function startLive() {
+      if (!window.EventSource || liveStream) return;
+      liveStream = new EventSource("/api/events");
+      liveStream.onmessage = e => { liveConnected = true; try { applyLive(JSON.parse(e.data)); } catch (err) { /* keep last */ } };
+      liveStream.onerror = () => { liveConnected = false; };
+    }
+    function stopLive() { if (liveStream) { liveStream.close(); liveStream = null; } liveConnected = false; }
+
+    /* ---------------- home (phone remote) ---------------- */
+    const titleCase = v => v ? v[0].toUpperCase() + v.slice(1) : "—";
+    function renderHome() {
+      const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+      const src = Object.assign({}, lastStatus?.source || {}, live?.source || {});
+      const available = src.available || {};
+      qs("#homeSource").textContent = SOURCE_LABELS[src.current] || titleCase(src.current);
+      const badge = qs("#homeLive");
+      badge.textContent = src.mode && src.mode !== "auto" ? "manual" : "auto";
+      badge.className = "badge " + (src.mode && src.mode !== "auto" ? "warn" : "ok");
+      const vol = c.volume_db != null ? Number(c.volume_db) : null;
+      const homeVol = qs("#homeVol");
+      homeVol.textContent = vol == null ? "—" : vol.toFixed(1);
+      homeVol.classList.toggle("muted", !!c.muted);
+      qs("#homeVolSub").textContent = c.volume_max_db != null ? `dB · max ${Number(c.volume_max_db).toFixed(0)}` : "dB";
+      const mute = qs("#homeMute");
+      mute.textContent = c.muted ? "Muted · tap to unmute" : "Mute";
+      mute.classList.toggle("is-muted", !!c.muted);
+      const chips = [`<button class="btn ${!src.mode || src.mode === "auto" ? "on" : ""}" data-home-source="auto">Auto</button>`];
+      for (const [key, item] of Object.entries(available)) {
+        if (!item.exists) continue;
+        chips.push(`<button class="btn ${src.mode === key ? "on" : ""} ${src.current === key ? "live" : ""}" data-home-source="${esc(key)}">${esc(item.label)}</button>`);
+      }
+      const html = chips.join("");
+      if (qs("#homeSources").innerHTML !== html) {
+        qs("#homeSources").innerHTML = html;
+        qsa("[data-home-source]").forEach(b => b.addEventListener("click", homeSource));
+      }
+      const known = !!(motu && motu.known);
+      qs("#homeMotu").innerHTML = known ? `${motuDb(motuTarget ?? motu.volume_db)}<span class="unit"> dB</span>` : '<span class="faint">unknown</span>';
+      qsa("[data-home-motu]").forEach(b => { b.disabled = !(known && motu.writable); });
+    }
+    const SOURCE_LABELS = { streamer: "Streamer", gadget: "USB Gadget", toslink: "TOSLINK", analog: "Analog" };
+    async function homeSource(e) {
+      const btn = e.currentTarget; btn.disabled = true;
+      try { await api("/api/source", { method: "POST", body: JSON.stringify({ source: btn.dataset.homeSource }) }); await load(); }
+      catch (err) { toast(err.message); } finally { btn.disabled = false; }
+    }
+    /* Press and hold repeats, like the remote's volume keys. */
+    function holdRepeat(button, action) {
+      let timer = null, first = null;
+      const stop = () => { clearTimeout(first); clearInterval(timer); first = timer = null; };
+      button.addEventListener("pointerdown", e => {
+        e.preventDefault(); stop(); action();
+        first = setTimeout(() => { timer = setInterval(action, 180); }, 450);
+      });
+      ["pointerup", "pointerleave", "pointercancel"].forEach(ev => button.addEventListener(ev, stop));
+      button.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); action(); } });
+    }
+    let homeVolumeBusy = false, homeVolumePending = 0;
+    async function homeVolume(step) {
+      homeVolumePending += step;
+      if (homeVolumeBusy) return;
+      homeVolumeBusy = true;
+      try {
+        while (homeVolumePending !== 0) {
+          const delta = homeVolumePending; homeVolumePending = 0;
+          const d = await api("/api/camilla/volume", { method: "POST", body: JSON.stringify({ delta_db: delta }) });
+          const cam = d.camilla || {};
+          if (cam.volume_db != null) {
+            if (live && live.camilla) Object.assign(live.camilla, { volume_db: cam.volume_db, muted: cam.muted });
+            else if (lastStatus) lastStatus.camilla = Object.assign({}, lastStatus.camilla, cam);
+            renderHome();
+          }
+        }
+      } catch (err) { homeVolumePending = 0; toast(err.message); }
+      finally { homeVolumeBusy = false; }
+    }
+
     /* ---------------- loop ---------------- */
     async function load() {
       const data = await api("/api/status");
@@ -1390,13 +1565,14 @@ HTML = r"""<!doctype html>
       renderVolume(data);
       lastStatus = data;
       renderSourceVolume(data);
+      renderHome();
       if (Number(data.camilla?.sample_rate)>0) eqSampleRate=Number(data.camilla.sample_rate);
       if (data.speaker) { speakerState=data.speaker; renderSpeakerProfiles(); }
       renderSystem(data);
     }
 
     async function pollLevels() {
-      if (document.hidden) return;
+      if (document.hidden || liveConnected) return;
       try { const d = await api("/api/levels"); updateSignal(d.signal_db); }
       catch (e) { /* keep last */ }
     }
@@ -1459,10 +1635,24 @@ HTML = r"""<!doctype html>
     setInterval(() => { if (motuTarget != null) renderMotuCaption(); }, 1000);
     // A backgrounded phone must not keep the Pi spawning a status sweep every
     // 5s; refresh immediately instead when the page becomes visible again.
+    // With the live stream connected the full sweep only has to catch what the
+    // stream does not carry (services, speaker, availability): every 20 s.
+    let refreshTick = 0;
     const refresh = () => { if (!document.hidden) load().catch(() => {}); };
-    setInterval(refresh, 5000);
-    document.addEventListener("visibilitychange", refresh);
+    setInterval(() => { refreshTick++; if (!liveConnected || refreshTick % 4 === 0) refresh(); }, 5000);
+    document.addEventListener("visibilitychange", () => { if (document.hidden) stopLive(); else { startLive(); refresh(); } });
     setInterval(pollLevels, 800);
+    startLive();
+    qsa("[data-home-vol]").forEach(b => holdRepeat(b, () => homeVolume(Number(b.dataset.homeVol))));
+    qsa("[data-home-motu]").forEach(b => holdRepeat(b, () => {
+      if (motu && motu.known && motu.writable) motuSetTarget((motuTarget ?? motu.volume_db) + MOTU_STEP_DB * Number(b.dataset.homeMotu), "nudge");
+      renderHome();
+    }));
+    qs("#homeMute").addEventListener("click", () => {
+      const c = (live && live.camilla && live.camilla.ok) ? live.camilla : (lastStatus?.camilla || {});
+      setVolume({ muted: !c.muted });
+    });
+    qs("#homeAmps").addEventListener("click", ampsOff);
   </script>
 </body>
 </html>
@@ -1710,6 +1900,203 @@ def camilla_levels() -> dict[str, Any]:
             return {"ok": False, "signal_db": None}
 
     return {"ok": True, "signal_db": max(finite) if finite else None}
+
+
+# ---- live state for the page's event stream (/api/events) ----
+# Every open page reads one shared snapshot, refreshed at most this often, on
+# the persistent read-only client above: cheap reads only (levels, volume,
+# mute, state, file path), never the full status sweep.
+LIVE_INTERVAL_SECONDS = 0.5
+# Each stream holds a handler thread; a few phones and a laptop is the use.
+LIVE_MAX_STREAMS = 8
+LIVE_KEEPALIVE_SECONDS = 15.0
+# A stream ends after this long; EventSource reconnects by itself, so a
+# forgotten tab cannot hold a thread for ever.
+LIVE_STREAM_SECONDS = 1800.0
+_live_lock = threading.Lock()
+_live_cache: tuple[float, dict[str, Any]] | None = None
+_live_identity: tuple[str | None, str | None] = (None, None)
+_live_streams = 0
+_live_streams_lock = threading.Lock()
+
+
+def _strongest_level(levels: Any) -> float | None:
+    finite = []
+    for level in levels:
+        if level is None:
+            continue
+        numeric = float(level)
+        if math.isfinite(numeric) and numeric > -999.0:
+            finite.append(numeric)
+    return max(finite) if finite else None
+
+
+def _read_live_camilla() -> dict[str, Any]:
+    global _levels_client
+    with _levels_lock:
+        try:
+            if _levels_client is None:
+                from camilladsp import CamillaClient
+
+                client = CamillaClient(CAMILLA_HOST, CAMILLA_PORT)
+                client.connect()
+                _levels_client = client
+            client = _levels_client
+            return {
+                "ok": True,
+                "state": str(client.general.state()).replace("ProcessingState.", ""),
+                "config_file": client.config.file_path(),
+                "volume_db": client.volume.main_volume(),
+                "muted": client.volume.main_mute(),
+                "signal_db": _strongest_level(client.levels.playback_rms()),
+            }
+        except Exception:
+            try:
+                if _levels_client is not None:
+                    _levels_client.disconnect()
+            except Exception:
+                pass
+            _levels_client = None
+            return {"ok": False}
+
+
+def _live_source(config_file: Any) -> str | None:
+    """The playing source, recomputed only when the config path changes."""
+    global _live_identity
+    path = config_file if isinstance(config_file, str) else None
+    if _live_identity[0] != path:
+        current = None
+        if path:
+            try:
+                identity = managed_config_identity(path)
+                current = identity[0] if identity is not None else Path(path).stem
+            except Exception:
+                current = Path(path).stem
+        _live_identity = (path, current)
+    return _live_identity[1]
+
+
+def live_snapshot() -> dict[str, Any]:
+    """What changes second to second: level, volume, mute, source, MOTU."""
+    global _live_cache
+    with _live_lock:
+        now = time.monotonic()
+        if _live_cache is not None and now - _live_cache[0] < LIVE_INTERVAL_SECONDS * 0.8:
+            return _live_cache[1]
+        camilla = _read_live_camilla()
+        if camilla.get("ok"):
+            try:
+                camilla["volume_max_db"] = current_volume_max()
+            except Exception:
+                camilla["volume_max_db"] = None
+        snapshot = {
+            "camilla": camilla,
+            "source": {
+                "mode": read_source_override() or "auto",
+                "current": _live_source(camilla.get("config_file")),
+            },
+            "motu": motu_volume.read_status(),
+        }
+        _live_cache = (now, snapshot)
+        return snapshot
+
+
+def _claim_live_stream() -> bool:
+    global _live_streams
+    with _live_streams_lock:
+        if _live_streams >= LIVE_MAX_STREAMS:
+            return False
+        _live_streams += 1
+        return True
+
+
+def _release_live_stream() -> None:
+    global _live_streams
+    with _live_streams_lock:
+        _live_streams = max(0, _live_streams - 1)
+
+
+# ---- installable web app: manifest and icons ----
+THEME_COLOR = "#0b0c0e"
+ICON_BARS = (0.34, 0.62, 0.9, 0.7, 0.46)
+ICON_COOL = (0x4D, 0x8D, 0xFF)
+ICON_WARM = (0xFF, 0x9A, 0x45)
+
+
+def manifest() -> dict[str, Any]:
+    return {
+        "name": f"{SITE_NAME} audio control",
+        "short_name": SITE_NAME,
+        "start_url": "/#home",
+        "scope": "/",
+        "display": "standalone",
+        "background_color": THEME_COLOR,
+        "theme_color": THEME_COLOR,
+        "icons": [
+            {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable"},
+            {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml"},
+        ],
+    }
+
+
+def _icon_bars(size: int) -> list[tuple[int, int, int, int, tuple[int, int, int]]]:
+    """(x0, x1, y0, y1, colour) per bar, inside the maskable safe zone."""
+    safe = size * 0.6  # the maskable icon's guaranteed-visible circle, roughly
+    left = (size - safe) / 2
+    slot = safe / len(ICON_BARS)
+    bars = []
+    for index, height in enumerate(ICON_BARS):
+        mix = index / (len(ICON_BARS) - 1)
+        colour = tuple(round(c + (w - c) * mix) for c, w in zip(ICON_COOL, ICON_WARM))
+        x0 = round(left + slot * index + slot * 0.18)
+        x1 = round(left + slot * (index + 1) - slot * 0.18)
+        bar = safe * height
+        y1 = round(size / 2 + safe / 2)
+        bars.append((x0, x1, round(y1 - bar), y1, colour))
+    return bars
+
+
+@lru_cache(maxsize=4)
+def icon_png(size: int) -> bytes:
+    """The app icon as a PNG, drawn here so the UI stays one stdlib file."""
+    background = bytes(int(THEME_COLOR[i : i + 2], 16) for i in (1, 3, 5))
+    bars = _icon_bars(size)
+    rows = []
+    for y in range(size):
+        row = bytearray(background * size)
+        for x0, x1, y0, y1, colour in bars:
+            if y0 <= y < y1:
+                row[x0 * 3 : x1 * 3] = bytes(colour) * (x1 - x0)
+        rows.append(b"\x00" + bytes(row))
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + kind
+            + data
+            + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"".join(rows), 9))
+        + chunk(b"IEND", b"")
+    )
+
+
+def icon_svg() -> str:
+    size = 512
+    rects = "".join(
+        f'<rect x="{x0}" y="{y0}" width="{x1 - x0}" height="{y1 - y0}" rx="10" '
+        f'fill="rgb({c[0]},{c[1]},{c[2]})"/>'
+        for x0, x1, y0, y1, c in _icon_bars(size)
+    )
+    return (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}">'
+        f'<rect width="{size}" height="{size}" rx="96" fill="{THEME_COLOR}"/>{rects}</svg>'
+    )
 
 
 def camilla_status() -> dict[str, Any]:
@@ -2442,6 +2829,55 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def send_body(self, body: bytes, content_type: str) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_live_events(self) -> None:
+        """Stream live_snapshot() as Server-Sent Events while the page is open.
+
+        A message goes out only when something changed; a comment line keeps
+        idle proxies from closing the stream.  The page falls back to polling
+        when the stream is refused or unavailable.
+        """
+        if not _claim_live_stream():
+            self.send_json(
+                {"ok": False, "error": "too many live streams"},
+                HTTPStatus.SERVICE_UNAVAILABLE,
+            )
+            return
+        try:
+            self.close_connection = True
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.write(b"retry: 3000\n\n")
+            self.wfile.flush()
+            started = last_write = time.monotonic()
+            last_body = None
+            while time.monotonic() - started < LIVE_STREAM_SECONDS:
+                body = json.dumps(live_snapshot(), separators=(",", ":"))
+                now = time.monotonic()
+                if body != last_body:
+                    self.wfile.write(f"data: {body}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_body, last_write = body, now
+                elif now - last_write >= LIVE_KEEPALIVE_SECONDS:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    last_write = now
+                time.sleep(LIVE_INTERVAL_SECONDS)
+        except OSError:
+            pass  # the page closed or went to sleep
+        finally:
+            _release_live_stream()
+
     def refuse(self, refusal: RequestRefused) -> None:
         """Answer a guard rejection without draining the unread body."""
         # The body was never read, so this connection cannot be reused: the
@@ -2477,6 +2913,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+            return
+
+        if parsed.path == "/manifest.webmanifest":
+            self.send_body(json.dumps(manifest()).encode("utf-8"), "application/manifest+json")
+            return
+
+        if parsed.path == "/icon.svg":
+            self.send_body(icon_svg().encode("utf-8"), "image/svg+xml")
+            return
+
+        icon_sizes = {"/icon-192.png": 192, "/icon-512.png": 512, "/apple-touch-icon.png": 180}
+        if parsed.path in icon_sizes:
+            self.send_body(icon_png(icon_sizes[parsed.path]), "image/png")
+            return
+
+        if parsed.path == "/api/events":
+            self.send_live_events()
             return
 
         if parsed.path == "/api/status":

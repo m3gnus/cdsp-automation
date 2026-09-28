@@ -448,6 +448,27 @@ The unit deliberately runs as root because the UI starts, stops and restarts
 services. Users who do not want a root web
 service simply skip this component — nothing else depends on it.
 
+### Home screen and live updates
+
+The page is installable as a home-screen app: `/manifest.webmanifest`
+(standalone, `start_url` `/#home`) and icons drawn by the server itself
+(`/icon.svg`, `/icon-192.png`, `/icon-512.png`, `/apple-touch-icon.png`, PNGs
+encoded with `zlib`, so the UI stays one stdlib file). There is no service
+worker: browsers only register one in a secure context, and the UI is plain
+HTTP on the LAN.
+
+`GET /api/events` is a Server-Sent Events stream of `live_snapshot()`: the
+CamillaDSP level, volume, mute, state, ceiling, the source and override mode,
+and the switcher's published MOTU status. All streams share one snapshot,
+refreshed at most every `LIVE_INTERVAL_SECONDS` (0.5 s) on the same
+persistent read-only CamillaDSP client as the level meter, and a message is
+sent only when it changed (a comment line every 15 s keeps idle connections
+open). At most `LIVE_MAX_STREAMS` (8) streams are served, each ends after 30
+minutes (EventSource reconnects by itself), and the page closes its stream
+while hidden. With the stream connected the page drops its 800 ms level poll
+and runs the full status sweep every 20 s instead of every 5 s. Like every
+GET it is ungated; it only reads.
+
 ### Request guards
 
 Two guards are unconditional, because they are safe whatever the

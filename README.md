@@ -585,6 +585,25 @@ logs.
 The UI edits persistent state only; the source switcher remains the sole
 writer of the live CamillaDSP configuration.
 
+### On your phone
+
+The page opens on **Home**: a phone-sized remote with the playing source, a
+level meter, big volume buttons (hold to repeat), mute, source buttons, the
+MOTU main output and the amps-off button. The Dashboard, Audio, Services and
+Logs tabs are unchanged.
+
+Add it to your home screen to use it like an app, with its own icon and no
+browser bars: on iPhone, open `http://<pi>:8088` in Safari, then Share → Add
+to Home Screen; on Android, Chrome's ⋮ menu → Add to Home screen. (Browsers
+only offer a full offline "install" over HTTPS; this LAN page is served over
+plain HTTP, so it is a home-screen shortcut that opens full screen, which is
+all a local controller needs.)
+
+Volume, mute, source, the MOTU level and the input meter update live while
+the page is open, over one lightweight event stream (`/api/events`); the page
+closes it when the phone sleeps or the tab is hidden, and falls back to
+polling on a browser without it.
+
 ### Security Model
 
 Because it starts, stops and restarts system services, the

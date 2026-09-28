@@ -1599,3 +1599,94 @@ def test_health_check_endpoint_is_guarded_and_returns_every_check() -> None:
         {"group": "System", "name": "Python", "status": "ok", "detail": "3.11"}
     ]
     assert 'id="runDiagnose"' in web_ui.HTML
+
+
+# --------------------------------------------------------------------------
+# Installable app and live updates
+# --------------------------------------------------------------------------
+
+
+class _DrivableGet(_DrivableHandler):
+    def __init__(self, path: str) -> None:
+        super().__init__(path, "Host: pi.local:8088\n\n", b"")
+        self.command = "GET"
+
+
+def test_manifest_and_icons_are_served_for_home_screen_install() -> None:
+    handler = _DrivableGet("/manifest.webmanifest")
+    handler.do_GET()
+    manifest = json.loads(handler.wfile.getvalue())
+    assert manifest["display"] == "standalone"
+    assert manifest["start_url"] == "/#home"
+    assert {icon["src"] for icon in manifest["icons"]} >= {"/icon-192.png", "/icon-512.png"}
+    for path, size in (("/icon-192.png", 192), ("/icon-512.png", 512), ("/apple-touch-icon.png", 180)):
+        icon = _DrivableGet(path)
+        icon.do_GET()
+        body = icon.wfile.getvalue()
+        assert icon.sent_headers["Content-Type"] == "image/png"
+        assert body[:8] == b"\x89PNG\r\n\x1a\n"
+        assert int.from_bytes(body[16:20], "big") == size
+    page = web_ui.HTML
+    assert '<link rel="manifest" href="/manifest.webmanifest">' in page
+    assert '<link rel="apple-touch-icon" href="/apple-touch-icon.png">' in page
+    assert 'data-tab="home"' in page and '<section id="home" class="active">' in page
+
+
+def test_live_stream_sends_changes_only_and_releases_its_slot() -> None:
+    snapshots = iter([{"v": 1}, {"v": 1}, {"v": 2}])
+
+    def snapshot():
+        try:
+            return next(snapshots)
+        except StopIteration:
+            raise BrokenPipeError("page closed") from None
+
+    handler = _DrivableGet("/api/events")
+    with (
+        patch.object(web_ui, "live_snapshot", side_effect=snapshot),
+        patch.object(web_ui.time, "sleep"),
+    ):
+        handler.do_GET()
+    text = handler.wfile.getvalue().decode()
+    assert handler.sent_headers["Content-Type"] == "text/event-stream"
+    assert text.count("data: ") == 2
+    assert 'data: {"v":1}' in text and 'data: {"v":2}' in text
+    assert web_ui._live_streams == 0
+
+
+def test_live_streams_are_capped() -> None:
+    with patch.object(web_ui, "_live_streams", web_ui.LIVE_MAX_STREAMS):
+        handler = _DrivableGet("/api/events")
+        with patch.object(web_ui, "live_snapshot") as snapshot:
+            handler.do_GET()
+        snapshot.assert_not_called()
+        assert handler.status == HTTPStatus.SERVICE_UNAVAILABLE
+
+
+def test_live_snapshot_is_shared_between_streams() -> None:
+    reads = []
+
+    def read():
+        reads.append(1)
+        return {"ok": True, "config_file": "/c/toslink.yml", "volume_db": -20.0}
+
+    with (
+        patch.object(web_ui, "_live_cache", None),
+        patch.object(web_ui, "_read_live_camilla", side_effect=read),
+        patch.object(web_ui, "current_volume_max", return_value=-3.0),
+        patch.object(web_ui, "read_source_override", return_value=None),
+        patch.object(web_ui, "_live_source", return_value="toslink"),
+        patch.object(web_ui.motu_volume, "read_status", return_value={"known": False}),
+    ):
+        first = web_ui.live_snapshot()
+        second = web_ui.live_snapshot()
+    assert first is second and len(reads) == 1
+    assert first["camilla"]["volume_max_db"] == -3.0
+    assert first["source"] == {"mode": "auto", "current": "toslink"}
+
+
+def test_page_falls_back_to_polling_without_the_stream() -> None:
+    page = web_ui.HTML
+    assert 'new EventSource("/api/events")' in page
+    assert "if (document.hidden || liveConnected) return;" in page
+    assert "if (document.hidden) stopLive(); else { startLive(); refresh(); }" in page
