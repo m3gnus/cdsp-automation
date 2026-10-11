@@ -689,7 +689,7 @@ MIT License — see [LICENSE](LICENSE). Third-party notices are in
 - [CamillaDSP](https://github.com/HEnquist/camilladsp) by HEnquist
 - [pycamilladsp](https://github.com/HEnquist/pycamilladsp) Python library
 - [RPi-CamillaDSP](https://github.com/mdsimon2/RPi-CamillaDSP) — RPi-focused CamillaDSP setup by mdsimon2
-- **meloman13**, whose [Display, remote and trigger power for CamillaDSP streamer and preamp](https://www.audiosciencereview.com/forum/index.php?threads/display-remote-and-trigger-power-for-camilladsp-streamer-and-preamp-alternative-to-mdsimon2%E2%80%99s-implementation.52818/) thread on Audio Science Review inspired the Trigger Control and Remote Control parts
+- **melomane13**, whose [Display, remote and trigger power for CamillaDSP streamer and preamp](https://www.audiosciencereview.com/forum/index.php?threads/display-remote-and-trigger-power-for-camilladsp-streamer-and-preamp-alternative-to-mdsimon2%E2%80%99s-implementation.52818/) thread on Audio Science Review inspired the Trigger Control and Remote Control parts
 
 ## Support
 
