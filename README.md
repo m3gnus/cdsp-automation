@@ -1,55 +1,26 @@
 # CamillaDSP Utilities for Raspberry Pi
 
-Automation utilities for CamillaDSP on Raspberry Pi: trigger control, seamless source switching with MOTU clock control, and Bluetooth remote control.
+A set of small background programs that make a Raspberry Pi running
+[CamillaDSP](https://github.com/HEnquist/camilladsp) behave like a finished
+hi-fi preamp: it picks the right input by itself, turns the amplifier on and
+off, takes a remote control, and keeps the volume in step with AirPlay and
+Spotify.
 
-## Prerequisites
+## What's included
 
-Before installing, ensure you have:
+| Part | What it does for you | Needs |
+|------|----------------------|-------|
+| [**Source Switcher**](#source-switcher) | Plays whichever source is active (streamer, USB, optical, analog) by loading the matching CamillaDSP config. Also sets the MOTU's clock and remembers a volume per source. **Most other parts depend on it.** | Your CamillaDSP configs; a MOTU UltraLite mk5 for optical/analog detection |
+| [**Trigger Control**](#trigger-control) | Switches your amplifier on when music starts and off after about 5 minutes of silence. | A 5V relay and an amp with a trigger input |
+| [**Remote Control**](#remote-control) | Volume, mute, bass, treble and more from a Bluetooth or USB remote. Buttons can be remapped. | Any remote that shows up as a keyboard |
+| [**AirPlay + Spotify Volume Sync**](#airplay--spotify-volume-sync) | The volume slider on your phone moves the CamillaDSP volume, and changes made elsewhere move the phone slider. | `shairport-sync` and/or `raspotify` |
+| [**ISO 226 Loudness**](#iso-226-loudness) | Adds bass and treble at low volume so music sounds balanced at every level. | Optional patched CamillaDSP build |
+| [**Web Control UI**](#web-control-ui) | A dashboard and phone remote in your browser: volume, sources, EQ, speakers, services and logs. | Optional; runs as root |
+| [**Health Check**](#health-check) | One command that checks everything and tells you what's wrong. | Nothing |
 
-**General Requirements:**
-- Raspberry Pi (any model) running Raspberry Pi OS
-- CamillaDSP installed and running
-- Python 3.10 or newer
+## Quick start
 
-**For the optional ISO 226 Loudness Engine:**
-- `camilladsp.service` must start `/usr/local/bin/camilladsp`, because the
-  engine replaces that exact binary. A CamillaDSP installed elsewhere is
-  detected before anything is compiled: Install All skips it with a note in the
-  run summary and installs everything else, while menu option 9 fails and
-  prints the reason.
-
-**For the optional Spotify Volume Sync:**
-- A `raspotify.service`. Without one the step is skipped with a note.
-- The receiver inherits raspotify's own output device. Set
-  `SPOTIFY_ALSA_DEVICE` in `~/camilladsp/cdsp-automation.env` (see `aplay -L`)
-  only to override it.
-
-**For Trigger Control:**
-- 5V relay module ([like this](https://www.aliexpress.com/item/1005007109343076.html))
-- Mono 3.5mm jack connector ([like this](https://www.aliexpress.com/item/32704200322.html))
-- Your amplifier must support trigger input (typically 3-12V)
-
-**For MOTU clock, meters and main volume (Source Switcher):**
-- MOTU UltraLite mk5 (or compatible MOTU interface)
-- MOTU accessible on your network
-
-**For Source Switcher:**
-- Three CamillaDSP config files with **specific naming**:
-  - `~/camilladsp/configs/toslink.yml` - For the optical input
-  - `~/camilladsp/configs/streamer.yml` - For AirPlay/network streaming
-  - `~/camilladsp/configs/gadget.yml` - For USB Gadget mode
-- Optional `~/camilladsp/configs/analog.yml` for manual or meter-based analog input
-- Clock ownership is derived from the managed source name, not sample rate:
-  TOSLINK selects optical; streamer, gadget, and analog select internal. Equal
-  sample rates across sources are therefore supported.
-
-**For Remote Control:**
-- Bluetooth or USB HID remote control ([like this](https://www.aliexpress.com/item/1005010182280772.html))
-- The installed persistent audio-EQ overlay (tone control uses its reserved low/high shelves)
-
-## Quick Start
-
-Download and run the installer:
+On the Raspberry Pi, run:
 
 ```bash
 wget https://raw.githubusercontent.com/m3gnus/cdsp-automation/main/install.sh -O install.sh
@@ -57,930 +28,661 @@ chmod +x install.sh
 ./install.sh
 ```
 
-**Notes:**
-- Run the installer on the Raspberry Pi where you want the utilities installed
-- The installer uses `sudo` where required, so you do not need to run the whole script as root
-- Choose option **1** to install all utilities at once, or install them
-  individually - but note that options 5, 8 and 11 also install the source
-  switcher, which they require for their volume ceiling and tone changes
+Then pick from the menu:
 
-## Health check
+1. **Install All Utilities** — everything except the web UI (recommended the first time)
+2. **Update Utilities** — get the latest scripts; your settings are kept
+3. **Install Trigger Control**
+4. **Install Source Switcher**
+5. **Install Remote Control**
+6. **Pair Bluetooth Remote**
+7. **Show Service Status**
+8. **Install AirPlay + Spotify Volume Sync**
+9. **Install ISO 226 Loudness Engine** — also rebuilds it
+10. **Uninstall All Utilities** — asks first; your configs and settings are kept
+11. **Install Web Control UI** — optional; asks first
+12. **Run Health Check**
 
-When something sounds wrong, after an OS upgrade, or before asking for help,
-run the health check: installer option **12**, the **Services** tab's "Run
-health check" button in the control UI, or directly:
+You don't need to run the installer as root; it uses `sudo` when it needs to.
+Options 5, 8 and 11 also install the Source Switcher if it is missing,
+because they don't work without it.
 
-```bash
-~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/diagnose.py          # add --json for a machine-readable report
-```
+**After installing**, create your CamillaDSP configs (see
+[Source Switcher](#source-switcher)) and put your own values in
+`~/camilladsp/cdsp-automation.env` (see [Settings](#settings)).
 
-It checks the Python version, free disk space and Raspberry Pi under-voltage /
-throttling, the env file, every service (including restart loops), the
-CamillaDSP connection and state, that every source config passes
-`camilladsp -c`, the speaker profile and its source bases, the last transition,
-that the shared audio-control lock is free and writable, the MOTU link (by ping
-and from what the switcher reports: it never connects to the MOTU itself, which
-would drop the switcher), the remote and its key map, and recent errors in the
-journal. It only reads, and exits 1 when any check failed.
+## Before you start
 
-## Audio control architecture
+- A Raspberry Pi running Raspberry Pi OS, with Python 3.10 or newer
+- CamillaDSP installed and running
+- Hardware for the parts you want: a relay for the trigger, a remote, a MOTU
+  UltraLite mk5 — listed under each part below
 
-The source switcher is the only writer of the active CamillaDSP configuration.
-It composes the selected speaker's persistent EQ/loudness overlay from
-`/var/lib/cdsp-automation/speaker-audio` into every source before that
-speaker's crossover. The default speaker keeps using the legacy
-`/var/lib/cdsp-automation/audio-eq.json` state path. The browser and HID
-remote resolve the selected profile for every edit, so Bass/Treble, user EQ,
-and loudness remain independent per speaker.
+## Can I install just one part?
 
-The selectable speakers ship as the maintainer's defaults. A site replaces
-the whole catalog without editing code by writing the JSON file at
-`/etc/cdsp-automation/speaker-catalog.json` (see
-`speaker-catalog.example.json`). The contract is one sentence: the
-`default` speaker is the one that plays through your existing full CamillaDSP
-configs (and keeps the legacy `audio-eq.json` state path); every other
-speaker is a managed profile — parametric YAML in the profile directory, or
-complete operator-owned CamillaDSP files mapped per source with
-`operator_configs`. An unreadable or invalid catalog logs a warning and
-keeps the built-ins.
-
-Speaker selection and source arbitration are orthogonal. The catalog's default
-speaker uses the existing full configs. Non-legacy profiles are strict YAML fragments in
-`/etc/cdsp-automation/speaker-profiles`; they are composed with capture-only YAML bases from
-`/etc/cdsp-automation/source-bases`, written to digest-addressed immutable files, checked with
-`camilladsp -c`, and reloaded transactionally. A profile is unavailable until
-all of its declared source bases exist and `enabled: true` is explicit.
-
-The output contract requires every physical output to be declared active or
-muted and the final pipeline step to be a safety/output mixer. A typical
-three-way topology is: stereo source processing → expansion mixer → per-output
-crossover/delay/gain filters → final 1:1 output mixer. Do not enable PartyMEH,
-Bird, or Measurement definitions until measured crossover, polarity, delay,
-gain, and channel routing values are known. Measurement must set both
-`raw_measurement: true` and `bypass_user_eq: true`. That contract rejects all
-source and profile filters/processors and every source pipeline step, leaving
-only the profile's explicit direct output mixer; its output level remains the
-operator's responsibility.
-The repository's `speaker-profile.example.yml` is deliberately disabled and
-fully muted; `source-base.example.yml` shows the capture-only boundary.
-
-All master-volume and mute writers share
-`/var/lib/cdsp-automation/audio-control.lock`. The
-source switcher holds that lock for a whole config switch: it mutes, reloads,
-checks that the engine runs the new file, re-applies the EQ overlay, and then
-puts back the listener's previous mute state. AirPlay, Spotify, the browser
-and the HID remote take the same lock around every volume or mute write, so a
-change made mid-switch simply waits until the switch is done. A switch that
-fails rolls back to the previous config and stays muted. At startup, and
-whenever it reconnects to CamillaDSP, the switcher mutes and re-applies the
-current config before restoring the mute state it found.
-`cdsp-source-switcher.service` is `PartOf=` `camilladsp.service`, so
-restarting the engine restarts the switcher too. (An engine that crashes and
-restarts by itself is caught when the switcher's websocket reconnects; until
-then a control could unmute it briefly.)
-
-The all-utilities install also:
-
-- builds the pinned CamillaDSP 4.1.3 ISO 226 patch, runs the full Rust library
-  suite plus deployed-config checks, and puts the previous engine back if
-  CamillaDSP does not restart on the new one. Once it runs, the installer writes
-  `/var/lib/cdsp-automation/iso226-engine.json`; while that receipt names the
-  Iso226 engine, the switcher and the control UI offer ISO 226 loudness;
-- installs a persistent network-volume daemon and a non-blocking Shairport
-  callback, backs up/validates its configuration, and restores the original
-  volume settings on uninstall;
-- builds a pinned librespot 0.8.0 receiver that keeps Spotify audio at unity,
-  routes Spotify Connect volume into CamillaDSP, and publishes CamillaDSP/Web
-  UI/HID changes back to the Spotify source slider. The installer verifies the
-  patched receiver and rolls back automatically if its service or command
-  socket is unhealthy.
-
-When a network receiver session starts, the bridge can also stop local
-LMS/Squeezelite streamer playback: set `AIRPLAY_INTERRUPTED_LMS_PLAYERS` to a
-comma-separated list of player names. It is strictly best-effort — an
-unreachable LMS never blocks AirPlay or Spotify — and unset (the default) the
-hand-off is disabled.
-
-ISO calibration: choose a comfortable reference master setting, play a 1 kHz
-sine at a known digital level, measure SPL at the listening position, enter that
-reading as the reference phon and then enable the engine. The tone matters —
-phon equals SPL only at 1 kHz, so an SPL reading taken on music or broadband
-noise will not give the right reference and a several-dB error here shifts the
-whole compensation curve. Reference phon is limited to 40–90 because ISO
-226:2003 defines the contours no higher (and only to 80 phon above 4 kHz, so
-81–90 already extrapolates the top of the curve). Amplifier gains remain
-calibration stages.
-
-**The MOTU main output is part of the calibration.** Enter the MOTU level you
-calibrated at under "MOTU main output at calibration" (or press "Use current
-levels" while both the fader and the MOTU are where you measured). From then on
-the compensation follows both: the engine takes the listening level as
-`reference phon + (fader − reference fader) + (MOTU − reference MOTU)`, so a
-TV source that plays with the MOTU at 0 dB instead of -6 dB, or the MOTU turned
-up for a party, gets exactly the correction its real loudness calls for. Leave
-the field empty to calibrate on the fader alone, as before. A MOTU change
-reaches the loudness curve within about a second (immediately on a source
-switch, before the sound comes back). An engine built from this repository's
-patch crossfades the curve to its new shape; an engine built before this
-change swaps it abruptly, which can click once per MOTU change, so rebuild it
-with installer option **9** (an ordinary update never rebuilds the engine).
-
-The implementation uses the established ISO 226:2003 coefficient model as a
-practical approximation to the 2023 revision. The published revision analysis
-places the maximum difference at 0.6 dB; the licensed 2023 Annex B data is not
-copied into this repository.
-
-The filter realises the correction as one broadband gain plus nine high shelves.
-The shelf gains are solved through a per-samplerate matrix rather than assigned
-band-to-band, which holds the realised response within 0.6 dB of the intended
-curve from 20 Hz to 12.5 kHz at every supported rate — the engine's Rust tests
-assert this, along with the invariant that boost never exceeds the attenuation
-the fader has already applied. Because coefficients can only change on chunk
-boundaries, a chunk whose gains changed is crossfaded from the old cascade to
-the new one; swapping outright measured about 30 dB more broadband splatter
-during volume ramps.
+- **Trigger Control** works entirely on its own.
+- **Source Switcher** works on its own.
+- **Remote Control**, **AirPlay + Spotify Volume Sync** and the **Web Control
+  UI** each require **Source Switcher**. It is the only program that applies tone,
+  EQ and speaker changes to CamillaDSP, and it tells the others how loud they
+  are allowed to go. Without it they would be stuck at a safe low volume and
+  their changes would never be heard. The installer adds it for you.
 
 ---
 
-## 🎮 Remote Control - Detailed Setup
-
-### What It Does
+## Source Switcher
 
-Control CamillaDSP from a Bluetooth or USB HID remote. Volume and mute drive the
-CamillaDSP Main fader; Bass and Treble update the shared persistent Audio overlay.
+### What it does
 
-### Hardware Requirements
+Watches all your inputs and loads the CamillaDSP config for whichever one is
+playing. It is also the only program that talks to the MOTU interface.
 
-Any Bluetooth or USB remote that registers as an HID keyboard device. Common options:
-- Bluetooth media remotes ([example](https://www.aliexpress.com/item/1005010182280772.html))
-- USB IR remotes
-- Bluetooth presentation clickers
-
-### Button Mapping
-
-| Button | Action |
-|--------|--------|
-| **VOLUME UP** | Increase volume by 1 dB (hold for continuous) |
-| **VOLUME DOWN** | Decrease volume by 1 dB (hold for continuous) |
-| **MUTE** | Toggle mute on/off |
-| **UP arrow** | Increase treble by 0.5 dB (max +6 dB) |
-| **DOWN arrow** | Decrease treble by 0.5 dB (min -6 dB) |
-| **RIGHT arrow** | Increase bass by 0.5 dB (max +6 dB) |
-| **LEFT arrow** | Decrease bass by 0.5 dB (min -6 dB) |
-| **ENTER** (short press) | Print current status to log |
-| **ENTER** (hold ~1 sec) | Reset bass and treble to 0 dB |
-| **POWER** (hold ~1 sec) | Restart all CamillaDSP services |
-| **POWER** (hold ~10 sec) | Shutdown the system |
-
-### Pairing a Bluetooth Remote
-
-Use the installer's built-in pairing option:
-
-```bash
-./install.sh
-# Choose option 6: Pair Bluetooth Remote
-```
-
-Or pair manually:
-
-```bash
-bluetoothctl power on
-bluetoothctl scan on
-# Wait for your remote to appear, note the MAC address
-bluetoothctl scan off
-bluetoothctl pair XX:XX:XX:XX:XX:XX
-bluetoothctl connect XX:XX:XX:XX:XX:XX
-bluetoothctl trust XX:XX:XX:XX:XX:XX
-```
+### What you need
 
-### Finding Your Remote's Device Name
+Create these config files with **exactly** these names:
 
-After pairing, find your remote's name:
+| File | Used for |
+|------|----------|
+| `~/camilladsp/configs/streamer.yml` | AirPlay / Spotify / Squeezelite (ALSA Loopback) |
+| `~/camilladsp/configs/gadget.yml` | A computer connected over USB (USB Gadget mode) |
+| `~/camilladsp/configs/toslink.yml` | The optical input on the MOTU |
+| `~/camilladsp/configs/analog.yml` | *Optional* analog input |
 
-```bash
-python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
-```
+The sources may all use the same sample rate. The switcher service won't start
+until these configs exist.
 
-Example output:
-```
-['HID Remote01 Keyboard', 'HID Remote01 Mouse', 'vc4-hdmi-0', 'pwr_button']
-```
+### Which source wins
 
-The installer will prompt you to enter this name during installation.
+1. **Your manual choice**, if you have pinned one (see below)
+2. **The source already playing** keeps playing
+3. **Streamer**
+4. **USB Gadget**
+5. **TOSLINK** (detected from the MOTU's input meters)
+6. **Analog** (only if you turn it on)
 
-### Configuration
+When nothing is playing, the current config stays loaded.
 
-User settings live in `~/camilladsp/cdsp-automation.env` and are preserved when you update the scripts. The remote reads:
+### Choosing a source by hand
 
-```text
-REMOTE_NAME=HID Remote01 Keyboard
-REMOTE_VOLUME_MIN=-80
-REMOTE_VOLUME_MAX=0
-```
+Write `toslink`, `streamer`, `gadget` or `analog` to
+`/run/cdsp-source-switcher/manual_source`. Write `auto`, empty the file or
+delete it to go back to automatic. The remote and the web UI can do this too.
 
-The tone range (±6 dB) is fixed in `cdsp_remote.py`; the steps, hold times and
-buttons come from the key map below.
+### Volume per source
 
-### Custom button mapping
+Each source starts at the volume it last played at, separately for each
+speaker. So the TV on TOSLINK comes back at TV volume and AirPlay comes back at
+AirPlay volume. The "Per-source volume" card in the web UI shows these levels
+and lets you change them. To turn this off, set `SOURCE_VOLUME_MEMORY=0` in the
+settings file.
 
-The table above is the built-in key map. To change it, or to give spare
-buttons a job, write `/etc/cdsp-automation/remote-keymap.json` (start from
-`remote-keymap.example.json` in this repository, or print the map in force)
-and restart the remote:
+### MOTU clock
 
-```bash
-~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
-sudo install -m 0644 remote-keymap.json /etc/cdsp-automation/remote-keymap.json
-sudo systemctl restart cdsp-remote
-```
+The MOTU must use the optical input as its clock for TOSLINK and its own
+internal clock for everything else. The switcher changes this for you, only
+while the output is muted, so you never hear the click. There is no separate
+MOTU service any more; an install or update removes the old
+`cdsp-motu-sync` service.
 
-**Finding your buttons' names.** Every remote sends different key names.
-Stop the service and let the remote tell you:
-
-```bash
-sudo systemctl stop cdsp-remote
-~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
-# press each button; Ctrl+C when done
-sudo systemctl start cdsp-remote
-```
-
-It prints lines like `KEY_HOMEPAGE  pressed  [HID Remote01 Keyboard] -> not mapped`.
-Only keys from the `REMOTE_NAME` device can be used; keys that arrive on a
-sibling device (for example "... Consumer Control") are marked unusable.
-
-Each key takes a `press` action (add `"repeat": true` to repeat while held), a
-`hold` (after `hold_seconds`, default 1 s) and a `long_hold` (after
-`long_hold_seconds`, default 10 s). Actions:
-
-| Action | Does |
-|--------|------|
-| `volume_up`, `volume_down`, `mute` | CamillaDSP Main fader (`volume_step_db`) |
-| `bass_up`, `bass_down`, `treble_up`, `treble_down`, `tone_reset` | Tone shelves (`tone_step_db`) |
-| `motu_volume_up`, `motu_volume_down` | MOTU main output (`motu_step_db`) |
-| `next_source` | Auto → each available source → Auto |
-| `source_auto`, `source_streamer`, `source_gadget`, `source_toslink`, `source_analog` | Pin a source, or go back to automatic |
-| `amps_off` | Same as the control UI's "Turn amps off now" |
-| `status` | Log the current state |
-| `restart_services`, `shutdown` | Hold / long hold only |
-
-Speaker-profile changes are deliberately not available on the remote: they
-need the matching passive speakers connected, which the control UI makes you
-confirm. An invalid key map is logged and the built-in map stays in force.
-
-`REMOTE_VOLUME_MAX` can only lower the ceiling. The real maximum comes from the
-speaker profile that is currently applied, so a profile capped at -20 dB stays
-capped at -20 dB on the remote, in the control UI, and over AirPlay/Spotify.
-
-### CamillaDSP Filter Ownership
-
-Do not add legacy filters named `Bass`, `Treble`, or `loudness` to source
-configs. The source switcher owns the persistent `cdsp_ui_eq_*` overlay and
-uses its reserved low/high shelves for remote tone control. It also removes
-legacy connected tone and loudness stages so they cannot stack with the GUI EQ
-or the optional ISO226 filter.
-
----
-
-## 🔌 Trigger Control - Detailed Setup
-
-### What It Does
-
-Automatically powers your amplifier on/off by sending the Pi's switched 5V signal into an amplifier trigger input.
-
-### Hardware Requirements
-
-1. **5V Relay Module** - [Example](https://www.aliexpress.com/item/1005007109343076.html)
-2. **Mono 3.5mm Jack** - [Example](https://www.aliexpress.com/item/32704200322.html)
-3. Jumper wires
-4. Amplifier with 12V trigger input
-
-### Wiring Instructions
-
-**What You Need:**
-- Raspberry Pi
-- 5V relay module (6 pins total)
-- Mono 3.5mm jack cable (to amplifier)
-
-**Connections:**
-
-**Step 1: Control Side of Relay** (powers the relay)
-1. **Pi 5V** (Pin 2 or 4) → **Relay DC+**
-2. **Pi Ground** (Pin 6, 9, 14, 20, 25, 30, 34, or 39) → **Relay DC-**
-3. **Pi GPIO 4** (Pin 7) → **Relay IN**
-
-**Step 2: Switch Side of Relay** (triggers the amp)
-4. **Pi 5V** (Pin 2 or 4) → **Relay COM**
-5. **Relay NO** → **Mono jack Tip**
-6. **Pi Ground** (any ground pin) → **Mono jack Sleeve**
-
-**Step 3: Leave Unused**
-7. **Relay NC** → nothing (leave empty)
-
-**Summary:**
-- **Pi 5V** connects to 2 places: DC+ and COM
-- **Pi Ground** connects to 2 places: DC- and jack sleeve
-- **Pi GPIO 4** connects to 1 place: IN
-- **Jack Tip** connects to 1 place: NO
-- **Jack Sleeve** connects to 1 place: Pi Ground
-- **NC terminal** stays empty
-
-**Done!** When the script activates GPIO 4, the relay switches on and sends 5V to your amp's trigger input.
-
-**3.5mm Jack to Amplifier:**
-- Connect the mono jack to your amplifier's trigger input
-
-### Configuration
-
-Set the GPIO pin in `~/camilladsp/cdsp-automation.env`:
-
-```text
-POWER_GPIO=4
-```
-
-The 320 s off delay, the 200 ms check interval and the -80 dB activity
-threshold are fixed in `trigger.py`.
-
-### How It Works
-
-- Detects music and turns relay ON (checks every 200ms)
-- Starts 320-second countdown when music stops
-- Only turns relay OFF if silence continues for full duration
-- Resets countdown if music resumes
-- Accepts `SIGUSR1` for an immediate manual OFF. If audio is still active it
-  stays off until silence is observed, then automatic triggering is re-armed
-  for the next audio session.
-
-**Why 320 seconds?** Long enough to handle gaps between tracks and quiet passages without constantly cycling your amplifier on/off.
-
----
-
-## 🎚️ MOTU Clock (in the Source Switcher)
-
-### What It Does
-
-The source switcher moves your MOTU audio interface's clock source with the
-active managed source. There is no separate MOTU service.
-
-### How It Works
-
-- The UltraLite serves one WebSocket client at a time, so the source switcher
-  is the only thing on the Pi that talks to it: its one connection carries the
-  TOSLINK/analog meters, the clock writes and the control UI's main volume
-- **TOSLINK** → switches to **optical** clock
-- **Streamer, USB gadget, or analog** → switches to **internal** clock
-- The MOTU pushes its whole state to every new connection and every change
-  afterwards, so the switcher always knows the clock it is on and never
-  rewrites a clock the device already reports (each write re-locks audibly)
-- Every write goes into silence: inside the muted source transition, before
-  the new config is loaded, the switcher waits for CamillaDSP's mute ramp and
-  output buffer to go quiet (confirmed on the playback meter), writes, lets
-  the interface re-lock, and reconnects to check the device took it. A
-  rolled-back transition puts the old clock back the same way
-- A write that failed or did not take, or a clock changed from CueMix 5, is
-  corrected later in its own brief muted step, never on live audio
-
-### Requirements
-
-- MOTU UltraLite mk5 (other MOTU models may need different parameter values)
-- MOTU must be accessible on your network
-- The active config must use a managed source name
-
-### Configuration
-
-To find the MOTU's IP address, push the UltraLite mk5's left front-panel knob
-to open the device info list; one entry is the IP address (a self-assigned
-`169.254.x.x`, usually `169.254.51.193` here). The UltraLite has no web
-interface: port 80 answers nothing, and all control goes over the binary
-WebSocket on port 1280 that CueMix 5 uses. Set it in
-`~/camilladsp/cdsp-automation.env`:
+To set it up, find the MOTU's IP address: push the left front-panel knob on
+the UltraLite mk5 and look for the IP in the info list (usually
+`169.254.x.x`). Put it in the settings file:
 
 ```text
 MOTU_WS_URL=ws://YOUR_MOTU_IP:1280
 ```
 
-Clock ownership is independent of sample rate. Sources may all run at 48 kHz;
-the config identity still selects the correct clock. The config's identity
-comes from the speaker catalog, so an operator config mapped to any filename
-(not only `<speaker>-<source>.yml`) still selects the right clock.
+Other MOTU models may use different values; see
+[Troubleshooting](#motu-clock-not-switching).
 
-The clock timings (1 s re-lock settle, silence confirmation at -100 dB, a 30 s
-gap between corrections) are fixed in `source_switcher.py`.
+### How it decides (details)
 
-Earlier releases ran a separate `cdsp-motu-sync` service; an install or update
-removes it.
+- It checks whether each input is connected and ready, then listens to the
+  actual audio level.
+- A source that has gone quiet keeps control for **60 seconds**, so a pause
+  between tracks doesn't make it switch away. A different source that is
+  clearly playing (for 2 seconds) can take over sooner.
+- TOSLINK and analog count as quiet after a few seconds of silent meters, so
+  turning off the TV lets another source take over quickly.
+- A source that looks connected but is silent (for example a paused AirPlay
+  session) is tried for 5 seconds. If it stays silent, the switcher waits
+  before trying it again: 30 seconds at first, growing to at most 15 minutes.
+  Real audio, a manual choice, or reconnecting the source resets this.
+- Every switch mutes first, loads and checks the new config, then unmutes. If
+  the new config fails, the old one is put back and the output stays muted.
 
+The timings are constants at the top of `scripts/source_switcher.py`.
 
 ---
 
-## 🔄 Source Switcher
+## Trigger Control
 
-### What It Does
+### What it does
 
-Automatically switches between CamillaDSP configs based on which audio source is playing.
+Turns your amplifier on when music starts and off after 320 seconds (about
+5 minutes) of silence. The long delay means pauses between tracks and quiet
+passages don't switch the amp off. You can also turn the amp off straight away
+from the remote or the web UI; it then stays off until the music has stopped
+and started again.
 
-**Priority order:**
-1. **Manual override** - optional pinned source selected by writing to the override file (`SOURCE_OVERRIDE_PATH`)
-2. **Current active source** - if the current source is still playing, it keeps control
-3. **Streamer** (AirPlay/network streaming) - first automatic choice when changing sources
-4. **USB Gadget** (direct USB connection)
-5. **TOSLINK** (optical input) - detected from MOTU input meters
-6. **Analog** (optional) - disabled by default; can be enabled for MOTU input meters
+### What you need
 
-When no automatic source is active, the switcher keeps the current config
-instead of forcing TOSLINK.
+- A 5V relay module ([example](https://www.aliexpress.com/item/1005007109343076.html))
+- A mono 3.5mm jack cable ([example](https://www.aliexpress.com/item/32704200322.html))
+- Jumper wires
+- An amplifier with a trigger input that accepts 5V (most accept 3–12V)
 
-**Per-source volume memory:** each source starts at the CamillaDSP and MOTU
-levels it last played at (per speaker), so the TV on TOSLINK comes back at the
-TV's level and AirPlay at AirPlay's. The profile and MOTU ceilings still
-apply. The dashboard's "Per-source volume" card shows the remembered levels
-and lets you set where a source that is not playing will start. Set
-`SOURCE_VOLUME_MEMORY=0` in `~/camilladsp/cdsp-automation.env` to turn it off.
+### Wiring
 
-### Critical Configuration Requirements
+| From | To |
+|------|----|
+| Pi 5V (pin 2 or 4) | Relay **DC+** |
+| Pi ground (e.g. pin 6) | Relay **DC−** |
+| Pi GPIO 4 (pin 7) | Relay **IN** |
+| Pi 5V (pin 2 or 4) | Relay **COM** |
+| Relay **NO** | Jack **tip** |
+| Pi ground (any ground pin) | Jack **sleeve** |
+| Relay **NC** | *nothing* |
 
-**You MUST create three config files with exact names:**
+Plug the jack into the amp's trigger input. When the script switches GPIO 4
+on, the relay closes and sends 5V to the amp.
 
-1. **`~/camilladsp/configs/toslink.yml`**
-   - Configure for optical input
-   - Use the rate required by the source and DSP graph
+### Settings
 
-2. **`~/camilladsp/configs/streamer.yml`**
-   - Configure for ALSA Loopback (from Squeezelite/AirPlay)
-   - May use the same sample rate as TOSLINK
+To use a different GPIO pin, change `POWER_GPIO=4` in the settings file. The
+320-second delay and the −80 dB "is music playing" threshold are constants in
+`scripts/trigger.py`.
 
-3. **`~/camilladsp/configs/gadget.yml`**
-   - Configure for USB Gadget
-   - May use the same sample rate as the other sources
+---
 
-Optional manual-only configs can also be selected through the override file. For example,
-`~/camilladsp/configs/analog.yml` can be pinned manually even though analog is not
-auto-detected by default.
+## Remote Control
 
-The source name, not a sample-rate heuristic, controls clock ownership.
+### What it does
 
-### How It Works
+Lets you control the system from any Bluetooth or USB remote that shows up as
+a keyboard (media remotes, USB IR receivers, presentation clickers;
+[example](https://www.aliexpress.com/item/1005010182280772.html)).
 
-1. Checks if hardware is active (device connected and ready)
-2. Switches to that source's config
-3. Monitors actual audio playback via RMS levels
-4. Keeps the current source while it is still playing
-5. Waits 60 seconds of silence before abandoning a source whose playback it has *confirmed*, unless another meter-confirmed source is already active
-6. Remembers a source it selected and heard nothing from, and re-probes it on a growing backoff instead of every minute
-7. Uses passive MOTU meter frames to detect TOSLINK activity
-8. Keeps the current config when all sources are idle
+### Default buttons
 
-A source with confirmed audio cuts a silent source's grace short rather than
-waiting it out, once it has held that confirmation for 2 seconds (so a single
-noisy meter frame cannot yank the config away mid-track). A *higher*-priority
-source waits for nothing else. A *lower*-priority one hands off as soon as it
-has passed its own activity debounce. A source that is merely
-ready - a connected-but-paused AirPlay session, say - never cuts a grace short,
-because that grace is exactly what protects a track gap from it.
+| Button | Action |
+|--------|--------|
+| **Volume up / down** | Volume ±1 dB (hold to repeat) |
+| **Mute** | Mute on/off |
+| **Up / Down** | Treble ±0.5 dB (range −6 to +6 dB) |
+| **Right / Left** | Bass ±0.5 dB (range −6 to +6 dB) |
+| **Enter** (press) | Write the current status to the log |
+| **Enter** (hold 1 s) | Reset bass and treble to 0 |
+| **Power** (hold 1 s) | Restart the CamillaDSP services |
+| **Power** (hold 10 s) | Shut down the Pi |
 
-The MOTU meter sources are a special case: `toslink_available` only goes false
-after 5 seconds of quiet meters, so by the time one of them
-reads silent it has already served a track-gap grace of its own. It does not
-get a second one on top - switch the TV off and the switcher starts looking
-elsewhere as soon as the meters settle, not a minute later.
+### Setting it up
 
-Hardware readiness only says a stream is open - a connected-but-paused AirPlay
-session or an idle console looks exactly like a playing one until the switcher
-selects it and reads the capture levels. A source selected this way is listened
-to for 5 seconds; if it stays silent the switcher records that and will not
-select it again for 30 seconds, growing fourfold per consecutive silent probe
-up to 15 minutes. Confirmed audio, a manual override, and the source
-disappearing and coming back all clear the backoff immediately.
+1. Pair the remote with installer option **6**, or by hand:
 
-### Configuration
+   ```bash
+   bluetoothctl power on
+   bluetoothctl scan on      # wait for the remote, note its MAC address
+   bluetoothctl scan off
+   bluetoothctl pair XX:XX:XX:XX:XX:XX
+   bluetoothctl connect XX:XX:XX:XX:XX:XX
+   bluetoothctl trust XX:XX:XX:XX:XX:XX
+   ```
 
-The switcher's timings, thresholds and MOTU meter channels are constants at the
-top of `source_switcher.py`; shared paths are in `settings.py`. The env file
-only names where the manual override lives:
+2. Find the remote's name:
 
-```text
-SOURCE_OVERRIDE_PATH=/run/cdsp-source-switcher/manual_source
-```
+   ```bash
+   ~/camilladsp/.venv/bin/python3 -c "import evdev; print([evdev.InputDevice(p).name for p in evdev.list_devices()])"
+   # e.g. ['HID Remote01 Keyboard', 'HID Remote01 Mouse', 'vc4-hdmi-0', 'pwr_button']
+   ```
 
-To pin a source manually, write one of `toslink`, `streamer`, `gadget`, or `analog`
-to that file. Remove the file, leave it empty, or write `auto` to return
-to automatic switching.
+3. The installer asks for that name. You can change it later in the settings
+   file, together with the volume limits:
 
-### Debugging
+   ```text
+   REMOTE_NAME=HID Remote01 Keyboard
+   REMOTE_VOLUME_MIN=-80
+   REMOTE_VOLUME_MAX=0
+   ```
 
-Set `DEBUG_MODE = True` near the top of `~/camilladsp/scripts/source_switcher.py`
-and restart the switcher to see what it is doing, then watch the logs:
+   `REMOTE_VOLUME_MAX` can only lower the limit; the selected speaker's own
+   maximum always applies.
+
+### Changing the buttons
+
+**1. Find out what your buttons are called.** Every remote is different:
 
 ```bash
-journalctl -u cdsp-source-switcher -f
+sudo systemctl stop cdsp-remote
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn
+# press each button, then Ctrl+C
+sudo systemctl start cdsp-remote
 ```
 
-You'll see output like:
+You'll see lines like `KEY_HOMEPAGE  pressed  [HID Remote01 Keyboard] -> not mapped`.
+Only keys from the `REMOTE_NAME` device can be used; keys from a sibling
+device (e.g. "… Consumer Control") are marked as unusable.
 
+**2. Write your own key map**, starting from the current one (or from
+`remote-keymap.example.json`):
+
+```bash
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --print-keymap > remote-keymap.json
+# edit remote-keymap.json
+sudo install -m 0644 remote-keymap.json /etc/cdsp-automation/remote-keymap.json
+sudo systemctl restart cdsp-remote
 ```
-DEBUG: Streamer HW=True, Gadget HW=False, TOSLINK meter=False/0/5, Analog meter=False/0/30, Last=streamer, ST=0, GT=0
--> Streamer: audio active
--> Streamer: idle 5/60s
-```
+
+Each key can have a `press` action (add `"repeat": true` to repeat while
+held), a `hold` action (after `hold_seconds`, default 1 s) and a `long_hold`
+action (after `long_hold_seconds`, default 10 s). If the file has a mistake,
+it is logged and the default buttons stay in use.
+
+| Action | Does |
+|--------|------|
+| `volume_up`, `volume_down`, `mute` | CamillaDSP volume (step: `volume_step_db`) |
+| `bass_up`, `bass_down`, `treble_up`, `treble_down`, `tone_reset` | Tone (step: `tone_step_db`) |
+| `motu_volume_up`, `motu_volume_down` | MOTU main output (step: `motu_step_db`) |
+| `next_source` | Auto → each available source → Auto |
+| `source_auto`, `source_streamer`, `source_gadget`, `source_toslink`, `source_analog` | Pick a source, or go back to automatic |
+| `amps_off` | Turn the amp off now |
+| `status` | Write the current state to the log |
+| `restart_services`, `shutdown` | Only allowed on hold / long hold |
+
+Changing speakers is deliberately not possible from the remote: the right
+speakers have to be connected first, which the web UI asks you to confirm.
 
 ---
 
-## 🖥️ Web Control UI (optional)
+## AirPlay + Spotify Volume Sync
 
-### What It Does
+### What it does
 
-A single-file, no-framework web dashboard (default port 8088) for the whole
-audio stack: physical source switching, CamillaDSP master volume/mute, the
-persistent parametric EQ with a computed response curve and loudness
-controls, speaker-profile selection (muted, validated, rollback-protected
-transitions), service health and restarts, live input levels and journal
-logs.
+Normally AirPlay and Spotify turn down the digital signal before CamillaDSP
+sees it. With this installed, they send full-level audio and their volume
+sliders control the CamillaDSP volume instead. It works both ways: turn it up
+on the remote or web UI and the Spotify slider on your phone moves too.
 
-The UI edits persistent state only; the source switcher remains the sole
-writer of the live CamillaDSP configuration.
+### What you need
+
+- **AirPlay:** `shairport-sync`. The installer backs up its config, changes
+  only the volume settings, and puts the original back on uninstall.
+- **Spotify:** a `raspotify` service. The installer builds a patched
+  librespot 0.8.0 and switches back automatically if it doesn't start
+  properly. Without `raspotify` this step is skipped. It uses raspotify's
+  output device; set `SPOTIFY_ALSA_DEVICE` (see `aplay -L`) only to override
+  it.
+
+The AirPlay volume range is set with `AIRPLAY_VOLUME_MIN_DB` (default −50) and
+`AIRPLAY_VOLUME_MAX_DB` (default 0).
+
+### Stopping Squeezelite when AirPlay or Spotify starts
+
+Optional: set `AIRPLAY_INTERRUPTED_LMS_PLAYERS` to a comma-separated list of
+Squeezelite player names, and they are stopped when an AirPlay or Spotify
+session starts. If the LMS server can't be reached, nothing breaks. Empty (the
+default) turns this off.
+
+---
+
+## ISO 226 Loudness
+
+### What it does
+
+Our ears hear less bass and treble at low volume. This adds just the right
+amount back as you turn the volume down, following the ISO 226 equal-loudness
+curves, so music sounds balanced at any level.
+
+It needs a patched CamillaDSP 4.1.3. Install All (option 1) builds it last;
+option 9 builds it on its own, or rebuilds it. A normal update never touches
+it. If the new build doesn't start, your old CamillaDSP is put back.
+
+**Requirement:** `camilladsp.service` must start `/usr/local/bin/camilladsp`,
+because that's the file it replaces. If your CamillaDSP is somewhere else,
+Install All skips this step (and says so) and option 9 stops with the reason.
+
+### Calibrating it
+
+For the curves to be right, the system needs to know how loud "loud" is:
+
+1. Set the volume to a comfortable level you'd normally listen at.
+2. Play a **1 kHz sine tone** (not music or noise — the reading is only
+   correct at 1 kHz).
+3. Measure the sound level (SPL) at your listening position.
+4. In the web UI, enter that reading as the **reference phon** (40–90), then
+   turn the engine on.
+5. Also enter the MOTU output level you measured at under **"MOTU main output
+   at calibration"**, or press **"Use current levels"** while both are still
+   where you measured.
+
+After that, the correction follows both the CamillaDSP volume and the MOTU
+output. So a source that plays with the MOTU at 0 dB instead of −6 dB gets
+the right correction for how loud it really is. Leave the MOTU field empty to
+calibrate on the CamillaDSP volume alone. If you built the engine before this
+MOTU feature existed, rebuild it with option **9** to avoid a small click when
+the MOTU level changes.
+
+Technical background (accuracy, filter design) is in
+[Under the hood](#under-the-hood).
+
+---
+
+## Web Control UI
+
+### What it does
+
+A web page (port 8088) for the whole system: volume and mute, source choice,
+a parametric EQ with a response graph, loudness, speaker selection, service
+status and restarts, live input meters and logs. Install it with option
+**11**; it is not part of Install All.
 
 ### On your phone
 
-The page opens on **Home**: a phone-sized remote with the playing source, a
-level meter, big volume buttons (hold to repeat), mute, source buttons, the
-MOTU main output and the amps-off button. The Dashboard, Audio, Services and
-Logs tabs are unchanged.
+The page opens on **Home**, a phone-sized remote with the playing source, a
+level meter, big volume buttons, mute, source buttons, the MOTU output level
+and an amp-off button. The Dashboard, Audio, Services and Logs tabs have
+everything else. Everything updates live while the page is open.
 
-Add it to your home screen to use it like an app, with its own icon and no
-browser bars: on iPhone, open `http://<pi>:8088` in Safari, then Share → Add
-to Home Screen; on Android, Chrome's ⋮ menu → Add to Home screen. (Browsers
-only offer a full offline "install" over HTTPS; this LAN page is served over
-plain HTTP, so it is a home-screen shortcut that opens full screen, which is
-all a local controller needs.)
+To use it like an app, add it to your home screen: on iPhone, open
+`http://<pi>:8088` in Safari, then Share → Add to Home Screen; on Android,
+Chrome's ⋮ menu → Add to Home screen.
 
-Volume, mute, source, the MOTU level and the input meter update live while
-the page is open, over one lightweight event stream (`/api/events`); the page
-closes it when the phone sleeps or the tab is hidden, and falls back to
-polling on a browser without it.
+### Security — read this
 
-### Security Model
-
-Because it starts, stops and restarts system services, the
-`cdsp-control-ui.service` unit runs as **root** by design. Install it only if
-you want that trade-off; every other utility works without it.
-
-Out of the box it binds **every interface on port 8088 with no
-authentication** — the historical behaviour, kept as the default so that
-upgrading an existing install does not take its UI away. Two settings in
-`~/camilladsp/cdsp-automation.env` narrow that, and menu option 11 offers the
-first one before it installs anything:
+The UI can start and stop system services, so it runs as **root** by design. By default
+it is open to **anyone on your network, without a password**. Never expose it
+to the internet. You can lock it down in the settings file:
 
 | Setting | Default | Effect |
-| --- | --- | --- |
-| `INSTALLATION_UI_HOST` | `0.0.0.0` | Bind address. Set `127.0.0.1` for loopback only. |
-| `INSTALLATION_UI_PORT` | `8088` | Listening port. |
-| `INSTALLATION_UI_TOKEN` | *(empty)* | Empty means no authentication. Set a secret to require it. |
+|---------|---------|--------|
+| `INSTALLATION_UI_HOST` | `0.0.0.0` | `0.0.0.0` = whole network. `127.0.0.1` = this Pi only. |
+| `INSTALLATION_UI_PORT` | `8088` | Port number |
+| `INSTALLATION_UI_TOKEN` | *(empty)* | Set a secret to require it for any change |
 
-**Loopback only.** Set `INSTALLATION_UI_HOST=127.0.0.1` and
-`sudo systemctl restart cdsp-control-ui`, then reach the UI through an SSH
-tunnel from your laptop:
+Restart it after a change: `sudo systemctl restart cdsp-control-ui`. Option 11
+offers to switch to `127.0.0.1` before it installs anything.
+
+**This Pi only:** set `INSTALLATION_UI_HOST=127.0.0.1` and reach it from your
+laptop through an SSH tunnel:
 
 ```bash
 ssh -N -L 8088:127.0.0.1:8088 <user>@<pi>
 # then open http://127.0.0.1:8088
 ```
 
-**Shared secret.** Set a long random token and restart the service:
+**With a secret:** create one with `openssl rand -hex 32` and set
+`INSTALLATION_UI_TOKEN=<that value>`. Open the page once as
+`http://<pi>:8088/#token=<token>` and it remembers it; otherwise it asks the
+first time you change something. Viewing still works without it. (API clients
+send `Authorization: Bearer <token>`.)
 
-```bash
-openssl rand -hex 32           # put the result in cdsp-automation.env
-# INSTALLATION_UI_TOKEN=<that value>
-sudo systemctl restart cdsp-control-ui
-```
-
-Every request that changes anything (volume, EQ, source, speaker profile,
-services) then needs
-`Authorization: Bearer <token>`. Open the dashboard once as
-`http://<pi>:8088/#token=<token>` and the page remembers it; otherwise it
-prompts for the token the first time you change something. Status views stay
-readable without it, so the page can load in order to ask.
-
-Two protections are always on, whatever you configure: state-changing
-requests from a foreign `Origin` are refused, and request bodies are bounded
-(256 KiB) and timed out rather than buffered.
-
-The service still runs as root. A token limits *who* can drive it; it does not
-reduce what the process itself can do. Treat port 8088 as privileged either
-way, and never expose it to the internet.
+Always on, whatever you configure: changes from other websites are refused,
+and large or slow requests are cut off.
 
 ---
 
-## Installation Details
+## Health Check
 
-The installer menu provides these options:
+When something sounds wrong, after an OS upgrade, or before asking for help,
+run the health check. Use installer option **12**, the **"Run health check"**
+button on the web UI's Services tab, or:
 
-1. **Install All Utilities** - Recommended for first-time setup
-2. **Update Utilities** - Downloads latest scripts and updates pycamilladsp
-3. **Install Trigger Control** - GPIO relay control only
-4. **Install Source Switcher** - Config switching, plus the MOTU clock, meters
-   and main volume
-5. **Install Remote Control** - Bluetooth/USB remote control (also installs
-   option 4, which it requires)
-6. **Pair Bluetooth Remote** - Interactive Bluetooth pairing
-7. **Show Service Status** - Check if services are running
-8. **Install AirPlay + Spotify Volume Sync** - Network receivers drive the
-   CamillaDSP fader (also installs option 4, which it requires)
-9. **Install ISO 226 Loudness Engine** - Pinned loudness-patched CamillaDSP build.
-   Requires `camilladsp.service` to start `/usr/local/bin/camilladsp`.
-10. **Uninstall All Utilities** - Remove the services, units and sudoers rules.
-    Your configs, the env file and `/var/lib/cdsp-automation` state are kept.
-11. **Install Web Control UI** - Optional root web dashboard (trusted LAN only;
-    also installs option 4, which it requires)
-12. **Run Health Check** - Read-only report on services, configs, the audio
-    lock, the MOTU link, the remote and power (see "Health check")
+```bash
+~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/diagnose.py      # add --json for machine-readable output
+```
 
-Options 5, 8 and 11 install the source switcher when it is missing, because
-the components they install depend on it. The switcher is the only thing that
-applies persisted Bass/Treble/EQ and speaker changes to the running engine,
-and the only publisher of the volume ceiling the controls honour, so installing
-any of them alone would produce a remote, bridge or UI stuck at the fail-safe
-ceiling whose edits go nowhere. Each run says so before it acts, and lists the
-switcher under "Also installed, because the components you chose require it"
-in its closing summary. Installing the switcher does not give it its source
-configs - you still have to create them, or its service will not run.
-
-Options 10 and 11 ask for a `y/N` confirmation before acting: one removes every
-managed service, the other exposes a root web server. Option 11 first prints
-the address it is about to bind to and whether a token is configured, and
-offers to move the UI to `127.0.0.1` before you say yes.
-
-Options 1, 2, 5, 8 and 11 end with a summary listing anything that was pulled
-in as a dependency and any component that was skipped or failed, and no longer
-abandon the rest of the run when one of them cannot be installed.
-
-### What Gets Installed
-
-**Directories created:**
-- `~/camilladsp/scripts/` - Python scripts
-- `~/camilladsp/configs/` - CamillaDSP config files (you must create these)
-- `~/camilladsp/.venv/` - Python virtual environment
-- `~/camilladsp/cdsp-automation.env` - User settings preserved across script updates
-
-The env file holds only what varies per site: the CamillaDSP host/port and
-config directory, the manual-override file, the trigger GPIO, the MOTU
-WebSocket URL, the remote's name, volume limits (`MOTU_MAIN_VOLUME_MAX_DB`,
-`AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`, `REMOTE_VOLUME_MIN`/`MAX`), the LMS players
-to interrupt, the Spotify ALSA device, the control UI's host/port/token and
-its site name. Shared paths live in `scripts/settings.py` and timings at the
-top of each script; keys the scripts no longer read are ignored.
-
-**System services:**
-- `cdsp-trigger.service`
-- `cdsp-source-switcher.service`
-- `cdsp-remote.service`
-- `airplay-volume-bridge.service`
-- `cdsp-control-ui.service` (optional)
-
-**Dependencies:**
-- `websocket-client` (Python package)
-- `pycamilladsp` (Python package)
-- `evdev` (Python package)
-- `python3-rpi-lgpio` (system package)
-- `alsa-utils`, `bluez`, `wget`, `python3-venv` (system packages)
+It checks the Python version, disk space, Pi power problems (under-voltage),
+the settings file, every service, the CamillaDSP connection, that every config
+is valid, the speaker profiles, the MOTU connection, the remote and key map,
+and recent errors in the logs. It only reads — it never changes anything.
 
 ---
 
-## Managing Services
+## Settings
 
-### View Status
+All your settings are in **`~/camilladsp/cdsp-automation.env`**. Updates
+never overwrite it. After changing it, restart the affected service (or
+re-run the installer's update).
+
+| Setting | Default | Used by |
+|---------|---------|---------|
+| `CDSP_HOST`, `CDSP_PORT` | `127.0.0.1`, `1234` | Everything |
+| `CDSP_CONFIG_DIR` | `~/camilladsp/configs` | Source Switcher |
+| `SOURCE_OVERRIDE_PATH` | `/run/cdsp-source-switcher/manual_source` | Source Switcher |
+| `SOURCE_VOLUME_MEMORY` | `1` | Source Switcher |
+| `MOTU_WS_URL` | `ws://169.254.51.193:1280` | Source Switcher |
+| `MOTU_MAIN_VOLUME_MAX_DB` | `0` | MOTU volume limit |
+| `POWER_GPIO` | `4` | Trigger Control |
+| `REMOTE_NAME` | `HID Remote01 Keyboard` | Remote Control |
+| `REMOTE_VOLUME_MIN`, `REMOTE_VOLUME_MAX` | `-80`, `0` | Remote Control |
+| `AIRPLAY_VOLUME_MIN_DB`, `AIRPLAY_VOLUME_MAX_DB` | `-50`, `0` | AirPlay sync |
+| `AIRPLAY_INTERRUPTED_LMS_PLAYERS` | *(empty)* | AirPlay + Spotify sync |
+| `SPOTIFY_ALSA_DEVICE` | *(empty)* | Spotify sync |
+| `INSTALLATION_UI_HOST`, `_PORT`, `_TOKEN` | `0.0.0.0`, `8088`, *(empty)* | Web UI |
+| `SITE_NAME` | `CamillaDSP` | Web UI |
+
+Timings and thresholds are constants at the top of each script; shared paths
+are in `scripts/settings.py`.
+
+---
+
+## Speakers and EQ
+
+You can switch between several speaker setups (for example your main speakers
+and a party or measurement setup) from the web UI. Each speaker has its own
+EQ, bass/treble, loudness and volume limit.
+
+- The **default** speaker uses your own config files from
+  `~/camilladsp/configs/` as they are.
+- Other speakers are **profiles**: a speaker part (crossover, delays, output
+  routing) that is combined with a small per-source input part. They live in
+  `/etc/cdsp-automation/speaker-profiles` and
+  `/etc/cdsp-automation/source-bases`. See `speaker-profile.example.yml` and
+  `source-base.example.yml`. A profile only shows up when it has
+  `enabled: true` and all its source parts exist.
+- To replace the list of speakers, write
+  `/etc/cdsp-automation/speaker-catalog.json` (see
+  `speaker-catalog.example.json`). If the file is broken, a warning is logged
+  and the built-in list is used.
+
+The built-in speakers (Kantarellen as the default, PartyMEH, Measurement) are
+the maintainer's own; replace them with your own catalog. Only enable a
+profile after you have measured its crossover, polarity, delay, gain and
+channel routing. Changing speaker is always muted,
+checked, and rolled back if it fails.
+
+**Don't add your own filters named `Bass`, `Treble` or `loudness`** to your
+configs. The Source Switcher adds its own EQ and tone filters and removes old
+ones with those names, so they don't stack up.
+
+The full rules for profiles are in [TECHNICAL.md](TECHNICAL.md).
+
+---
+
+## Managing services
+
+| Service | Part |
+|---------|------|
+| `cdsp-source-switcher` | Source Switcher |
+| `cdsp-trigger` | Trigger Control |
+| `cdsp-remote` | Remote Control |
+| `airplay-volume-bridge` | AirPlay + Spotify Volume Sync |
+| `cdsp-control-ui` | Web Control UI |
+
+Use the service name in these commands:
 
 ```bash
-systemctl status cdsp-trigger
-systemctl status cdsp-source-switcher
-systemctl status cdsp-remote
+systemctl status cdsp-remote               # is it running?
+journalctl -u cdsp-remote -f               # follow the log live
+journalctl -u cdsp-remote -n 100           # last 100 log lines
+sudo systemctl restart cdsp-remote         # restart (also: start, stop)
+sudo systemctl enable cdsp-remote          # start at boot (disable: don't)
 ```
 
-### View Logs (Live)
-
-```bash
-journalctl -u cdsp-trigger -f
-journalctl -u cdsp-source-switcher -f
-journalctl -u cdsp-remote -f
-```
-
-### View Last 100 Log Lines
-
-```bash
-journalctl -u cdsp-trigger -n 100
-journalctl -u cdsp-source-switcher -n 100
-journalctl -u cdsp-remote -n 100
-```
-
-### Start/Stop/Restart
-
-```bash
-sudo systemctl start cdsp-remote
-sudo systemctl stop cdsp-remote
-sudo systemctl restart cdsp-remote
-```
-
-### Enable/Disable Auto-Start on Boot
-
-```bash
-sudo systemctl enable cdsp-remote   # Start on boot
-sudo systemctl disable cdsp-remote  # Don't start on boot
-```
+Restarting `camilladsp` also restarts the Source Switcher.
 
 ---
 
 ## Troubleshooting
 
-### Remote Control Not Working
+Start with the [health check](#health-check) — it often names the problem.
 
-**Check if remote is detected:**
+### Remote not working
 
-```bash
-python3 -c "import evdev; print([d.name for d in [evdev.InputDevice(p) for p in evdev.list_devices()]])"
-```
+- Is the remote seen at all? Run the command from
+  [step 2](#setting-it-up). If it's missing, check
+  `bluetoothctl devices Connected` and re-pair with option 6.
+- `REMOTE_NAME` in the settings file must match the name **exactly**.
+- Test the buttons: `sudo systemctl stop cdsp-remote`, then
+  `~/camilladsp/.venv/bin/python3 ~/camilladsp/scripts/cdsp_remote.py --learn`.
+- Check the log: `journalctl -u cdsp-remote -n 100`.
+- **Bass/treble do nothing?** Make sure `cdsp-source-switcher` is running —
+  it is what applies tone changes.
 
-Your remote should appear in the list. If not:
-- Check Bluetooth connection: `bluetoothctl devices Connected`
-- Re-pair the remote using the installer (option 6)
+### Amp not switching on
 
-**Check if the device name matches:**
+- Check the wiring: GPIO 4 → relay IN, and 5V/ground to the relay.
+- Is the user allowed to use GPIO? `ls -l /dev/gpiochip0` should show the
+  `gpio` group. If your user isn't in it: `sudo usermod -aG gpio $USER`, then
+  log out and back in.
+- Test the relay by hand: `sudo systemctl stop cdsp-trigger`, then
+  `pinctrl set 4 op dh` (on) and `pinctrl set 4 op dl` (off). Start the
+  service again afterwards.
+- Check the log: `journalctl -u cdsp-trigger -n 100`.
 
-The `REMOTE_NAME` value in `~/camilladsp/cdsp-automation.env` must exactly match what appears in the device list.
+### MOTU clock not switching
 
-**Test remote input:**
+- Can the Pi reach the MOTU? `ping 169.254.51.193` (or your MOTU's IP).
+- Is the control port open? (This briefly disconnects the Source Switcher.)
 
-```bash
-python3 -m evdev.evtest
-```
+  ```bash
+  timeout 2 bash -c '</dev/tcp/169.254.51.193/1280' && echo open
+  ```
 
-Select your remote and press buttons - you should see key events.
+- Check the log: `journalctl -u cdsp-source-switcher -n 100 | grep MOTU`.
+- **Other MOTU models:** the clock values come from MOTU's CueMix 5 app (for
+  the UltraLite, `dev.js`: `kClockSource` is id 11 with Internal=3,
+  S/PDIF=0, Optical=2). Other gen5 models may differ — check the matching
+  `dev_*.js` and update `MOTU_CLOCK_WRITES` and `MOTU_CLOCK_NAMES` in
+  `source_switcher.py`. MOTU's AVB interfaces are not supported.
 
-**Check logs:**
+### Source not switching
 
-```bash
-journalctl -u cdsp-remote -n 100
-```
+- Do the configs exist and are they valid?
 
-**Tone controls not working:**
+  ```bash
+  ls -l ~/camilladsp/configs/        # toslink.yml, streamer.yml, gadget.yml
+  camilladsp -c ~/camilladsp/configs/toslink.yml
+  ```
 
-Check that `cdsp-source-switcher.service` is active and that
-`/var/lib/cdsp-automation/audio-eq.json` is writable by the service user. Do
-not add separate `Bass` or `Treble` filters.
+- Turn on debug output: set `DEBUG_MODE = True` near the top of
+  `~/camilladsp/scripts/source_switcher.py`, run
+  `sudo systemctl restart cdsp-source-switcher`, then
+  `journalctl -u cdsp-source-switcher -f`. You'll see lines like:
 
-### Trigger Control Not Working
+  ```
+  DEBUG: Streamer HW=True, Gadget HW=False, TOSLINK meter=False/0/5, Analog meter=False/0/30, Last=streamer, ST=0, GT=0
+  -> Streamer: audio active
+  -> Streamer: idle 5/60s
+  ```
 
-**Check wiring:**
-- Verify GPIO 4 is connected to relay IN
-- Verify 5V and GND are connected correctly
-- Test relay manually: `gpio -g write 4 1` (requires wiringpi)
-
-**Check permissions:**
-
-```bash
-ls -l /dev/gpiochip0
-# Should show: crw-rw---- 1 root gpio
-```
-
-If not in gpio group:
-
-```bash
-sudo usermod -aG gpio $USER
-# Then logout and login again
-```
-
-**Check logs:**
-
-```bash
-journalctl -u cdsp-trigger -n 100
-```
-
-Look for error messages about GPIO access or CamillaDSP connection.
-
-### MOTU Clock Not Switching
-
-**Verify MOTU IP address:**
-
-```bash
-ping 169.254.51.193  # Or your MOTU's IP
-```
-
-**Check the MOTU control WebSocket is reachable** (an UltraLite mk5 serves no
-HTTP, so `curl` to port 80 always reports an empty reply; like any client,
-this briefly displaces the source switcher's connection):
-
-```bash
-timeout 2 bash -c '</dev/tcp/169.254.51.193/1280' && echo open
-```
-
-**Check logs:**
-
-```bash
-journalctl -u cdsp-source-switcher -n 100 | grep MOTU
-```
-
-**For other MOTU models:**
-
-The parameter ids and values come from MOTU's CueMix 5 app, whose
-unobfuscated JavaScript defines every device parameter (for the UltraLite,
-`dev.js`: `kClockSource` is id 11 with Internal=3, S/PDIF=0, Optical=2). Other
-MOTU gen5 models may differ; check the matching `dev_*.js`, then update
-`MOTU_CLOCK_WRITES` and `MOTU_CLOCK_NAMES` in `source_switcher.py` together.
-MOTU's AVB interfaces use a different (HTTP datastore) API and are not
-supported.
-
-### Source Switcher Not Switching
-
-**Enable debug mode:**
-
-Set `DEBUG_MODE = True` near the top of `~/camilladsp/scripts/source_switcher.py`,
-then restart the service:
-
-```bash
-sudo systemctl restart cdsp-source-switcher
-```
-
-Watch logs:
-
-```bash
-journalctl -u cdsp-source-switcher -f
-```
-
-**Verify config files exist:**
-
-```bash
-ls -l ~/camilladsp/configs/
-# Should show: toslink.yml, streamer.yml, gadget.yml
-```
-
-**Check if configs are valid:**
-
-```bash
-camilladsp -c ~/camilladsp/configs/toslink.yml
-```
-
-**Inspect configured sample rates:**
-
-```bash
-grep samplerate ~/camilladsp/configs/*.yml
-# Equal rates are supported; each source should use the rate its graph expects.
-```
-
-**Test hardware detection manually:**
-
-For Loopback (Streamer):
-
-```bash
-cat /proc/asound/Loopback/pcm0p0/sub0/status
-# Look for "state: RUNNING" when streaming
-```
-
-For USB Gadget:
-
-```bash
-amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1
-# Should show non-zero rate when USB host connected
-```
-
-For TOSLINK meter detection, check that the MOTU WebSocket is reachable:
-
-```bash
-journalctl -u cdsp-source-switcher -n 100 | grep "MOTU connected"
-```
+- Is the streamer input active? `cat /proc/asound/Loopback/pcm0p0/sub0/status`
+  should say `state: RUNNING` while playing.
+- Is a USB computer connected?
+  `amixer -c UAC2Gadget contents | grep "Capture Rate" -A 1` should show a
+  rate that isn't zero.
+- Is TOSLINK detection working?
+  `journalctl -u cdsp-source-switcher -n 100 | grep "MOTU connected"`.
 
 ---
 
-## Can I Use Just One Utility?
+## What gets installed
 
-**Some of them.** Trigger control is genuinely standalone.
-The remote, the AirPlay/Spotify volume bridge and the web control UI are not:
-they take their volume ceiling from the speaker-profile status only the source
-switcher publishes (without it they hold the fail-safe ceiling), and the
-switcher is the only thing that applies a persisted Bass/Treble/EQ or speaker
-change to the running engine. So:
+- `~/camilladsp/scripts/` — the Python scripts
+- `~/camilladsp/configs/` — your CamillaDSP configs (you create these)
+- `~/camilladsp/.venv/` — a Python environment for the scripts
+- `~/camilladsp/cdsp-automation.env` — your settings
+- `/var/lib/cdsp-automation/` — saved state (EQ, volumes, speaker choice)
+- `/etc/cdsp-automation/` — optional site files (key map, speaker catalog,
+  profiles)
+- The systemd services listed under [Managing services](#managing-services)
+- System packages: `python3-venv`, `python3-rpi-lgpio`, `alsa-utils`, `bluez`,
+  `wget`, `curl`, `git`, plus build tools (`cargo`, `build-essential`,
+  `pkg-config`, `libasound2-dev`, `libssl-dev`) for the patched CamillaDSP and
+  librespot
+- Python packages: `pycamilladsp`, `websocket-client`, `evdev`, `pyyaml`
 
-- Install only **Trigger Control** for amp power management
-- Install only **Source Switcher** for config switching and MOTU clock control
-- **Remote Control**, **AirPlay + Spotify Volume Sync** and the **Web Control
-  UI** each require **Source Switcher**. The installer adds it for you rather
-  than leaving you with a component whose edits are never applied
-- Install any combination of the above; shared writers use the audio-control lock
+Uninstall (option 10) removes the services, unit files and sudoers rules. It
+keeps your configs, settings and saved state.
+
+---
+
+## Under the hood
+
+Details for the curious; you don't need these to use the system. More is in
+[TECHNICAL.md](TECHNICAL.md).
+
+**One writer.** The Source Switcher is the only program that loads configs
+into CamillaDSP. For every source it combines your config with the selected
+speaker's saved EQ and loudness (from `/var/lib/cdsp-automation/speaker-audio`;
+the default speaker keeps using `/var/lib/cdsp-automation/audio-eq.json`). The
+web UI and remote only edit that saved state.
+
+**Shared lock.** Everything that changes volume or mute takes the lock
+`/var/lib/cdsp-automation/audio-control.lock`. The switcher holds it for a
+whole switch (mute → load → check → apply EQ → restore mute), so a volume
+change made mid-switch simply waits. At startup, and whenever it reconnects to
+CamillaDSP, the switcher re-applies the current config the same way. If
+CamillaDSP crashes and restarts by itself, there can be a short moment before
+the switcher notices.
+
+**MOTU connection.** The UltraLite accepts one control connection at a time,
+so the switcher's single connection carries the meters, clock changes and the
+MOTU volume. The MOTU reports its full state on connect and every change
+after, so the switcher never rewrites a clock that is already right (each
+clock change makes the MOTU re-lock audibly). Clock changes wait until the
+output is confirmed silent (below −100 dB), then wait 1 s for the re-lock. A
+clock change that failed, or one made in CueMix 5, is fixed later in its own
+short muted step, at most every 30 s. Which clock to use comes from the
+source's name in the speaker catalog, not from its sample rate.
+
+**Speaker profile rules.** Every output must be declared active or muted, and
+the last step in the pipeline must be an output mixer. A typical three-way
+setup is: stereo source → expansion mixer → per-output crossover/delay/gain →
+final 1:1 output mixer. A Measurement profile must set both
+`raw_measurement: true` and `bypass_user_eq: true`; it then allows no filters
+except its own output mixer, and its output level is up to you. Generated
+configs are written to fixed, content-addressed files and checked with
+`camilladsp -c` before loading.
+
+**ISO 226 maths.** The curves use the ISO 226:2003 model as an approximation
+of the 2023 revision (at most 0.6 dB different; the licensed 2023 data is not
+included). The listening level is calculated as
+`reference phon + (volume − reference volume) + (MOTU − reference MOTU)`.
+Reference phon is limited to 40–90 because the standard stops there (and at
+80 phon above 4 kHz, so 81–90 extrapolates the top). The filter is one gain
+plus nine high shelves, solved per sample rate to stay within 0.6 dB of the
+target from 20 Hz to 12.5 kHz, and it never boosts more than the volume
+control has already turned down. Changes are crossfaded between audio chunks;
+switching instantly caused about 30 dB more distortion during volume changes.
+After installation, `/var/lib/cdsp-automation/iso226-engine.json` records the
+engine, and the UI only offers ISO 226 loudness while that file exists.
 
 ---
 
 ## Contributing
 
-Contributions welcome! Please:
+Contributions are welcome:
 
 1. Fork the repository
 2. Create a feature branch
-3. Test thoroughly on your hardware
-4. Submit a pull request
-
----
+3. Test on your hardware
+4. Open a pull request
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
----
+MIT License — see [LICENSE](LICENSE). Third-party notices are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Acknowledgments
 
@@ -989,10 +691,7 @@ MIT License — see [LICENSE](LICENSE) for details.
 - [RPi-CamillaDSP](https://github.com/mdsimon2/RPi-CamillaDSP) — RPi-focused CamillaDSP setup by mdsimon2
 - [Display, remote and trigger power for CamillaDSP streamer and preamp — Audio Science Review thread](https://www.audiosciencereview.com/forum/index.php?threads/display-remote-and-trigger-power-for-camilladsp-streamer-and-preamp-alternative-to-mdsimon2%E2%80%99s-implementation.52818/) — community discussion and alternative implementations
 
----
-
 ## Support
 
-- **Issues:** Open a GitHub issue for bugs
-- **Questions:** Use GitHub Discussions
-- **Ideas:** Start a discussion or open a feature request
+- **Bugs:** open a GitHub issue
+- **Questions and ideas:** use GitHub Discussions
