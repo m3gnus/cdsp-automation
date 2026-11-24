@@ -57,6 +57,7 @@ CDSP_SERVICES=(
   cdsp-source-switcher
   cdsp-remote
   airplay-volume-bridge
+  cdsp-jukebox
 )
 
 default_env() {
@@ -99,6 +100,22 @@ INSTALLATION_UI_TOKEN=
 # Shown in the control UI's page title and header.
 SITE_NAME=CamillaDSP
 REMOTE_NAME=HID Remote01 Keyboard
+# Guest jukebox (menu option 13): a phone page where visitors search and
+# queue tracks on one LMS player.  Guests can only add to the end of the queue.
+LMS_HOST=127.0.0.1
+LMS_PORT=9000
+JUKEBOX_HOST=0.0.0.0
+JUKEBOX_PORT=8090
+# The LMS player name (or MAC) guests queue on.  Empty = the only player.
+JUKEBOX_PLAYER=
+# LMS streaming plugins searched, in order; the first one installed is used.
+JUKEBOX_SERVICES=qobuz,tidal
+# Shown as the page title.  Empty uses SITE_NAME.
+JUKEBOX_TITLE=
+JUKEBOX_MAX_PER_GUEST=3
+JUKEBOX_COOLDOWN_SECONDS=20
+JUKEBOX_MAX_TRACK_MINUTES=12
+JUKEBOX_AUTOPLAY=1
 EOF
 }
 
@@ -258,7 +275,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py; do
+  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py jukebox.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -717,6 +734,50 @@ refresh_installed_units() {
   if systemctl list-unit-files --no-legend cdsp-control-ui.service 2>/dev/null | grep -q '^cdsp-control-ui.service'; then
     install_control_ui
   fi
+  if systemctl list-unit-files --no-legend cdsp-jukebox.service 2>/dev/null | grep -q '^cdsp-jukebox.service'; then
+    create_unit "Guest Jukebox" jukebox.py cdsp-jukebox
+  fi
+}
+
+# Prints the LMS player names, one per line; nothing when LMS does not answer.
+lms_player_names() {
+  local host port
+  host="$(get_env_value LMS_HOST)"
+  port="$(get_env_value LMS_PORT)"
+  curl -s --max-time 5 -H 'Content-Type: application/json' \
+    -d '{"id":1,"method":"slim.request","params":["",["players","0","100"]]}' \
+    "http://${host:-127.0.0.1}:${port:-9000}/jsonrpc.js" 2>/dev/null \
+    | python3 -c 'import json,sys
+try:
+    for p in json.load(sys.stdin)["result"].get("players_loop", []): print(p.get("name", ""))
+except Exception:
+    sys.exit(1)'
+}
+
+# Menu option 13.  Runs as the install user, needs only the Python standard
+# library, and never touches CamillaDSP: it talks to LMS alone.
+install_jukebox() {
+  local players player count port
+  echo "Installing the Guest Jukebox..."
+  if ! players="$(lms_player_names)"; then
+    echo "WARNING: Lyrion Music Server does not answer on $(get_env_value LMS_HOST):$(get_env_value LMS_PORT)." >&2
+    echo "         Install LMS and Squeezelite first (see the README); the jukebox" >&2
+    echo "         is installed anyway and will work once LMS is running." >&2
+    players=""
+  fi
+  count="$(printf '%s' "$players" | grep -c . || true)"
+  if [[ -z "$(get_env_value JUKEBOX_PLAYER)" && "$count" -gt 1 ]]; then
+    echo "LMS knows these players:"
+    sed 's/^/  - /' <<< "$players"
+    read -r -p "Which one should guests queue on? " player || player=""
+    if [[ -n "$player" ]]; then
+      set_env_value JUKEBOX_PLAYER "$player"
+    fi
+  fi
+  create_unit "Guest Jukebox" jukebox.py cdsp-jukebox
+  port="$(get_env_value JUKEBOX_PORT)"
+  echo "Guest Jukebox installed: http://$(hostname).local:${port:-8090}/"
+  echo "Put that address in a QR code for your visitors."
 }
 
 run_diagnose() {
@@ -960,6 +1021,7 @@ CamillaDSP Utilities - Choose an Option
 10) Uninstall All Utilities
 11) Install Web Control UI (optional)
 12) Run Health Check (diagnose)
+13) Install Guest Jukebox (Lyrion queue page for visitors)
 0)  Exit
 Options 5, 8 and 11 also install option 4 when it is missing: the Source
 Switcher is the only thing that applies tone/EQ and speaker changes.
@@ -986,6 +1048,7 @@ main() {
       10) if confirm_action "Remove all CamillaDSP utility services, units and sudoers rules?"; then uninstall_all; else echo "Cancelled."; fi ;;
       11) if confirm_control_ui_exposure; then prepare_install; install_control_ui; print_install_summary; else echo "Cancelled."; fi ;;
       12) run_diagnose ;;
+      13) download_scripts; ensure_venv; install_jukebox ;;
       0) echo "Exiting."; exit 0 ;;
       *) echo "Invalid choice" ;;
     esac
