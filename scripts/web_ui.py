@@ -116,6 +116,10 @@ PORT = ui_bind_port()
 CDSP_ENV = ENV_FILE
 CDSP_CONFIG_DIR = CONFIG_DIR
 UI_SERVICE = "cdsp-control-ui.service"
+# The page's fonts, served from the folder the installer puts next to this
+# script.  A fixed list, so a request can never name any other file.
+FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+FONT_FILES = ("inter-tight.woff2", "ibm-plex-mono-400.woff2", "ibm-plex-mono-500.woff2", "syne.woff2")
 # How long a MOTU volume change waits for the source switcher to apply it
 # (normally within one of its ~1.2 s passes) before answering 202.
 MOTU_VOLUME_REPLY_SECONDS = 3.0
@@ -208,12 +212,18 @@ HTML = r"""<!doctype html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="{{site}}">
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@300;400;500;600&family=IBM+Plex+Mono:wght@400;500&family=Syne:wght@700;800&display=swap">
   <style>
     /* Amber instrument: warm paper, ink rules, halftone meter (after the vist.audio amber theme).
-       Web fonts load from Google when the Pi is online; the fallbacks keep it usable offline. */
+       Fonts: the Pi's own copy first (/fonts/, installed next to this script), Google's copy if
+       that is missing, and the system fonts in the stacks below if neither loads. */
+    @font-face { font-family: "Inter Tight"; font-style: normal; font-weight: 300 600; font-display: swap;
+      src: url("/fonts/inter-tight.woff2") format("woff2"), url("https://fonts.gstatic.com/s/intertight/v9/NGSwv5HMAFg6IuGlBNMjxLsH8ag.woff2") format("woff2"); }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap;
+      src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2"), url("https://fonts.gstatic.com/s/ibmplexmono/v23/-F63fjptAgt5VM-kVkqdyU8n1i8q1w.woff2") format("woff2"); }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap;
+      src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2"), url("https://fonts.gstatic.com/s/ibmplexmono/v23/-F6qfjptAgt5VM-kVkqdyU8n3twJwlBFgg.woff2") format("woff2"); }
+    @font-face { font-family: "Syne"; font-style: normal; font-weight: 700 800; font-display: swap;
+      src: url("/fonts/syne.woff2") format("woff2"), url("https://fonts.gstatic.com/s/syne/v24/8vIH7w4qzmVxm2BL9A.woff2") format("woff2"); }
     :root {
       color-scheme: light;
       --bg: #f3e7d8;
@@ -2973,6 +2983,16 @@ class Handler(BaseHTTPRequestHandler):
         icon_sizes = {"/icon-192.png": 192, "/icon-512.png": 512, "/apple-touch-icon.png": 180}
         if parsed.path in icon_sizes:
             self.send_body(icon_png(icon_sizes[parsed.path]), "image/png")
+            return
+        if parsed.path.startswith("/fonts/") and parsed.path[len("/fonts/"):] in FONT_FILES:
+            # A missing file is a plain 404, which sends the page on to its
+            # Google copy of the font.
+            try:
+                font = (FONTS_DIR / parsed.path[len("/fonts/"):]).read_bytes()
+            except OSError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_body(font, "font/woff2")
             return
 
         if parsed.path == "/api/events":
