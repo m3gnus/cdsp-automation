@@ -2380,6 +2380,13 @@ def test_probe_backoff_delay_escalates_and_is_capped() -> None:
     assert switcher.probe_backoff_delay(3, base=0.0) == 0.0
 
 
+def test_probe_backoff_delay_survives_a_level_that_overflows_a_float() -> None:
+    # 4.0 ** 512 raises OverflowError; a source left ready but silent for
+    # about five days reaches that level and used to break every pass.
+    for level in (511, 512, 10_000):
+        assert switcher.probe_backoff_delay(level) == switcher.PROBE_BACKOFF_MAX
+
+
 class SwitcherLoopClock:
     """A monotonic clock the switcher loop drives forward by sleeping."""
 
