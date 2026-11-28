@@ -33,6 +33,8 @@ if [[ ! "$INSTALL_GROUP" =~ ^[a-zA-Z0-9._-]+$ ]]; then
 fi
 SYSTEMD_UNIT_DIR="${CDSP_AUTOMATION_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 SUDOERS_DIR="${CDSP_AUTOMATION_SUDOERS_DIR:-/etc/sudoers.d}"
+UDEV_RULES_DIR="${CDSP_AUTOMATION_UDEV_RULES_DIR:-/etc/udev/rules.d}"
+PULSE_IGNORE_RULE="89-cdsp-pulse-ignore-motu.rules"
 SYSTEMCTL_BIN="${CDSP_AUTOMATION_SYSTEMCTL_BIN:-/usr/bin/systemctl}"
 VISUDO_BIN="${CDSP_AUTOMATION_VISUDO_BIN:-/usr/sbin/visudo}"
 # These land verbatim in a sudoers rule, where a space or comma would change
@@ -463,6 +465,7 @@ install_source_switcher() {
   echo "Installing Source Switcher..."
   mkdir -p "$CONFIGS_DIR"
   remove_motu_sync
+  install_pulse_ignore_motu
   create_unit "Source Switcher" source_switcher.py cdsp-source-switcher
   echo ""
   echo "IMPORTANT: create these config files if they do not already exist:"
@@ -474,6 +477,32 @@ install_source_switcher() {
   # Remembered for the rest of this run so a component installed after it never
   # re-installs it just because systemd has not caught up with the new unit.
   SOURCE_SWITCHER_INSTALLED_THIS_RUN=1
+}
+
+# CamillaDSP must own the MOTU exclusively. A desktop PulseAudio grabs any new
+# sound card it sees and, when it holds the MOTU's playback device, CamillaDSP
+# cannot open it or stalls. Tag the MOTU (USB 07fd:000c) so PulseAudio leaves
+# it alone. Takes effect the next time the card appears (boot or replug); the
+# rule is only rewritten when it changed, and udev is not retriggered, so an
+# update never disturbs a playing card.
+install_pulse_ignore_motu() {
+  local tmp target="$UDEV_RULES_DIR/$PULSE_IGNORE_RULE"
+  tmp="$(mktemp)"
+  cat > "$tmp" <<'RULE'
+# cdsp-automation: keep PulseAudio off the MOTU so CamillaDSP owns it.
+SUBSYSTEM=="sound", ATTRS{idVendor}=="07fd", ATTRS{idProduct}=="000c", ENV{PULSE_IGNORE}="1"
+RULE
+  if [[ -f "$target" ]] && cmp -s "$tmp" "$target"; then
+    rm -f "$tmp"
+    return 0
+  fi
+  sudo mkdir -p "$UDEV_RULES_DIR"
+  sudo install -m 0644 "$tmp" "$target"
+  rm -f "$tmp"
+  if command -v udevadm >/dev/null 2>&1; then
+    sudo udevadm control --reload-rules 2>/dev/null || true
+  fi
+  echo "PulseAudio will ignore the MOTU from its next connection (udev rule $PULSE_IGNORE_RULE)."
 }
 
 install_remote_sudoers() {
@@ -832,6 +861,7 @@ uninstall_all() {
   done
   remove_motu_sync
   sudo rm -f "$SUDOERS_DIR/cdsp-automation" "$SUDOERS_DIR/cdsp-automation-receivers"
+  sudo rm -f "$UDEV_RULES_DIR/$PULSE_IGNORE_RULE"
   if [[ -x "$SCRIPTS_DIR/build_camilladsp_iso226.sh" ]]; then
     "$SCRIPTS_DIR/build_camilladsp_iso226.sh" --uninstall || true
   fi
@@ -891,6 +921,9 @@ update_utilities() {
     echo "Run menu option 9 to rebuild it against the downloaded pinned patch."
   fi
   audit_operator_volume_limits
+  if source_switcher_present; then
+    install_pulse_ignore_motu
+  fi
   # refresh_installed_units already restarts every installed service once:
   # create_unit does it for each daemon and install_control_ui for the UI.
   # A second pass here restarted each of them again ~2 s later, and the

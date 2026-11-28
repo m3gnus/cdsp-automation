@@ -2869,3 +2869,32 @@ def test_an_engine_running_another_config_file_fails_the_reload_check(
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_failed_speaker_transition_is_held_until_retry_or_new_selection() -> None:
+    latch = switcher.FailedTransitionLatch(retry_seconds=300)
+    attempt = ("partymeh", 4, "streamer", "/configs/oldJVC-streamer.yml")
+    assert not latch.holds(attempt, 0.0)
+
+    latch.record(attempt, 100.0)
+    # The same failing switch is not retried every pass...
+    assert latch.holds(attempt, 101.0)
+    assert latch.holds(attempt, 399.0)
+    # ...but is tried again once the hold expires.
+    assert not latch.holds(attempt, 400.0)
+
+    # A new selection revision (or another speaker) is tried at once.
+    assert not latch.holds(("partymeh", 5, *attempt[2:]), 101.0)
+    assert not latch.holds(("oldjvc", 4, *attempt[2:]), 101.0)
+
+    latch.clear()
+    assert not latch.holds(attempt, 101.0)
+
+
+def test_main_loop_routes_speaker_transitions_through_the_retry_latch() -> None:
+    import inspect
+
+    source = inspect.getsource(switcher.main)
+    assert "failed_transition.holds(transition_key" in source
+    assert "failed_transition.record(transition_key" in source
+    assert "_apply_speaker_transition(" in source
