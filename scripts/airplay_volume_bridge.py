@@ -157,7 +157,7 @@ def set_mapped_volume(
     # copy in /usr/local/libexec merely to send a datagram; deployment helpers
     # used by the daemon live beside the daemon script and may not be installed
     # beside that callback copy.
-    from speaker_profiles import audio_control_lock, volume_ceiling
+    from speaker_profiles import audio_control_lock, speaker_switch_failed, volume_ceiling
 
     # A network sender's 100% maps onto VOLUME_MAX_DB, which knows nothing
     # about the speaker profile in service. The ceiling the switcher verified
@@ -168,6 +168,11 @@ def set_mapped_volume(
         ceiling = volume_ceiling(SPEAKER_STATUS_PATH)
         capped_db = min(mapped_db, ceiling)
         client.volume.set_main_volume(capped_db)
+        # AirPlay and Spotify clients send a volume event (unmuted) on every
+        # session start. After a failed speaker switch the switcher keeps the
+        # engine muted on purpose; such an event must not lift that mute.
+        held_muted = not muted and speaker_switch_failed(SPEAKER_STATUS_PATH)
+        muted = muted or held_muted
         client.volume.set_main_mute(muted)
     result = {
         "ok": True,
@@ -177,6 +182,7 @@ def set_mapped_volume(
         "requested_db": mapped_db,
         "volume_limit_db": ceiling,
         "muted": muted,
+        "held_muted": held_muted,
         "updated_at": time.time(),
     }
     return result

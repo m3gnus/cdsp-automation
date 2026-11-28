@@ -107,6 +107,10 @@ PROBE_SILENCE_TIMEOUT = 5.0
 PROBE_BACKOFF_SECONDS = 30.0
 PROBE_BACKOFF_FACTOR = 4.0
 PROBE_BACKOFF_MAX = 900.0
+# A speaker switch that failed (rolled back, latched muted) is not retried
+# for this long unless the selection changes, so a persistent fault does not
+# mute, reclock and reload the MOTU every pass.
+FAILED_TRANSITION_RETRY_SECONDS = 300.0
 SETTLE_TIME = 2.0
 # SetConfig/Reload acknowledge that a change was queued, not that the
 # processing controller finished applying it. SETTLE_TIME remains the grace
@@ -703,6 +707,32 @@ def _processing_state(cdsp: CamillaClient) -> str:
     if isinstance(name, str):
         return name.strip().lower()
     return str(state).rsplit(".", 1)[-1].strip().lower()
+
+
+class FailedTransitionLatch:
+    """Remembers the last speaker switch that failed and holds off retrying it.
+
+    The key identifies the attempt (selected speaker, selection revision,
+    source and config in service). A different key -- the listener picked
+    another speaker or edited the profile -- is tried at once; the same key
+    waits ``retry_seconds`` while the engine stays muted with ``ok: false``.
+    """
+
+    def __init__(self, retry_seconds: float = FAILED_TRANSITION_RETRY_SECONDS) -> None:
+        self.retry_seconds = retry_seconds
+        self.key: tuple | None = None
+        self.retry_at = 0.0
+
+    def holds(self, key: tuple, now: float) -> bool:
+        return key == self.key and now < self.retry_at
+
+    def record(self, key: tuple, now: float) -> None:
+        self.key = key
+        self.retry_at = now + self.retry_seconds
+
+    def clear(self) -> None:
+        self.key = None
+        self.retry_at = 0.0
 
 
 class ConfigRecoveryGuard:
@@ -1960,6 +1990,59 @@ def mute_for_startup_validation(cdsp: CamillaClient) -> bool:
     return restore_mute
 
 
+def _apply_speaker_transition(
+    cdsp,
+    *,
+    selected_speaker: str,
+    selection_revision,
+    current_speaker: str | None,
+    current_source: str | None,
+    current_config: str,
+    restore_mute: bool | None,
+    remember_volumes: bool,
+) -> None:
+    """Switch the live graph to the selected speaker, or latch muted and raise."""
+    try:
+        if not current_source:
+            raise RuntimeError(
+                "active CamillaDSP config is not managed; "
+                "speaker transition is latched muted"
+            )
+        target = resolve_config_target(
+            current_source,
+            selected_speaker,
+            selection_revision=selection_revision,
+        )
+    except Exception as exc:
+        # The selected speaker cannot be served: stay muted rather than keep
+        # playing the previous speaker's graph.
+        try:
+            with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
+                cdsp.volume.set_main_mute(True)
+        finally:
+            _write_speaker_status(
+                {
+                    "selected": selected_speaker,
+                    "applied": current_speaker,
+                    "source": current_source,
+                    "config_path": current_config,
+                    "config_digest": "",
+                    "ok": False,
+                    "rollback_ok": False,
+                    "error": str(exc),
+                    "updated_at": time.time(),
+                }
+            )
+        raise
+    apply_config(
+        cdsp,
+        target["path"],
+        target=target,
+        restore_mute=restore_mute,
+        remember_volumes=remember_volumes,
+    )
+
+
 def main() -> int:
     print(">>> CamillaDSP Source Switcher Started <<<", flush=True)
     print(
@@ -1991,6 +2074,7 @@ def main() -> int:
     restore_mute: bool | None = None
     startup_configs_validated = False
     recovery = ConfigRecoveryGuard()
+    failed_transition = FailedTransitionLatch()
 
     def applied_ok() -> None:
         nonlocal applied, restore_mute
@@ -2078,45 +2162,37 @@ def main() -> int:
             if current_config and (
                 current_speaker != selected_speaker or profile_edit_pending
             ):
-                try:
-                    if not current_source:
-                        raise RuntimeError(
-                            "active CamillaDSP config is not managed; "
-                            "speaker transition is latched muted"
-                        )
-                    target = resolve_config_target(
-                        current_source,
-                        selected_speaker,
-                        selection_revision=selection["revision"],
-                    )
-                except Exception as exc:
-                    # The selected speaker cannot be served: stay muted rather
-                    # than keep playing the previous speaker's graph.
-                    try:
-                        with audio_control_lock(AUDIO_CONTROL_LOCK_PATH):
-                            cdsp.volume.set_main_mute(True)
-                    finally:
-                        _write_speaker_status(
-                            {
-                                "selected": selected_speaker,
-                                "applied": current_speaker,
-                                "source": current_source,
-                                "config_path": current_config,
-                                "config_digest": "",
-                                "ok": False,
-                                "rollback_ok": False,
-                                "error": str(exc),
-                                "updated_at": time.time(),
-                            }
-                        )
-                    raise
-                apply_config(
-                    cdsp,
-                    target["path"],
-                    target=target,
-                    restore_mute=restore_mute,
-                    remember_volumes=remember_volumes(),
+                transition_key = (
+                    selected_speaker,
+                    selection["revision"],
+                    current_source,
+                    current_config,
                 )
+                if failed_transition.holds(transition_key, time.monotonic()):
+                    # Still muted with ok: false from the failed attempt.
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+                try:
+                    _apply_speaker_transition(
+                        cdsp,
+                        selected_speaker=selected_speaker,
+                        selection_revision=selection["revision"],
+                        current_speaker=current_speaker,
+                        current_source=current_source,
+                        current_config=current_config,
+                        restore_mute=restore_mute,
+                        remember_volumes=remember_volumes(),
+                    )
+                except Exception:
+                    failed_transition.record(transition_key, time.monotonic())
+                    print(
+                        f"Speaker switch to {selected_speaker!r} failed; not "
+                        f"retrying for {FAILED_TRANSITION_RETRY_SECONDS:.0f}s "
+                        "unless the selection changes",
+                        flush=True,
+                    )
+                    raise
+                failed_transition.clear()
                 applied_ok()
                 time.sleep(CHECK_INTERVAL)
                 continue

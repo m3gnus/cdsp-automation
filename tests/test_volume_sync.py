@@ -613,6 +613,64 @@ def test_network_sender_volume_is_capped_by_the_applied_profile(
     assert volume == speaker_profiles.FAILSAFE_VOLUME_LIMIT_DB
 
 
+def test_network_sender_cannot_unmute_after_a_failed_speaker_switch(
+    tmp_path: Path,
+) -> None:
+    """A session-start volume event must not lift the switcher's failure mute."""
+
+    class Volume:
+        def __init__(self) -> None:
+            self.mute = True
+            self.volume = -40.0
+
+        def set_main_volume(self, value: float) -> None:
+            self.volume = value
+
+        def set_main_mute(self, value: bool) -> None:
+            self.mute = value
+
+    status = tmp_path / "speaker-profile-status.json"
+
+    def send(argument):
+        client = SimpleNamespace(volume=Volume())
+        with (
+            patch.object(
+                volume_sync, "AUDIO_CONTROL_LOCK_PATH", tmp_path / "audio.lock"
+            ),
+            patch.object(volume_sync, "SPEAKER_STATUS_PATH", status),
+            patch.object(volume_sync, "STATUS_PATH", tmp_path / "bridge-status.json"),
+        ):
+            result = volume_sync.set_client_volume(client, argument)
+        return client.volume, result
+
+    status.write_text(
+        '{"ok": false, "applied": "partymeh", "error": "start failed"}',
+        encoding="utf-8",
+    )
+    volume, result = send(-15)
+    assert volume.mute is True
+    assert result["muted"] is True
+    assert result["held_muted"] is True
+    # Muting from the sender still works while the failure stands.
+    volume, result = send(-144)
+    assert volume.mute is True
+    assert result["held_muted"] is False
+
+    # After a verified apply the sender unmutes as before.
+    status.write_text(
+        '{"ok": true, "applied": "partymeh", "volume_limit_db": 0.0}',
+        encoding="utf-8",
+    )
+    volume, result = send(-15)
+    assert volume.mute is False
+    assert result["held_muted"] is False
+
+    # Setups without speaker profiles never write a status: no block.
+    status.unlink()
+    volume, _ = send(-15)
+    assert volume.mute is False
+
+
 def test_airplay_notify_callback_starts_without_deployment_helpers(
     tmp_path: Path,
 ) -> None:

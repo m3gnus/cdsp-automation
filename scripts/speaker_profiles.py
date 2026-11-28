@@ -384,6 +384,22 @@ def read_effective_volume_limit(
     return fallback if limit is None else limit
 
 
+def speaker_switch_failed(path: Path) -> bool:
+    """True while the switcher reports a failed speaker switch.
+
+    After a failed switch or rollback the switcher leaves CamillaDSP muted and
+    writes ``ok: false``. Control surfaces that react to network senders must
+    not unmute on their own then: the graph in service is unverified. A missing
+    or unreadable status is not a recorded failure (setups without speaker
+    profiles never write one), so it does not block.
+    """
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return isinstance(raw, dict) and raw.get("ok") is False
+
+
 def volume_ceiling(
     path: Path,
     *,

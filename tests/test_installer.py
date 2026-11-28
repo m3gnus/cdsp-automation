@@ -978,6 +978,60 @@ ensure_audio_state_storage
             self.assertFalse((sudoers / "cdsp-automation").exists())
             self.assertFalse((sudoers / "cdsp-automation-receivers").exists())
 
+    def test_pulse_ignore_rule_is_installed_once_and_removed_on_uninstall(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rules = root / "rules.d"
+            log = root / "udevadm.log"
+            env = {
+                "HOME": str(root),
+                "CDSP_AUTOMATION_BASE_DIR": str(root / "site"),
+                "CDSP_AUTOMATION_UDEV_RULES_DIR": str(rules),
+                "CDSP_AUTOMATION_SYSTEMD_UNIT_DIR": str(root / "units"),
+                "CDSP_AUTOMATION_SUDOERS_DIR": str(root / "sudoers.d"),
+            }
+            stubs = [
+                f"udevadm() {{ printf '%s\\n' \"$*\" >> {log!s}; }}",
+                'sudo() { if [[ "$1" == udevadm ]]; then shift; udevadm "$@"; '
+                'else command "$@"; fi; }',
+            ]
+            self._run("\n".join([*stubs, "install_pulse_ignore_motu"]), env=env)
+            rule = (rules / "89-cdsp-pulse-ignore-motu.rules").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('ATTRS{idVendor}=="07fd"', rule)
+            self.assertIn('ATTRS{idProduct}=="000c"', rule)
+            self.assertIn('ENV{PULSE_IGNORE}="1"', rule)
+            self.assertNotIn("trigger", log.read_text(encoding="utf-8"))
+            self.assertIn("control --reload-rules", log.read_text(encoding="utf-8"))
+
+            # Unchanged rule: nothing rewritten, udev left alone.
+            log.unlink()
+            self._run("\n".join([*stubs, "install_pulse_ignore_motu"]), env=env)
+            self.assertFalse(log.exists())
+
+            self._run(
+                "\n".join(
+                    [
+                        "systemctl() { :; }",
+                        'sudo() { if [[ "$1" == rm ]]; then command "$@"; fi; }',
+                        "SCRIPTS_DIR=/nonexistent",
+                        "uninstall_all",
+                    ]
+                ),
+                env=env,
+            )
+            self.assertFalse((rules / "89-cdsp-pulse-ignore-motu.rules").exists())
+
+    def test_switcher_install_and_update_both_install_the_pulse_rule(self) -> None:
+        installer = INSTALLER.read_text(encoding="utf-8")
+        switcher = installer.split("install_source_switcher() {", 1)[1].split("\n}", 1)[0]
+        update = installer.split("update_utilities() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("install_pulse_ignore_motu", switcher)
+        self.assertIn("install_pulse_ignore_motu", update)
+
     def test_default_env_publishes_only_site_settings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = self._run(
