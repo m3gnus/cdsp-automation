@@ -756,7 +756,6 @@ ensure_audio_state_storage
                     "unit:cdsp-remote",
                     "spotify",
                     "ui",
-                    "unit:cdsp-jukebox",
                 ],
             )
 
@@ -1078,8 +1077,7 @@ ensure_audio_state_storage
         self.assertIn("10) Uninstall All Utilities", output)
         self.assertIn("11) Install Web Control UI (optional)", output)
         self.assertIn("12) Run Health Check (diagnose)", output)
-        self.assertIn("13) Install Guest Jukebox", output)
-        self.assertNotIn("14)", output)
+        self.assertNotIn("13)", output)
         self.assertNotIn("MOTU Clock Sync", output)
         readme = (REPOSITORY / "README.md").read_text(encoding="utf-8")
         technical = (REPOSITORY / "TECHNICAL.md").read_text(encoding="utf-8")
@@ -1291,58 +1289,6 @@ ensure_audio_state_storage
                 self.assertEqual(
                     count, 1, f"{service} restarted {count} times: {restarts}"
                 )
-
-class JukeboxInstallerTests(unittest.TestCase):
-    def test_jukebox_is_downloaded_offered_and_refreshed(self) -> None:
-        installer = INSTALLER.read_text(encoding="utf-8")
-        self.assertIn("web_ui.py jukebox.py; do", installer)
-        self.assertIn("13) Install Guest Jukebox", installer)
-        self.assertIn('create_unit "Guest Jukebox" jukebox.py cdsp-jukebox', installer)
-        refresh = installer.split("refresh_installed_units() {", 1)[1].split("\n}\n", 1)[0]
-        self.assertIn("cdsp-jukebox.service", refresh)
-
-    def test_install_asks_which_player_when_lms_has_several(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            log = root / "calls.log"
-            command = f"""
-set -euo pipefail
-export HOME={root!s}
-export CDSP_AUTOMATION_BASE_DIR={root!s}/site
-source {INSTALLER!s}
-curl() {{ printf '%s' '{{"result":{{"players_loop":[{{"name":"Hifi"}},{{"name":"Office"}}]}}}}'; }}
-create_unit() {{ printf '%s\\n' "$*" >> {log!s}; }}
-ensure_env_file
-install_jukebox <<< "Hifi"
-get_env_value JUKEBOX_PLAYER
-"""
-            result = subprocess.run(
-                ["bash", "-c", command], check=True, capture_output=True, text=True,
-                env={"HOME": str(root), "PATH": os.environ["PATH"]},
-            )
-            self.assertIn("  - Office", result.stdout)
-            self.assertEqual(result.stdout.strip().splitlines()[-1], "Hifi")
-            self.assertIn("Guest Jukebox jukebox.py cdsp-jukebox", log.read_text())
-
-    def test_install_continues_when_lms_is_down(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            command = f"""
-set -euo pipefail
-export HOME={root!s}
-export CDSP_AUTOMATION_BASE_DIR={root!s}/site
-source {INSTALLER!s}
-curl() {{ return 7; }}
-create_unit() {{ echo UNIT "$3"; }}
-ensure_env_file
-install_jukebox < /dev/null
-"""
-            result = subprocess.run(
-                ["bash", "-c", command], check=True, capture_output=True, text=True,
-                env={"HOME": str(root), "PATH": os.environ["PATH"]},
-            )
-            self.assertIn("UNIT cdsp-jukebox", result.stdout)
-            self.assertIn("does not answer", result.stderr)
 
 
 if __name__ == "__main__":

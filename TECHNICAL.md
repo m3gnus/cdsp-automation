@@ -12,8 +12,7 @@ unit loads with `EnvironmentFile=`: `CDSP_HOST`, `CDSP_PORT`,
 `SOURCE_VOLUME_MEMORY`, `REMOTE_NAME`,
 `REMOTE_VOLUME_MIN`/`MAX`, `AIRPLAY_VOLUME_MIN_DB`/`MAX_DB`,
 `AIRPLAY_INTERRUPTED_LMS_PLAYERS`, `SPOTIFY_ALSA_DEVICE`, `SITE_NAME` and
-`INSTALLATION_UI_HOST`/`PORT`/`TOKEN`; the guest jukebox reads `LMS_HOST`,
-`LMS_PORT` and the `JUKEBOX_*` keys. Other keys in the file are ignored.
+`INSTALLATION_UI_HOST`/`PORT`/`TOKEN`. Other keys in the file are ignored.
 The AirPlay callback copy in `/usr/local/libexec` gets `settings.py` beside it.
 
 ## Speaker-profile contract
