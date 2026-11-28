@@ -275,7 +275,7 @@ download_scripts() {
   echo "Downloading scripts from GitHub..."
   ensure_env_file
   local script tmp
-  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py jukebox.py; do
+  for script in settings.py trigger.py source_switcher.py cdsp_remote.py audio_eq.py eq_headroom.py speaker_profiles.py speaker_config.py speaker_xo.py airplay_volume_bridge.py configure_shairport.py motu_volume.py source_volume.py remote_keymap.py diagnose.py web_ui.py jukebox.py; do
     tmp="${SCRIPTS_DIR}/${script}.tmp"
     if [[ -f "$REPO_DIR/scripts/$script" ]]; then
       cp "$REPO_DIR/scripts/$script" "$tmp"
@@ -590,7 +590,7 @@ install_airplay_volume_bridge() {
   ensure_source_switcher "AirPlay/Spotify volume bridge"
   sudo install -d -m 0755 /usr/local/libexec
   sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
-  sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
+  sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" "$SCRIPTS_DIR/eq_headroom.py" /usr/local/libexec/
   # Before create_unit, which starts the daemon: a bridge that comes up without
   # its receiver authorization cannot hand playback over.
   install_receiver_sudoers || return 1
@@ -733,7 +733,7 @@ refresh_installed_units() {
   if systemctl list-unit-files --no-legend airplay-volume-bridge.service 2>/dev/null | grep -q '^airplay-volume-bridge.service'; then
     sudo install -d -m 0755 /usr/local/libexec
     sudo install -m 0755 "$SCRIPTS_DIR/airplay_volume_bridge.py" /usr/local/libexec/airplay_volume_bridge.py
-    sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" /usr/local/libexec/
+    sudo install -m 0644 "$SCRIPTS_DIR/settings.py" "$SCRIPTS_DIR/speaker_profiles.py" "$SCRIPTS_DIR/audio_eq.py" "$SCRIPTS_DIR/eq_headroom.py" /usr/local/libexec/
     install_receiver_sudoers
     create_unit "AirPlay Volume Bridge" airplay_volume_bridge.py airplay-volume-bridge --daemon
     configure_shairport_bridge || note_skip "AirPlay Shairport configuration: FAILED (previous settings were restored)"
@@ -846,7 +846,7 @@ uninstall_all() {
   sudo systemctl disable cdsp-control-ui.service 2>/dev/null || true
   remove_unit_file cdsp-control-ui.service
   sudo rm -f /usr/local/libexec/airplay_volume_bridge.py /usr/local/libexec/settings.py \
-    /usr/local/libexec/speaker_profiles.py /usr/local/libexec/audio_eq.py
+    /usr/local/libexec/speaker_profiles.py /usr/local/libexec/audio_eq.py /usr/local/libexec/eq_headroom.py
   sudo systemctl daemon-reload
   echo "Uninstalled."
 }

@@ -25,7 +25,6 @@ from audio_eq import (
     PIPELINE_DESCRIPTION,
     apply_audio_overlay,
     atomic_write_json,
-    effective_preamp_db,
     status_payload,
 )
 import motu_volume
@@ -1129,12 +1128,15 @@ def ensure_audio_eq(
             safe_state["enabled"] = False
             safe_state["loudness"]["enabled"] = False
             safe_state["preamp_db"] = 0.0
-            updated, _preamp = apply_audio_overlay(config, safe_state, motu_db=motu_db)
+            # A profile that bypasses the user EQ (the Measurement profile)
+            # wants the raw chain: no automatic headroom margin either.
+            safe_state["auto_headroom"] = False
+            updated, preamp = apply_audio_overlay(config, safe_state, motu_db=motu_db)
             if not _configs_equivalent(config, updated):
                 _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
                 {
-                    **status_payload(state, applied=True, effective_preamp=0.0),
+                    **status_payload(state, applied=True, effective_preamp=preamp),
                     "speaker": speaker_id,
                 }
             )
@@ -1143,7 +1145,10 @@ def ensure_audio_eq(
         if not iso226_capability_available():
             safe_state = copy.deepcopy(state)
             safe_state["loudness"]["enabled"] = False
-            updated, preamp = apply_audio_overlay(config, safe_state, motu_db=motu_db)
+            headroom: dict = {}
+            updated, preamp = apply_audio_overlay(
+                config, safe_state, motu_db=motu_db, report=headroom
+            )
             if not _configs_equivalent(config, updated):
                 _submit_audio_overlay(cdsp, updated)
             _write_audio_eq_status(
@@ -1152,13 +1157,17 @@ def ensure_audio_eq(
                         state,
                         applied=False,
                         effective_preamp=preamp,
+                        headroom=headroom,
                         error="ISO 226 engine capability is missing; loudness bypassed",
                     ),
                     "speaker": speaker_id,
                 }
             )
             return
-    updated, preamp = apply_audio_overlay(config, state, motu_db=motu_db)
+    headroom = {}
+    updated, preamp = apply_audio_overlay(
+        config, state, motu_db=motu_db, report=headroom
+    )
     changed = not _configs_equivalent(config, updated)
     if changed:
         _submit_audio_overlay(cdsp, updated)
@@ -1169,7 +1178,9 @@ def ensure_audio_eq(
         )
     _write_audio_eq_status(
         {
-            **status_payload(state, applied=True, effective_preamp=preamp),
+            **status_payload(
+                state, applied=True, effective_preamp=preamp, headroom=headroom
+            ),
             "speaker": speaker_id,
         }
     )
@@ -2135,7 +2146,7 @@ def main() -> int:
                                 **status_payload(
                                     state,
                                     applied=False,
-                                    effective_preamp=effective_preamp_db(state),
+                                    effective_preamp=None,
                                     error=str(exc),
                                 ),
                                 "speaker": failed_speaker,

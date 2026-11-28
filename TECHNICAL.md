@@ -137,6 +137,39 @@ patch applies it like a fader move: `update_parameters` only marks the filter
 for redesign, and the next chunk crossfades from the old cascade to the new
 one (`parameter_change_is_crossfaded` asserts the output does not step).
 
+### Automatic EQ headroom
+
+The user-EQ preamp (`cdsp_ui_eq_preamp`, a Gain right after loudness in the
+overlay step) is sized from the whole chain, not from the user bands alone.
+`eq_headroom.chain_peak()` walks the final config as signal paths, from each
+capture channel through every Filter step and mixer row to each output, so
+speaker-profile correction and crossover filters count on the outputs they
+feed. Each path's magnitude is the sum of its filters, evaluated on a log grid
+from DC to Nyquist and refined around its peaks. The RBJ biquads are evaluated
+as their analog prototypes at the prewarped frequency, which matches the
+engine's coefficients exactly. The preamp is then
+`min(manual, −(peak + headroom_margin_db))`, and never a boost.
+
+- **Counted:** every Biquad and BiquadCombo response (Butterworth,
+  Linkwitz-Riley, FivePointPeq) and DiffEq. Negative Gain filters and negative
+  mixer gains count as headroom already reserved: a profile that pairs a
+  resonant shelf with its own "calibration headroom" cut is not cut twice.
+- **Not counted:** positive gains, polarity, delays, allpasses and the fader,
+  which are level choices. Loudness also adds nothing. The engine keeps
+  fader + loudness ≤ 0 dB at every frequency, so the worst case is fader
+  0 dB, where loudness is flat.
+- **Reported instead of guessed:** Conv files, processors and unsupported
+  subtypes are listed in the EQ status as "not counted".
+
+The margin (default 1 dB, 0–6) covers what a magnitude response cannot show:
+steep-filter overshoot on transients and inter-sample peaks that the resampler
+turns into real samples. CamillaDSP computes in 64-bit float, so only the
+conversion to the output format can clip, and lowering the MOTU output does
+not help. The preamp stays in force with the user EQ switched off. Only
+profiles with `bypass_user_eq` (the Measurement profile) get the raw chain
+with no preamp. `normalize_audio_state` rejects a band set whose own peak
+cannot be compensated within CamillaDSP's ±150 dB gain range.
+
 ### Per-source volume memory
 
 Each speaker/source pair remembers the CamillaDSP Main level and the MOTU main

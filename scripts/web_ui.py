@@ -471,6 +471,20 @@ HTML = r"""<!doctype html>
     .eq-band label { color: var(--muted); font: 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
     .eq-band label input, .eq-band label select { margin-top: 4px; width: 100%; }
     .eq-power { align-self: center; }
+    .eq-region { font: 10px var(--mono); fill: var(--faint); letter-spacing: .04em; }
+    .eq-region-bar { fill: var(--raised); stroke: var(--line); stroke-width: 1; }
+    .eq-region-bar.alt { fill: var(--panel); }
+    .eq-shade { fill: var(--tone); opacity: .12; }
+    .eq-shade-edge { stroke: var(--tone); stroke-dasharray: 3 5; opacity: .6; }
+    .eq-guide { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line2); border-radius: 10px; }
+    .eq-guide-rows { display: grid; gap: 8px; margin-top: 8px; }
+    .eq-guide-row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .eq-guide-row > span { color: var(--muted); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; min-width: 74px; }
+    .eq-chip { border: 1px solid var(--line2); background: transparent; color: inherit; border-radius: 999px; padding: 4px 11px; font: inherit; font-size: 13px; cursor: pointer; }
+    .eq-chip:hover { border-color: var(--muted); }
+    .eq-chip.on { border-color: var(--accent); color: var(--accent); }
+    .eq-guide-advice { margin-top: 10px; display: grid; gap: 6px; }
+    .eq-guide-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 2px; }
     .audio-kv { display: grid; gap: 14px; align-content: start; }
     .audio-state { font: 12px var(--mono); }
     .speaker-summary { display: grid; gap: 10px; }
@@ -660,6 +674,7 @@ HTML = r"""<!doctype html>
           <div class="card">
             <div class="cap">User EQ response</div>
             <svg id="eqPlot" class="eq-plot" viewBox="0 0 900 360" role="img" aria-label="User equalizer frequency response"></svg>
+            <div id="eqGuide" class="eq-guide"></div>
             <div id="eqBands" class="eq-band-list"></div>
             <div class="actionbar">
               <button class="btn" id="eqAdd" disabled>+ Add band</button>
@@ -974,6 +989,7 @@ HTML = r"""<!doctype html>
       svg.innerHTML = `<defs><linearGradient id="eqFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#d9531f"/><stop offset="1" stop-color="#d9531f" stop-opacity="0"/></linearGradient></defs>
         ${freqTicks.map(f => `<line class="eq-grid-line" x1="${eqX(f)}" x2="${eqX(f)}" y1="${EQ_Y0}" y2="${EQ_Y1}"/><text class="eq-axis" x="${eqX(f)}" y="342" text-anchor="middle">${f>=1000 ? (f/1000)+"k" : f}</text>`).join("")}
         ${gainTicks.map(g => `<line class="${g===0 ? "eq-zero" : "eq-grid-line"}" x1="${EQ_X0}" x2="${EQ_X1}" y1="${eqY(g)}" y2="${eqY(g)}"/><text class="eq-axis" x="45" y="${eqY(g)+4}" text-anchor="end">${g>0?"+":""}${g}</text>`).join("")}
+        ${eqGuideShade()}${eqRegionStrip()}
         ${bandCurves}${markers}
         <path class="eq-fill" d="${fill}"/><path class="eq-curve" d="${curve}"/>
         ${section.bands.map((b,i) => {const y=eqY(eqSupportsGain(b)?b.gain:0);return `<g opacity="${b.enabled && section.enabled && (eqSoloBand==null||eqSoloBand===i) ? 1 : .25}"><circle class="eq-handle" data-eq-handle="${i}" cx="${eqX(b.freq)}" cy="${y}" r="${selectedEqBand===i?14:12}" fill="${EQ_COLORS[i%EQ_COLORS.length]}"/><text x="${eqX(b.freq)}" y="${y+4}" text-anchor="middle" fill="#fbf3ea" font-size="11" font-weight="700">${i+1}</text></g>`;}).join("")}`;
@@ -1001,6 +1017,124 @@ HTML = r"""<!doctype html>
       svg.onpointerup = svg.onpointercancel = () => { draggedBand = null; };
       svg.ondblclick = e => { const handle=e.target.closest&&e.target.closest("[data-eq-handle]"); if(!handle)return; const b=audioState.bands[Number(handle.dataset.eqHandle)]; if(eqSupportsGain(b)){b.gain=0;renderAudioEditor();scheduleAudioSave();} };
       svg.onwheel = e => { const handle=e.target.closest&&e.target.closest("[data-eq-handle]"); if(!handle)return; e.preventDefault(); const i=Number(handle.dataset.eqHandle),b=audioState.bands[i],step=e.shiftKey?0.02:0.1; b.q=Math.max(.1,Math.min(20,Math.round((b.q+(e.deltaY<0?step:-step))*100)/100)); selectedEqBand=i;renderAudioEditor();scheduleAudioSave(); };
+    }
+
+    /* ---------------- listening guide ----------------
+       Starting points, not diagnoses: each chip names a search range and one
+       bell to try there, which the listener then moves by ear. Ranges and
+       settings merge two independent reviews of common practice. */
+    const EQ_REGIONS = [["Sub-bass",20,60],["Bass",60,250],["Low mids",250,500],["Mids",500,2000],["Presence",2000,6000],["Brilliance",6000,12000],["Air",12000,20000]];
+    const EQ_GUIDE = [
+      {id:"boomy", label:"Boomy", more:true, lo:60, hi:150, freq:100, gain:-3, q:4,
+       tip:"Usually a room resonance: one or two notes ring on. Sweep the band slowly through the range, stop where the boom is worst, and keep it narrow."},
+      {id:"muddy", label:"Muddy", more:true, lo:180, hi:400, freq:250, gain:-3, q:1.4,
+       tip:"Bass and lower voices blur together. A gentle cut here often also cures “dull”."},
+      {id:"boxy", label:"Boxy", more:true, lo:350, hi:800, freq:500, gain:-2.5, q:1.8,
+       tip:"Sounds like it comes from inside a box or cabinet. Close to muddy; try both."},
+      {id:"honky", label:"Honky / nasal", more:true, lo:700, hi:1600, freq:1000, gain:-2.5, q:2,
+       tip:"Voices sound pinched, like through a cardboard tube or a telephone."},
+      {id:"harsh", label:"Harsh", more:true, lo:2000, hi:5000, freq:3000, gain:-2, q:1.6,
+       tip:"Glare and listening fatigue live here, lower than most people expect. Small cuts go a long way."},
+      {id:"piercing", label:"Piercing", more:true, lo:3500, hi:7000, freq:5000, gain:-2.5, q:2.5,
+       tip:"Sharp, metallic edge on cymbals and strings. Overlaps harsh: if this does little, try harsh."},
+      {id:"sibilant", label:"Sibilant", more:true, lo:5000, hi:9000, freq:6500, gain:-3, q:3,
+       tip:"Hissing “s” and “sh” sounds. Often in the recording itself; a fixed cut dulls everything else, so keep it narrow and modest."},
+      {id:"thin", label:"Thin", more:false, lo:80, hi:250, freq:150, gain:2, q:0.9,
+       tip:"Lacks body and warmth. Too much 3–5 kHz sounds thin too, so try a harsh cut first."},
+      {id:"hollow", label:"Hollow", more:false, lo:300, hi:800, freq:500, gain:2, q:1.2,
+       tip:"Often a dip from speaker or room cancellation, which boosting cannot fill. If the boost barely helps, take it out again."},
+      {id:"dull", label:"Dull / laid back", more:false, lo:3000, hi:6000, freq:4000, gain:2, q:0.9,
+       tip:"Lacks presence and detail. Can also be too much low mids: try a muddy cut first."},
+      {id:"air", label:"No air", more:false, lo:10000, hi:16000, freq:12000, gain:2, q:0.7,
+       tip:"Cymbals lack shimmer and space. Subtle by nature; only audible if the speakers and your ears reach up there."},
+    ];
+    const EQ_TRIAL_ID = "guide_trial";
+    let eqGuideChip = null;
+    const eqFmtHz = f => f >= 1000 ? `${+(f/1000).toFixed(1)} kHz` : `${Math.round(f)} Hz`;
+    const eqGuideItem = () => EQ_GUIDE.find(g => g.id === eqGuideChip) || null;
+    const eqTrialIndex = () => audioState ? audioState.bands.findIndex(b => b.id === EQ_TRIAL_ID) : -1;
+
+    function eqRegionStrip() {
+      return EQ_REGIONS.map(([name, lo, hi], i) => {
+        const x0 = eqX(lo), x1 = eqX(hi), mid = (x0 + x1) / 2, wide = x1 - x0 > name.length * 6.4 + 6;
+        return `<rect class="eq-region-bar ${i % 2 ? "alt" : ""}" x="${x0}" y="2" width="${x1 - x0}" height="15"/>` +
+          (wide ? `<text class="eq-region" x="${mid}" y="13" text-anchor="middle">${name}</text>` : "");
+      }).join("");
+    }
+
+    function eqGuideShade() {
+      const g = eqGuideItem(); if (!g) return "";
+      const x0 = eqX(g.lo), x1 = eqX(g.hi);
+      return `<rect class="eq-shade" x="${x0}" y="${EQ_Y0}" width="${x1 - x0}" height="${EQ_Y1 - EQ_Y0}"/>` +
+        `<line class="eq-shade-edge" x1="${x0}" x2="${x0}" y1="${EQ_Y0}" y2="${EQ_Y1}"/><line class="eq-shade-edge" x1="${x1}" x2="${x1}" y1="${EQ_Y0}" y2="${EQ_Y1}"/>`;
+    }
+
+    function renderEqGuide() {
+      const host = qs("#eqGuide"); if (!host || !audioState) return;
+      const chips = more => EQ_GUIDE.filter(g => g.more === more).map(g =>
+        `<button class="eq-chip ${eqGuideChip === g.id ? "on" : ""}" data-eq-guide="${g.id}" aria-pressed="${eqGuideChip === g.id}">${g.label}</button>`).join("");
+      const g = eqGuideItem(), trial = eqTrialIndex(), full = trial < 0 && audioState.bands.length >= 16;
+      let advice = "";
+      if (g) {
+        const sign = g.gain > 0 ? "+" : "−";
+        advice = `<div class="eq-guide-advice">
+          <div><b>${g.label}</b> · ${eqFmtHz(g.lo)}–${eqFmtHz(g.hi)} · try ${g.gain > 0 ? "a boost" : "a cut"} of ${sign}${Math.abs(g.gain)} dB at ${eqFmtHz(g.freq)}, Q ${g.q}</div>
+          <div class="sub2">${g.tip}</div>
+          <div class="eq-guide-actions">
+            <button class="btn sm" id="eqGuideTry" ${full ? "disabled" : ""}>${trial >= 0 ? "Move trial band here" : "Try it"}</button>
+            ${full ? `<span class="sub2">All 16 bands are in use: delete one first.</span>` : ""}
+          </div></div>`;
+      }
+      let trialRow = "";
+      if (trial >= 0) {
+        const b = audioState.bands[trial];
+        trialRow = `<div class="eq-guide-advice"><div class="sub2">Trial band ${trial + 1}: ${b.type} ${eqFmtHz(b.freq)}${eqSupportsGain(b) ? ` ${b.gain > 0 ? "+" : ""}${b.gain} dB` : ""}, Q ${b.q}. Drag it on the plot until it sounds right, and switch it off and on to compare.</div>
+          <div class="eq-guide-actions">
+            <button class="btn sm ghost" id="eqGuideCompare">${b.enabled ? "Bypass to compare" : "Turn back on"}</button>
+            <button class="btn sm" id="eqGuideKeep">Keep</button>
+            <button class="btn sm ghost" id="eqGuideDiscard">Discard</button>
+          </div></div>`;
+      }
+      host.innerHTML = `<div class="cap">Sounds… <span class="sub2" style="text-transform:none;letter-spacing:0">pick what you hear for a starting point</span></div>
+        <div class="eq-guide-rows">
+          <div class="eq-guide-row"><span>Too much</span>${chips(true)}</div>
+          <div class="eq-guide-row"><span>Too little</span>${chips(false)}</div>
+        </div>${advice}${trialRow}
+        <div class="sub2" style="margin-top:10px">Change one thing at a time and keep moves small (2–3 dB). Boosting is safe: automatic headroom lowers the level to match.</div>`;
+      qsa("[data-eq-guide]").forEach(el => el.addEventListener("click", () => {
+        eqGuideChip = eqGuideChip === el.dataset.eqGuide ? null : el.dataset.eqGuide; renderEqPlot(); renderEqGuide();
+      }));
+      const tryBtn = qs("#eqGuideTry");
+      if (tryBtn) tryBtn.addEventListener("click", () => {
+        const item = eqGuideItem(); if (!item) return;
+        let i = eqTrialIndex();
+        if (i < 0) {
+          if (audioState.bands.length >= 16) { toast("A maximum of 16 EQ bands is supported."); return; }
+          audioState.bands.push({id: EQ_TRIAL_ID, enabled: true, type: "Peaking", freq: item.freq, gain: item.gain, q: item.q});
+          i = audioState.bands.length - 1;
+        } else {
+          Object.assign(audioState.bands[i], {enabled: true, type: "Peaking", freq: item.freq, gain: item.gain, q: item.q});
+        }
+        selectedEqBand = i; renderAudioEditor(); scheduleAudioSave();
+      });
+      const cmp = qs("#eqGuideCompare");
+      if (cmp) cmp.addEventListener("click", () => {
+        const b = audioState.bands[eqTrialIndex()]; if (!b) return;
+        b.enabled = !b.enabled; renderAudioEditor(); scheduleAudioSave();
+      });
+      const keep = qs("#eqGuideKeep");
+      if (keep) keep.addEventListener("click", () => {
+        const b = audioState.bands[eqTrialIndex()]; if (!b) return;
+        b.id = `band_${Date.now().toString(36)}`; eqGuideChip = null; renderAudioEditor(); scheduleAudioSave();
+      });
+      const discard = qs("#eqGuideDiscard");
+      if (discard) discard.addEventListener("click", () => {
+        const i = eqTrialIndex(); if (i < 0) return;
+        audioState.bands.splice(i, 1);
+        if (eqSoloBand === i) eqSoloBand = null; else if (eqSoloBand > i) eqSoloBand--;
+        if (selectedEqBand != null && selectedEqBand >= audioState.bands.length) selectedEqBand = audioState.bands.length - 1;
+        renderAudioEditor(); scheduleAudioSave();
+      });
     }
 
     function syncEqBandInputs(index) {
@@ -1035,16 +1169,30 @@ HTML = r"""<!doctype html>
       }));
     }
 
+    // Explains where the automatic preamp comes from: the highest point of the
+    // whole chain (user EQ plus speaker-profile filters), not this plot alone.
+    function eqHeadroomNote(h) {
+      if (!audioState.auto_headroom) return " Automatic headroom is off: only the manual preamp applies.";
+      if (!h || h.peak_db == null) return " Automatic headroom keeps the loudest point of the whole chain (this EQ plus the speaker profile's filters) below full scale.";
+      const peak = Number(h.peak_db), where = h.peak_hz != null && h.output_channel != null
+        ? ` at ${h.peak_hz >= 1000 ? (h.peak_hz/1000).toFixed(1)+" kHz" : Math.round(h.peak_hz)+" Hz"} on output ${Number(h.output_channel)+1}` : "";
+      const missing = (h.not_counted || []).length
+        ? ` <span class="warn">Not counted: ${(h.not_counted).map(esc).join("; ")}.</span>` : "";
+      return ` Whole-chain peak ${peak >= 0 ? "+" : ""}${peak.toFixed(1)} dB${where}, kept ${Number(h.margin_db ?? 0).toFixed(1)} dB below full scale.${missing}`;
+    }
+
     function renderAudioEditor(status = {}) {
       if (!audioState) return;
-      renderEqPlot(); renderEqBands();
+      renderEqPlot(); renderEqBands(); renderEqGuide();
       qs("#eqGlobal").innerHTML = `<div class="cap">Global EQ</div>
         <label class="row" style="margin-top:12px"><span class="switch"><input id="eqEnabled" type="checkbox" ${audioState.enabled?"checked":""}><span></span></span> Enabled</label>
         <label class="row" style="margin-top:12px"><span class="switch"><input id="eqHeadroom" type="checkbox" ${audioState.auto_headroom?"checked":""}><span></span></span> Automatic headroom</label>
+        <label style="display:block;margin-top:14px" class="sub2">Headroom margin (dB)<input id="eqMargin" type="number" min="0" max="6" step="0.5" value="${audioState.headroom_margin_db ?? 1}" ${audioState.auto_headroom?"":"disabled"} style="margin-top:5px"></label>
         <label style="display:block;margin-top:14px" class="sub2">Manual preamp (dB)<input id="eqPreamp" type="number" min="-24" max="0" step="0.5" value="${audioState.preamp_db}" style="margin-top:5px"></label>
-        <div class="sub2" style="margin-top:10px">Effective preamp: <b>${status.effective_preamp_db != null ? Number(status.effective_preamp_db).toFixed(1) : "pending"} dB</b>. Auto mode reserves the sum of positive boosts.</div>`;
+        <div class="sub2" style="margin-top:10px">Effective preamp: <b>${status.effective_preamp_db != null ? Number(status.effective_preamp_db).toFixed(1) : "pending"} dB</b>.${eqHeadroomNote(status.headroom)}</div>`;
       qs("#eqEnabled").addEventListener("change", e => { audioState.enabled=e.target.checked; renderEqPlot(); scheduleAudioSave(); });
-      qs("#eqHeadroom").addEventListener("change", e => { audioState.auto_headroom=e.target.checked; scheduleAudioSave(); });
+      qs("#eqHeadroom").addEventListener("change", e => { audioState.auto_headroom=e.target.checked; qs("#eqMargin").disabled=!e.target.checked; scheduleAudioSave(); });
+      qs("#eqMargin").addEventListener("input", e => { audioState.headroom_margin_db=Number(e.target.value); scheduleAudioSave(); });
       qs("#eqPreamp").addEventListener("input", e => { audioState.preamp_db=Number(e.target.value); scheduleAudioSave(); });
       const spotifyBridge=audioBridge.spotify||{};
       const airplayReady=audioBridge.airplay_configured&&audioBridge.airplay_service_active===true&&audioBridge.live;

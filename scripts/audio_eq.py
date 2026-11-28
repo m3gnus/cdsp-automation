@@ -13,6 +13,8 @@ from pathlib import Path
 from contextlib import contextmanager
 from typing import Any
 
+from eq_headroom import chain_peak
+
 
 STATE_VERSION = 3
 FILTER_PREFIX = "cdsp_ui_eq_"
@@ -24,6 +26,13 @@ MAX_BANDS = 16
 # so 81-90 already extrapolates the top of the curve. The engine rejects anything
 # higher; see camilladsp-iso226/camilladsp-v4.1.3-iso226.patch.
 ISO226_MAX_PHON = 90
+# Kept below the computed whole-chain peak for transient overshoot of steep
+# filters and inter-sample peaks rebuilt by the resampler, neither of which a
+# magnitude response shows.
+DEFAULT_HEADROOM_MARGIN_DB = 1.0
+MAX_HEADROOM_MARGIN_DB = 6.0
+# CamillaDSP's Gain filter range.
+MIN_PREAMP_DB = -150.0
 
 DEFAULT_BANDS = [
     {
@@ -75,6 +84,7 @@ def default_audio_state() -> dict[str, Any]:
         "revision": 0,
         "enabled": True,
         "auto_headroom": True,
+        "headroom_margin_db": DEFAULT_HEADROOM_MARGIN_DB,
         "preamp_db": 0.0,
         "bands": copy.deepcopy(DEFAULT_BANDS),
         "volume": {
@@ -223,6 +233,12 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
         "auto_headroom": _boolean(
             raw.get("auto_headroom", True), "auto_headroom"
         ),
+        "headroom_margin_db": _number(
+            raw.get("headroom_margin_db", DEFAULT_HEADROOM_MARGIN_DB),
+            "headroom margin",
+            0,
+            MAX_HEADROOM_MARGIN_DB,
+        ),
         "preamp_db": _number(raw.get("preamp_db", 0), "preamp", -24, 0),
         "bands": bands,
         "volume": {
@@ -266,17 +282,39 @@ def normalize_audio_state(raw: Any, *, revision: int | None = None) -> dict[str,
             ),
         },
     }
-    if state["enabled"] and state["auto_headroom"]:
-        positive_boost = sum(
-            band["gain"]
-            for band in state["bands"]
-            if band["enabled"] and band["type"] in GAIN_FILTER_TYPES and band["gain"] > 0
-        )
-        if positive_boost > 150:
+    if state["auto_headroom"] and state["enabled"]:
+        peak = user_eq_peak_db(state["bands"])
+        if peak + state["headroom_margin_db"] > -MIN_PREAMP_DB:
             raise ValueError(
-                "automatic headroom requires more than CamillaDSP's 150 dB gain range"
+                f"the EQ peaks at +{peak:.0f} dB; automatic headroom needs more than "
+                f"CamillaDSP's {-MIN_PREAMP_DB:g} dB gain range"
             )
     return state
+
+
+def user_eq_peak_db(bands: list[dict[str, Any]]) -> float:
+    """Peak of the enabled user bands alone, for rejecting undeployable states."""
+    filters = {
+        f"band{index}": {
+            "type": "Biquad",
+            "parameters": {
+                "type": band["type"],
+                "freq": band["freq"],
+                "q": band["q"],
+                **({"gain": band["gain"]} if band["type"] in GAIN_FILTER_TYPES else {}),
+            },
+        }
+        for index, band in enumerate(bands)
+        if band["enabled"]
+    }
+    if not filters:
+        return 0.0
+    config = {
+        "devices": {"samplerate": 48000, "capture": {"channels": 1}},
+        "filters": filters,
+        "pipeline": [{"type": "Filter", "channels": [0], "names": list(filters)}],
+    }
+    return float(chain_peak(config)["peak_db"])
 
 
 def read_audio_state(path: Path) -> dict[str, Any]:
@@ -387,20 +425,25 @@ def reset_tone_bands(path: Path) -> dict[str, Any]:
         return state
 
 
-def effective_preamp_db(state: dict[str, Any]) -> float:
-    if not state.get("enabled", True):
-        return 0.0
+def effective_preamp_db(state: dict[str, Any], peak_db: float | None) -> float:
+    """The preamp for a whole-chain shaping peak (see eq_headroom.chain_peak).
+
+    The preamp is a headroom stage of its own, not part of the user EQ, so it
+    stays in force while the EQ is switched off: the speaker profile's own
+    correction can peak above 0 dB too.  Automatic headroom puts the highest
+    point of the chain ``headroom_margin_db`` below full scale and never
+    raises the level; a lower manual preamp still wins.  ``peak_db`` None
+    means the chain was not evaluated, so only the manual value applies.
+    """
     manual = float(state.get("preamp_db", 0))
-    if not state.get("auto_headroom", True):
+    if not state.get("auto_headroom", True) or peak_db is None:
         return manual
-    # The sum of all positive band gains is deliberately conservative, but it
-    # provides a safe upper bound even when several filters overlap.
-    positive = sum(
-        max(0.0, float(band["gain"]))
-        for band in state.get("bands", [])
-        if band["enabled"]
-    )
-    return round(min(manual, -positive), 4)
+    if not math.isfinite(float(peak_db)):
+        return -math.inf  # an unstable filter: rejected by the caller
+    margin = float(state.get("headroom_margin_db", DEFAULT_HEADROOM_MARGIN_DB))
+    automatic = min(0.0, -(float(peak_db) + margin))
+    # Round towards more attenuation so display rounding never costs headroom.
+    return math.floor(min(manual, automatic) * 100) / 100
 
 
 def is_owned_filter_name(name: object) -> bool:
@@ -518,16 +561,24 @@ def loudness_reference_level(
 
 
 def apply_audio_overlay(
-    config: dict[str, Any], state: dict[str, Any], *, motu_db: float | None = None
+    config: dict[str, Any],
+    state: dict[str, Any],
+    *,
+    motu_db: float | None = None,
+    report: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], float]:
     """Compose the reserved user-EQ step into an active CamillaDSP config.
 
     ``motu_db`` is the MOTU main output level now, which moves the loudness
     reference (loudness_reference_level); None uses it as calibrated.
+
+    The preamp is sized from the whole chain -- this overlay plus every
+    speaker-profile filter after the mixer -- and stays in place with the user
+    EQ switched off.  ``report``, when given, is filled with the chain peak
+    the preamp was sized from (see eq_headroom.chain_peak).
     """
     state = normalize_audio_state(state)
     updated = _strip_overlay(config)
-    preamp = effective_preamp_db(state)
     filters = updated.setdefault("filters", {})
     names: list[str] = []
     loudness = state["loudness"]
@@ -545,10 +596,8 @@ def apply_audio_overlay(
             },
         }
         names.append(name)
-    if state["enabled"] and abs(preamp) >= 0.0001:
-        name = f"{FILTER_PREFIX}preamp"
-        filters[name] = {"type": "Gain", "parameters": {"gain": preamp, "scale": "dB"}}
-        names.append(name)
+    # The preamp goes straight after loudness, ahead of the bands.
+    preamp_at = len(names)
 
     for index, band in enumerate(state["bands"], start=1):
         if not state["enabled"]:
@@ -577,29 +626,52 @@ def apply_audio_overlay(
         (i for i, existing in enumerate(pipeline) if existing.get("type") == "Mixer"),
         len(pipeline),
     )
+    step = {
+        "type": "Filter",
+        "channels": _program_channels(updated, pipeline, insert_at, capture_channels),
+        "names": names,
+        "description": PIPELINE_DESCRIPTION,
+        "bypassed": False,
+    }
     if names:
-        pipeline.insert(
-            insert_at,
-            {
-                "type": "Filter",
-                "channels": _program_channels(
-                    updated, pipeline, insert_at, capture_channels
-                ),
-                "names": names,
-                "description": PIPELINE_DESCRIPTION,
-                "bypassed": False,
-            },
+        pipeline.insert(insert_at, step)
+
+    peak = chain_peak(updated) if state["auto_headroom"] else None
+    preamp = effective_preamp_db(state, peak["peak_db"] if peak else None)
+    if preamp < MIN_PREAMP_DB:
+        raise ValueError(
+            f"the EQ chain peaks at {peak['peak_db'] if peak else '?'} dB, beyond "
+            f"CamillaDSP's {MIN_PREAMP_DB:g} dB gain range"
         )
+    if abs(preamp) >= 0.0001:
+        name = f"{FILTER_PREFIX}preamp"
+        filters[name] = {"type": "Gain", "parameters": {"gain": preamp, "scale": "dB"}}
+        names.insert(preamp_at, name)
+        if len(names) == 1:
+            pipeline.insert(insert_at, step)
+    if report is not None:
+        report.clear()
+        report.update(
+            peak
+            or {"peak_db": None, "peak_hz": None, "output_channel": None, "not_counted": []}
+        )
+        report["margin_db"] = state["headroom_margin_db"]
     return updated, preamp
 
 
 def status_payload(
-    state: dict[str, Any], *, applied: bool, effective_preamp: float, error: str = ""
+    state: dict[str, Any],
+    *,
+    applied: bool,
+    effective_preamp: float | None,
+    error: str = "",
+    headroom: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "revision": int(state.get("revision", 0)),
         "applied": bool(applied),
         "effective_preamp_db": effective_preamp,
+        "headroom": headroom,
         "error": error,
         "updated_at": time.time(),
     }

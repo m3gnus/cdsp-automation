@@ -70,14 +70,17 @@ def test_audio_eq_overlay_is_idempotent_and_precedes_crossover() -> None:
     state["bands"][1]["gain"] = 2
     updated, preamp = audio_eq.apply_audio_overlay(config, state)
 
-    assert preamp == -6
+    # The +4 dB shelf peaks at DC where the +2 dB bell adds almost nothing, the
+    # -1 dB room Gain is headroom already reserved, and 1 dB margin is kept:
+    # -(4.0 - 1 + 1), not the old sum-of-boosts -6.
+    assert preamp == -4.01
     mixer_index = next(
         i for i, step in enumerate(updated["pipeline"]) if step["type"] == "Mixer"
     )
     eq_step = updated["pipeline"][mixer_index - 1]
     assert eq_step["description"] == audio_eq.PIPELINE_DESCRIPTION
     assert eq_step["channels"] == [0, 1]
-    assert updated["filters"]["cdsp_ui_eq_preamp"]["parameters"]["gain"] == -6
+    assert updated["filters"]["cdsp_ui_eq_preamp"]["parameters"]["gain"] == -4.01
 
     reapplied, second_preamp = audio_eq.apply_audio_overlay(updated, state)
     assert reapplied == updated
@@ -203,6 +206,8 @@ def test_audio_overlay_removes_legacy_loudness_and_tone_filters() -> None:
         "cdsp_ui_eq_03_mid",
         "cdsp_ui_eq_04_high_mid",
         "cdsp_ui_eq_05_high",
+        # The default 1 dB headroom margin applies even to a flat EQ.
+        "cdsp_ui_eq_preamp",
     }
     room_step = next(step for step in updated["pipeline"] if "room" in step.get("names", []))
     assert room_step["names"] == ["room"]
