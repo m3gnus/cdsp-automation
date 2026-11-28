@@ -15,6 +15,7 @@ Spotify.
 | [**Remote Control**](#remote-control) | Volume, mute, bass, treble and more from a Bluetooth or USB remote. Buttons can be remapped. | Any remote that shows up as a keyboard |
 | [**AirPlay + Spotify Volume Sync**](#airplay--spotify-volume-sync) | The volume slider on your phone moves the CamillaDSP volume, and changes made elsewhere move the phone slider. | `shairport-sync` and/or `raspotify` |
 | [**ISO 226 Loudness**](#iso-226-loudness) | Adds bass and treble at low volume so music sounds balanced at every level. | Optional patched CamillaDSP build |
+| [**Guest Jukebox**](#guest-jukebox) | A phone page where visitors search Qobuz or TIDAL and add tracks to the queue, and nothing else. Made for shows and parties. | Lyrion Music Server + Squeezelite |
 | [**Web Control UI**](#web-control-ui) | A dashboard and phone remote in your browser: volume, sources, EQ, speakers, services and logs. | Optional; runs as root |
 | [**Health Check**](#health-check) | One command that checks everything and tells you what's wrong. | Nothing |
 
@@ -42,6 +43,7 @@ Then pick from the menu:
 10. **Uninstall All Utilities** — asks first; your configs and settings are kept
 11. **Install Web Control UI** — optional; asks first
 12. **Run Health Check**
+13. **Install Guest Jukebox** — a search-and-queue page for visitors
 
 You don't need to run the installer as root; it uses `sudo` when it needs to.
 Options 5, 8 and 11 also install the Source Switcher if it is missing,
@@ -364,6 +366,61 @@ the MOTU level changes.
 
 Technical background (accuracy, filter design) is in
 [Under the hood](#under-the-hood).
+
+---
+
+## Guest Jukebox
+
+### What it does
+
+A simple phone page (port 8090) where visitors search for music and add it to
+the queue. It shows what is playing and what is coming up, and marks the
+visitor's own tracks. Visitors **cannot** skip, remove, reorder, pause or change
+the volume; you keep those in Lyrion's own interface (Material Skin) or the
+control UI.
+
+The music comes from a streaming service in Lyrion Music Server (LMS), so it
+plays in full quality: LMS streams to Squeezelite on this Pi, which plays into
+the same ALSA Loopback as AirPlay and Spotify, so the Source Switcher picks it
+up as **streamer**.
+
+### What you need
+
+1. **Lyrion Music Server** on the Pi (or on another machine on the network);
+   download the Debian package from [lyrion.org](https://lyrion.org).
+2. **Squeezelite** (`sudo apt install squeezelite`), playing to the same ALSA
+   device as your other streamers.
+3. **A streaming plugin** in LMS — Qobuz or TIDAL — installed and signed in
+   (LMS settings → Plugins). Check that you can search and play from LMS first.
+
+Then pick menu option **13**. If LMS has more than one player, it asks which
+one visitors should queue on.
+
+### Rules for visitors
+
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `JUKEBOX_PLAYER` | *(empty)* | LMS player name (or MAC). Empty = the only player. |
+| `JUKEBOX_SERVICES` | `qobuz,tidal` | Services to search; the first one installed in LMS is used |
+| `JUKEBOX_MAX_PER_GUEST` | `3` | Tracks one visitor may have waiting at a time |
+| `JUKEBOX_COOLDOWN_SECONDS` | `20` | Wait between two additions |
+| `JUKEBOX_MAX_TRACK_MINUTES` | `12` | Longest track allowed (`0` = no limit) |
+| `JUKEBOX_AUTOPLAY` | `1` | Start playing when a track is added to a stopped player (never when paused) |
+| `JUKEBOX_TITLE` | `SITE_NAME` | Page title |
+| `JUKEBOX_PORT` | `8090` | Port number |
+| `LMS_HOST` / `LMS_PORT` | `127.0.0.1` / `9000` | Where LMS runs |
+
+Visitors are told apart by their phone's IP address. Only single tracks can be
+added (no albums or playlists), the same track can't be queued twice, and
+only tracks that came out of the page's own search can be added.
+
+After changing a setting, run `sudo systemctl restart cdsp-jukebox`.
+
+### At the show
+
+Put `http://<pi-name>.local:8090` (or the Pi's IP address) in a QR code on
+the stand. The Pi and the visitors' phones must be on the same Wi-Fi. If
+`.local` names don't work on that network, use the IP address.
 
 ---
 
