@@ -1707,10 +1707,22 @@ def probe_backoff_delay(
     factor: float = PROBE_BACKOFF_FACTOR,
     maximum: float = PROBE_BACKOFF_MAX,
 ) -> float:
-    """Delay before the ``level``-th consecutive silent probe may repeat."""
+    """Delay before the ``level``-th consecutive silent probe may repeat.
+
+    The level keeps counting for as long as a source stays ready but silent
+    (a paused AirPlay session re-probed every PROBE_BACKOFF_MAX), so it is
+    unbounded: ``factor ** level`` overflows a float at level 512 -- about
+    five days -- and the OverflowError then failed every switcher pass.
+    Growing step by step and stopping at ``maximum`` never overflows.
+    """
     if base <= 0:
         return 0.0
-    return min(base * (factor ** max(level, 0)), maximum)
+    delay = base
+    for _ in range(max(level, 0)):
+        if delay >= maximum:
+            break
+        delay *= factor
+    return min(delay, maximum)
 
 
 def _selected(record: ProbeRecord) -> ProbeRecord:
