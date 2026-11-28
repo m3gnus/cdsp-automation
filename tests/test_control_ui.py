@@ -1632,6 +1632,31 @@ def test_manifest_and_icons_are_served_for_home_screen_install() -> None:
     assert 'data-tab="home"' in page and '<section id="home" class="active">' in page
 
 
+def test_fonts_are_served_locally_with_google_as_the_fallback(tmp_path) -> None:
+    # The repository's copies are what the installer puts next to web_ui.py.
+    for name in web_ui.FONT_FILES:
+        handler = _DrivableGet(f"/fonts/{name}")
+        handler.do_GET()
+        assert handler.sent_headers["Content-Type"] == "font/woff2"
+        assert handler.wfile.getvalue()[:4] == b"wOF2"
+        # Each @font-face lists the Pi's copy first and Google's second.
+        rule = web_ui.HTML.split(f'url("/fonts/{name}")', 1)[1].split("}", 1)[0]
+        assert 'url("https://fonts.gstatic.com/' in rule
+    assert "fonts.googleapis.com" not in web_ui.HTML
+    # Only the listed names are served, so no other file can be read.
+    for path in ("/fonts/../web_ui.py", "/fonts/OFL.txt", "/fonts/"):
+        handler = _DrivableGet(path)
+        with patch.object(handler, "send_json") as answered, patch.object(handler, "send_error") as refused:
+            handler.do_GET()
+        assert not handler.wfile.getvalue().startswith(b"wOF2")
+    # A missing file is a 404, which sends the browser on to Google's copy.
+    with patch.object(web_ui, "FONTS_DIR", tmp_path):
+        handler = _DrivableGet("/fonts/syne.woff2")
+        with patch.object(handler, "send_error") as refused:
+            handler.do_GET()
+        refused.assert_called_once_with(HTTPStatus.NOT_FOUND)
+
+
 def test_live_stream_sends_changes_only_and_releases_its_slot() -> None:
     snapshots = iter([{"v": 1}, {"v": 1}, {"v": 2}])
 

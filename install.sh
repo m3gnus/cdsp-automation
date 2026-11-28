@@ -267,6 +267,20 @@ download_scripts() {
     fi
     mv "$tmp" "${SCRIPTS_DIR}/${script}"
   done
+  # The control UI serves these itself; if one is missing the page falls back
+  # to Google's copy, so a failed download is not fatal.
+  mkdir -p "${SCRIPTS_DIR}/fonts"
+  for font in inter-tight.woff2 ibm-plex-mono-400.woff2 ibm-plex-mono-500.woff2 syne.woff2 OFL.txt; do
+    tmp="${SCRIPTS_DIR}/fonts/${font}.tmp"
+    if [[ -f "$REPO_DIR/scripts/fonts/$font" ]]; then
+      cp "$REPO_DIR/scripts/fonts/$font" "$tmp" && mv "$tmp" "${SCRIPTS_DIR}/fonts/${font}"
+    elif wget -q "${BASE_URL}/fonts/${font}" -O "$tmp"; then
+      mv "$tmp" "${SCRIPTS_DIR}/fonts/${font}"
+    else
+      rm -f "$tmp"
+      echo "Could not download fonts/${font}; the control UI will use Google's copy instead."
+    fi
+  done
   if [[ -f "$REPO_DIR/scripts/build_camilladsp_iso226.sh" ]]; then
     cp "$REPO_DIR/scripts/build_camilladsp_iso226.sh" "$SCRIPTS_DIR/build_camilladsp_iso226.sh.tmp"
   else

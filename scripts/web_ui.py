@@ -116,6 +116,10 @@ PORT = ui_bind_port()
 CDSP_ENV = ENV_FILE
 CDSP_CONFIG_DIR = CONFIG_DIR
 UI_SERVICE = "cdsp-control-ui.service"
+# The page's fonts, served from the folder the installer puts next to this
+# script.  A fixed list, so a request can never name any other file.
+FONTS_DIR = Path(__file__).resolve().parent / "fonts"
+FONT_FILES = ("inter-tight.woff2", "ibm-plex-mono-400.woff2", "ibm-plex-mono-500.woff2", "syne.woff2")
 # How long a MOTU volume change waits for the source switcher to apply it
 # (normally within one of its ~1.2 s passes) before answering 202.
 MOTU_VOLUME_REPLY_SECONDS = 3.0
@@ -202,421 +206,449 @@ HTML = r"""<!doctype html>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/apple-touch-icon.png">
-  <meta name="theme-color" content="#0b0c0e">
+  <meta name="theme-color" content="#f3e7d8" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#170807" media="(prefers-color-scheme: dark)">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
-  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
   <meta name="apple-mobile-web-app-title" content="{{site}}">
   <style>
+    /* Amber instrument: warm paper, ink rules, halftone meter (after the vist.audio amber theme).
+       Fonts: the Pi's own copy first (/fonts/, installed next to this script), Google's copy if
+       that is missing, and the system fonts in the stacks below if neither loads. */
+    @font-face { font-family: "Inter Tight"; font-style: normal; font-weight: 300 600; font-display: swap;
+      src: url("/fonts/inter-tight.woff2") format("woff2"), url("https://fonts.gstatic.com/s/intertight/v9/NGSwv5HMAFg6IuGlBNMjxLsH8ag.woff2") format("woff2"); }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap;
+      src: url("/fonts/ibm-plex-mono-400.woff2") format("woff2"), url("https://fonts.gstatic.com/s/ibmplexmono/v23/-F63fjptAgt5VM-kVkqdyU8n1i8q1w.woff2") format("woff2"); }
+    @font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap;
+      src: url("/fonts/ibm-plex-mono-500.woff2") format("woff2"), url("https://fonts.gstatic.com/s/ibmplexmono/v23/-F6qfjptAgt5VM-kVkqdyU8n3twJwlBFgg.woff2") format("woff2"); }
+    @font-face { font-family: "Syne"; font-style: normal; font-weight: 700 800; font-display: swap;
+      src: url("/fonts/syne.woff2") format("woff2"), url("https://fonts.gstatic.com/s/syne/v24/8vIH7w4qzmVxm2BL9A.woff2") format("woff2"); }
     :root {
-      color-scheme: dark;
-      --bg: #0b0c0e;
-      --bg2: #0f1114;
-      --panel: #14161a;
-      --panel2: #101216;
-      --raised: #191c21;
-      --line: #24272e;
-      --line2: #2e323a;
-      --ink: #eceae4;
-      --muted: #8a8d95;
-      --faint: #5f636b;
-      --cool: #4d8dff;
-      --warm: #ff9a45;
-      --ok: #5fd08a;
-      --warn: #f4c451;
-      --bad: #ff6b6b;
-      --accent-grad: linear-gradient(90deg, var(--cool), var(--warm));
-      --mono: ui-monospace, "SFMono-Regular", "JetBrains Mono", "Menlo", "Consolas", monospace;
-      --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      color-scheme: light;
+      --bg: #f3e7d8;
+      --panel: #f7efe4;
+      --raised: #efe1cf;
+      --ink: #2a1a10;
+      --muted: #6f5644;
+      --faint: #7a5f4c;
+      --line: rgba(42,26,16,.14);
+      --line2: rgba(42,26,16,.30);
+      --rule: #2a1a10;
+      --accent: #b0361b;
+      --tone: #d9531f;
+      --on-accent: #fbf3ea;
+      --ok: #4b5530;
+      --warn: #8a5300;
+      --bad: #b0361b;
+      --dot-off: rgba(42,26,16,.18);
+      --code-bg: #2a1a10;
+      --code-ink: #f3e7d8;
+      --mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+      --sans: "Inter Tight", "Helvetica Neue", Arial, system-ui, sans-serif;
+      --display: "Syne", "Arial Black", "Helvetica Neue", Arial, sans-serif;
       --radius: 12px;
+      --tabbar: 0px;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #170807; --panel: #1f0d0b; --raised: #2a1310;
+        --ink: #f6e7dd; --muted: #c4a59d; --faint: #b5918a;
+        --line: rgba(246,231,221,.13); --line2: rgba(246,231,221,.28); --rule: #f6e7dd;
+        --accent: #ff5b3d; --tone: #ff7a45; --on-accent: #170807;
+        --ok: #b5c47a; --warn: #f2a640; --bad: #ff6b52;
+        --dot-off: rgba(246,231,221,.16); --code-bg: #0e0403; --code-ink: #f6e7dd;
+      }
     }
     * { box-sizing: border-box; }
-    html, body { overflow-x: hidden; }
+    html, body { overflow-x: clip; }  /* clip, not hidden: hidden would stop the header sticking */
     body {
-      margin: 0;
-      background:
-        radial-gradient(1200px 600px at 78% -8%, rgba(255,154,69,0.06), transparent 60%),
-        radial-gradient(1100px 620px at 10% -12%, rgba(77,141,255,0.07), transparent 55%),
-        var(--bg);
-      color: var(--ink);
-      font: 14px/1.5 var(--sans);
-      -webkit-font-smoothing: antialiased;
-      letter-spacing: 0.1px;
+      margin: 0; background: var(--bg); color: var(--ink);
+      font: 15px/1.5 var(--sans); -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
     }
-    /* subtle film grain */
-    .grain {
-      position: fixed; inset: 0; z-index: 0; pointer-events: none; opacity: 0.05;
-      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-      mix-blend-mode: overlay;
-    }
-    .wrap { position: relative; z-index: 1; }
+    .wrap { min-height: 100vh; min-height: 100dvh; }
+    button { font-family: inherit; }
 
     /* ---------- header ---------- */
     header {
       position: sticky; top: 0; z-index: 20;
       display: flex; align-items: center; justify-content: space-between; gap: 16px;
-      padding: 14px clamp(14px, 4vw, 28px);
-      background: rgba(11,12,14,0.78);
-      backdrop-filter: blur(10px);
-      border-bottom: 1px solid var(--line);
+      padding: max(14px, env(safe-area-inset-top)) max(clamp(16px, 4vw, 36px), env(safe-area-inset-right)) 12px max(clamp(16px, 4vw, 36px), env(safe-area-inset-left));
+      background: var(--bg); border-bottom: 1.5px solid var(--rule);
     }
-    .brand { display: flex; align-items: center; gap: 14px; min-width: 0; }
-    .eq { display: flex; align-items: flex-end; gap: 2.5px; height: 26px; width: 34px; flex: none; }
-    .eq i {
-      display: block; width: 4px; height: 20%;
-      background: var(--accent-grad); border-radius: 2px;
-      transition: height 90ms linear; opacity: 0.9;
-    }
+    .brand { display: flex; align-items: baseline; gap: 12px; min-width: 0; }
     .word { min-width: 0; }
-    .word h1 {
-      margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 3px;
-      line-height: 1; white-space: nowrap;
-    }
-    .word h1 b {
-      background: var(--accent-grad); -webkit-background-clip: text; background-clip: text;
-      -webkit-text-fill-color: transparent; font-weight: 800;
-    }
-    .word .sub {
-      font: 10px/1.2 var(--mono); letter-spacing: 2px; text-transform: uppercase;
-      color: var(--faint); margin-top: 5px; white-space: nowrap;
-    }
-    .health { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
-    .chip {
-      display: inline-flex; align-items: center; gap: 7px;
-      font: 11px/1 var(--mono); letter-spacing: 0.4px;
-      padding: 7px 10px; border: 1px solid var(--line); border-radius: 999px;
-      color: var(--muted); background: var(--panel2); white-space: nowrap;
-    }
-    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--faint); flex: none; }
-    .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(95,208,138,0.15); }
-    .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(244,196,81,0.15); }
-    .dot.bad { background: var(--bad); box-shadow: 0 0 0 3px rgba(255,107,107,0.16); }
+    .word h1 { margin: 0; font: 800 20px/1 var(--display); letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .word h1 b { font-weight: 800; }
+    .health { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; justify-content: flex-end; }
+    .chip { display: inline-flex; align-items: center; gap: 7px; font: 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--line2); flex: none; }
+    .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
 
-    /* ---------- nav ---------- */
-    nav {
-      position: sticky; top: 61px; z-index: 15;
-      display: flex; gap: 4px; padding: 8px clamp(14px, 4vw, 28px);
-      background: rgba(11,12,14,0.7); backdrop-filter: blur(10px);
-      border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none;
-    }
+    /* ---------- nav: pills in the header row on wide screens, a tab bar at the bottom on phones ---------- */
+    nav { display: flex; gap: 2px; padding: 10px clamp(16px, 4vw, 36px); border-bottom: 1px solid var(--line); overflow-x: auto; scrollbar-width: none; }
     nav::-webkit-scrollbar { display: none; }
     nav button {
-      appearance: none; border: 1px solid transparent; background: transparent;
-      color: var(--muted); cursor: pointer; white-space: nowrap;
-      padding: 8px 14px; border-radius: 8px;
-      font: 12px/1 var(--mono); letter-spacing: 1.2px; text-transform: uppercase;
+      appearance: none; border: 0; background: transparent; color: var(--ink); cursor: pointer; white-space: nowrap;
+      padding: 9px 16px; border-radius: 999px; font: 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase;
     }
-    nav button:hover { color: var(--ink); }
-    nav button.active { color: var(--ink); background: var(--raised); border-color: var(--line2); }
-
-    /* ---------- per-source volume ---------- */
-    .sv-grid { display: grid; grid-template-columns: minmax(70px,1fr) 92px 78px auto; gap: 6px 8px; align-items: center; }
-    .sv-grid .h { font: 10px/1.2 var(--mono); letter-spacing: 1.2px; text-transform: uppercase; color: var(--faint); }
-    .sv-grid .num { width: 100%; }
-    .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
-
-    /* ---------- home (phone remote) ---------- */
-    body { -webkit-tap-highlight-color: transparent; padding-bottom: env(safe-area-inset-bottom); }
-    header { padding-top: max(14px, env(safe-area-inset-top)); }
-    .home { max-width: 520px; margin: 0 auto; }
-    .home-now { text-align: center; margin-bottom: 18px; }
-    .home-source { font-size: clamp(30px, 9vw, 44px); font-weight: 800; letter-spacing: 1px; margin: 6px 0 12px; }
-    .home-vol { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 14px; }
-    .big-btn {
-      appearance: none; border: 1px solid var(--line2); background: var(--raised); color: var(--ink);
-      height: 88px; border-radius: 22px; font-size: 44px; line-height: 1; cursor: pointer;
-      touch-action: manipulation; user-select: none; -webkit-user-select: none;
+    nav button:hover { background: var(--raised); }
+    nav button.active { background: var(--ink); color: var(--bg); }
+    @media (min-width: 721px) { nav { position: sticky; top: 47px; z-index: 15; background: var(--bg); } }
+    @media (max-width: 720px) {
+      :root { --tabbar: calc(64px + env(safe-area-inset-bottom)); }
+      nav {
+        position: fixed; left: 0; right: 0; bottom: 0; z-index: 30; padding: 0 0 env(safe-area-inset-bottom);
+        display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0;
+        background: var(--bg); border-top: 1px solid var(--line2); border-bottom: 0;
+      }
+      nav button { height: 64px; border-radius: 0; color: var(--muted); padding: 0 4px; }
+      nav button:hover { background: transparent; }
+      nav button.active { background: transparent; color: var(--ink); font-weight: 600; }
+      nav button.active::before { content: "● "; color: var(--accent); }
+      .health .chip + .chip { display: none; }
     }
-    .big-btn:active { background: var(--line2); }
-    .home-level { text-align: center; min-width: 130px; }
-    .home-db { font: 800 clamp(40px, 12vw, 56px)/1 var(--mono); }
-    .home-db.muted { color: var(--warn); text-decoration: line-through; }
-    .home-mute { width: 100%; margin-top: 16px; height: 56px; font-size: 16px; }
-    .btn.home-mute.is-muted { background: rgba(244,196,81,0.14); border-color: var(--warn); color: var(--warn); }
-    .home-sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; margin-top: 8px; }
-    .home-sources .btn { height: 56px; font-size: 15px; }
-    .home-sources .btn.on { border-color: var(--cool); background: rgba(77,141,255,0.14); }
-    .home-sources .btn.live::after { content: " ●"; color: var(--ok); }
-    .home-motu { display: grid; grid-template-columns: 72px 1fr 72px; gap: 10px; align-items: center; text-align: center; margin-top: 8px; }
-    .home-motu .btn { height: 52px; font-size: 24px; }
-    .home-amps { width: 100%; margin-top: 26px; height: 52px; }
-    .home-hint { margin-top: 18px; text-align: center; }
-    @media (display-mode: standalone) { .home-hint { display: none; } }
 
-    .diag-row { display: grid; grid-template-columns: 18px minmax(120px, 220px) 1fr; gap: 8px; align-items: baseline; padding: 3px 0; }
-
-    main { max-width: 1180px; margin: 0 auto; padding: clamp(16px, 3vw, 30px) clamp(14px, 4vw, 28px) 60px; }
+    main { max-width: 1240px; margin: 0 auto; padding: clamp(16px, 3vw, 32px) max(clamp(16px, 4vw, 36px), env(safe-area-inset-right)) calc(60px + var(--tabbar)) max(clamp(16px, 4vw, 36px), env(safe-area-inset-left)); }
     section { display: none; }
-    section.active { display: block; animation: fade 0.25s ease; }
+    section.active { display: block; animation: fade .25s ease; }
     @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+    @media (prefers-reduced-motion: reduce) { section.active { animation: none; } }
 
-    .shead {
-      display: flex; align-items: baseline; gap: 10px; margin: 26px 0 12px;
-    }
+    .shead { display: flex; align-items: baseline; gap: 12px; margin: 34px 0 14px; padding-bottom: 8px; border-bottom: 1.5px solid var(--rule); }
     .shead:first-child { margin-top: 4px; }
-    .shead .ix { font: 11px/1 var(--mono); color: var(--warm); letter-spacing: 1px; }
-    .shead h2 {
-      margin: 0; font-size: 13px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase;
-      color: var(--muted);
-    }
-    .shead .rule { flex: 1; height: 1px; background: linear-gradient(90deg, var(--line2), transparent); }
+    .shead .ix { font: 11px/1 var(--mono); color: var(--accent); letter-spacing: .06em; }
+    .shead h2 { margin: 0; font: 700 19px/1.1 var(--display); letter-spacing: .02em; text-transform: uppercase; }
+    .shead .rule { display: none; }
 
-    .card {
-      background: linear-gradient(180deg, var(--panel), var(--panel2));
-      border: 1px solid var(--line); border-radius: var(--radius);
-      padding: 16px; box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
-    }
-    .grid { display: grid; gap: 12px; }
-    .g-auto { grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }
+    .card { background: transparent; border: 1px solid var(--line2); border-radius: var(--radius); padding: 18px; min-width: 0; }
+    .grid { display: grid; gap: 14px; }
+    .g-auto { grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
     .hero { grid-template-columns: 1.4fr 1fr 1fr; }
 
-    .tile { background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 13px 14px; min-width: 0; }
-    .cap { font: 10px/1.2 var(--mono); letter-spacing: 1.4px; text-transform: uppercase; color: var(--faint); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
-    .val { font-size: 19px; font-weight: 650; overflow-wrap: anywhere; }
-    .val.sm { font-size: 15px; font-weight: 600; }
-    .val.big { font-size: 30px; font-weight: 700; font-family: var(--mono); letter-spacing: -0.5px; }
-    .unit { font-size: 12px; color: var(--muted); font-weight: 500; }
-    .sub2 { font: 11px/1.3 var(--mono); color: var(--faint); margin-top: 6px; overflow-wrap: anywhere; }
+    .tile { border-top: 1.5px solid var(--rule); padding: 12px 2px 4px; min-width: 0; }
+    .cap { font: 11px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); margin-bottom: 10px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .val { font-size: 19px; font-weight: 500; overflow-wrap: anywhere; }
+    .val.sm { font-size: 16px; font-weight: 500; }
+    .val.big { font: 400 30px/1.1 var(--mono); letter-spacing: -.02em; }
+    .unit { font: 12px var(--mono); color: var(--muted); font-weight: 400; }
+    .sub2 { font: 12px/1.4 var(--mono); color: var(--faint); margin-top: 8px; overflow-wrap: anywhere; }
     .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .faint { color: var(--faint); }
 
-    .badge {
-      display: inline-flex; align-items: center; gap: 6px; font: 11px/1 var(--mono);
-      letter-spacing: 0.6px; padding: 5px 9px; border-radius: 999px;
-      border: 1px solid var(--line2); color: var(--muted); text-transform: uppercase;
-    }
-    .badge.ok { color: var(--ok); border-color: rgba(95,208,138,0.4); }
-    .badge.warn { color: var(--warn); border-color: rgba(244,196,81,0.4); }
-    .badge.bad { color: var(--bad); border-color: rgba(255,107,107,0.4); }
+    .badge { display: inline-flex; align-items: center; gap: 6px; font: 10.5px/1 var(--mono); letter-spacing: .06em; padding: 5px 9px; border-radius: 999px; border: 1px solid var(--line2); color: var(--muted); text-transform: uppercase; }
+    .badge.ok { color: var(--ok); border-color: currentColor; }
+    .badge.warn { color: var(--warn); border-color: currentColor; }
+    .badge.bad { color: var(--bad); border-color: currentColor; }
 
-    /* signal meter */
-    .meter { height: 12px; border-radius: 7px; background: #0a0b0d; border: 1px solid var(--line); overflow: hidden; position: relative; margin-top: 4px; }
-    .meter > i { display: block; height: 100%; width: 0%; background: var(--accent-grad); border-radius: 7px 0 0 7px; transition: width 260ms cubic-bezier(.2,.8,.2,1); }
-    .meter.silent > i { opacity: 0.25; }
+    /* level bar (kept for panels other than the remote) */
+    .meter { height: 8px; border-radius: 999px; background: var(--dot-off); overflow: hidden; margin-top: 4px; }
+    .meter > i { display: block; height: 100%; width: 0%; background: var(--tone); transition: width 260ms cubic-bezier(.2,.8,.2,1); }
+    .meter.silent > i { opacity: .3; }
 
     /* buttons */
-    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     button.btn, .btn {
-      appearance: none; cursor: pointer; font: 12px/1 var(--sans); font-weight: 600;
-      padding: 10px 13px; border-radius: 9px; border: 1px solid var(--line2);
-      color: var(--ink); background: var(--raised); letter-spacing: 0.3px;
-      transition: border-color 0.15s, background 0.15s, transform 0.05s;
+      appearance: none; cursor: pointer; font: 500 13px/1 var(--sans); min-height: 40px;
+      padding: 10px 16px; border-radius: 999px; border: 1.5px solid var(--ink);
+      color: var(--ink); background: transparent; display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+      transition: background .15s, color .15s, border-color .15s, transform .05s;
     }
-    .btn:hover { border-color: var(--faint); }
+    .btn:hover { background: var(--raised); }
     .btn:active { transform: translateY(1px); }
-    .btn.primary { border-color: transparent; background: var(--accent-grad); color: #0a0b0d; font-weight: 700; }
-    .btn.on { border-color: var(--cool); color: var(--ink); background: rgba(77,141,255,0.14); box-shadow: inset 0 0 0 1px rgba(77,141,255,0.35); }
-    .btn.danger { background: #2a1618; border-color: #5c2a2c; color: #ffb4b4; }
-    .btn.ghost { background: transparent; }
-    .btn.sm { padding: 7px 10px; font-size: 11px; }
-    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .btn.primary { background: var(--ink); color: var(--bg); }
+    .btn.primary:hover { background: var(--ink); opacity: .88; }
+    .btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    .btn.danger { border-color: var(--accent); color: var(--accent); }
+    .btn.danger:hover { background: var(--accent); color: var(--on-accent); }
+    .btn.ghost { border-color: var(--line2); }
+    .btn.sm { padding: 7px 12px; min-height: 34px; font-size: 12px; }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
 
-    /* source grid */
+    /* source grid (Remote · more controls) */
     .sources { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
-    .src { text-align: left; position: relative; padding: 12px; }
-    .src .k { font: 10px/1 var(--mono); letter-spacing: 1px; text-transform: uppercase; color: var(--faint); }
-    .src .n { font-size: 14px; font-weight: 650; margin-top: 6px; }
-    .src.on { border-color: var(--cool); background: rgba(77,141,255,0.12); }
-    .src.on .k { color: var(--cool); }
+    .btn.src { flex-direction: column; align-items: flex-start; border-radius: 12px; padding: 12px 14px; min-height: 60px; border-width: 1px; border-color: var(--line2); }
+    .src .k { font: 10.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+    .src .n { font: 700 14px/1.2 var(--display); margin-top: 6px; }
+    .src.on .k { color: inherit; }
 
     /* range / inputs */
-    input[type=range] {
-      -webkit-appearance: none; appearance: none; width: 100%; height: 4px; border-radius: 4px;
-      background: var(--line2); outline: none;
-    }
-    input[type=range]::-webkit-slider-thumb {
-      -webkit-appearance: none; appearance: none; width: 17px; height: 17px; border-radius: 50%;
-      background: var(--ink); border: 3px solid var(--cool); cursor: pointer; box-shadow: 0 1px 4px rgba(0,0,0,0.5);
-    }
-    input[type=range]::-moz-range-thumb { width: 15px; height: 15px; border-radius: 50%; background: var(--ink); border: 3px solid var(--cool); cursor: pointer; }
+    input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 28px; background: transparent; outline: none; cursor: pointer; }
+    input[type=range]::-webkit-slider-runnable-track { height: 2px; background: var(--line2); }
+    input[type=range]::-moz-range-track { height: 2px; background: var(--line2); }
+    input[type=range]::-moz-range-progress { height: 2px; background: var(--tone); }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 24px; height: 24px; margin-top: -11px; border-radius: 50%; background: var(--ink); border: 0; box-shadow: 0 0 0 4px var(--bg); }
+    input[type=range]::-moz-range-thumb { width: 24px; height: 24px; border-radius: 50%; background: var(--ink); border: 0; box-shadow: 0 0 0 4px var(--bg); }
     input[type=number], input[type=text], select {
-      width: 100%; padding: 8px 9px; border: 1px solid var(--line2); border-radius: 8px;
-      background: #0b0c0e; color: var(--ink); font: 13px/1 var(--mono);
+      width: 100%; padding: 9px 10px; border: 1px solid var(--line2); border-radius: 8px;
+      background: var(--panel); color: var(--ink); font: 13px/1.2 var(--mono);
     }
-    input:focus, select:focus, button:focus-visible { outline: 2px solid rgba(77,141,255,0.5); outline-offset: 1px; }
+    input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     select { cursor: pointer; }
 
     .volume { display: grid; grid-template-columns: 1fr auto; gap: 12px 16px; align-items: center; }
     .volume .num { width: 92px; }
-    .audio-layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr); gap: 14px; }
-    .eq-plot { width: 100%; min-height: 380px; display: block; touch-action: none; user-select: none; background:#090b0e; border:1px solid var(--line); border-radius:10px; }
-    .eq-grid-line { stroke: #252a31; stroke-width: 1; }
-    .eq-zero { stroke: #59606b; stroke-width: 1.4; }
-    .eq-curve { fill: none; stroke: var(--warm); stroke-width: 3; filter: drop-shadow(0 0 5px rgba(255,154,69,.28)); }
-    .eq-band-curve { fill:none; stroke-width:1.3; opacity:.42; }
-    .eq-band-curve.selected { stroke-width:2.2; opacity:.9; }
-    .eq-band.selected { border-color:rgba(77,141,255,.7); box-shadow:inset 0 0 0 1px rgba(77,141,255,.18); }
-    .eq-fill { fill: url(#eqFill); opacity: .2; }
-    .eq-handle { stroke: #0b0c0e; stroke-width: 3; cursor: grab; }
+
+    /* per-source volume */
+    .sv-grid { display: grid; grid-template-columns: minmax(70px,1fr) 92px 78px auto; gap: 6px 8px; align-items: center; }
+    .sv-grid .h { font: 10.5px/1.2 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+    .sv-grid .num { width: 100%; }
+    .sv-grid .live { color: var(--ok); font: 11px/1 var(--mono); }
+
+    /* ---------- Remote ---------- */
+    .home-wrap { display: grid; gap: 40px; }
+    @media (min-width: 1000px) { .home-wrap { grid-template-columns: minmax(340px, 420px) minmax(0, 1fr); gap: 56px; align-items: start; } }
+    .home {
+      display: flex; flex-direction: column; justify-content: space-between; gap: 18px; width: 100%; max-width: 460px; margin: 0 auto;
+      min-height: calc(100vh - 140px - var(--tabbar)); min-height: calc(100dvh - 140px - var(--tabbar));
+    }
+    @media (min-width: 1000px) { .home { min-height: 0; gap: 30px; } }
+    .ht { display: grid; grid-template-columns: repeat(18, minmax(0, 1fr)); grid-template-rows: repeat(7, minmax(0, 1fr)); height: clamp(64px, 13vh, 108px); align-items: center; justify-items: center; }
+    .ht i { display: block; width: 11px; height: 11px; border-radius: 50%; background: var(--dot-off); transform: scale(.2); transition: transform 90ms linear; }
+    .ht i.on { background: var(--tone); }
+    .ht i.hot { background: var(--accent); }
+    .ht-axis { display: flex; justify-content: space-between; font: 10.5px/1 var(--mono); letter-spacing: .06em; color: var(--muted); margin-top: 8px; }
+    .home-now { text-align: center; }
+    .home-now .cap { justify-content: center; margin-bottom: 0; }
+    .home-source { font: 800 clamp(24px, 8vw, 32px)/1.1 var(--display); letter-spacing: .02em; text-transform: uppercase; margin: 8px 0 0; overflow-wrap: anywhere; }
+    .home-level { display: flex; justify-content: center; align-items: baseline; gap: 8px; margin-top: 10px; }
+    .home-db { font: 400 clamp(36px, 11vw, 46px)/1 var(--mono); letter-spacing: -.02em; }
+    .home-db.muted { color: var(--accent); text-decoration: line-through; text-decoration-thickness: 2px; }
+    .home-level .sub2 { margin: 0; font-size: 12px; }
+    .home-fader { padding: 0 6px; }
+    .home-vol { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+    .big-btn {
+      appearance: none; height: 60px; border-radius: 999px; border: 1.5px solid var(--ink); background: transparent; color: var(--ink);
+      font: 300 30px/1 var(--sans); cursor: pointer; touch-action: manipulation; user-select: none; -webkit-user-select: none;
+    }
+    .big-btn:active { background: var(--raised); }
+    .btn.home-mute { height: 60px; min-height: 60px; background: var(--ink); color: var(--bg); font-size: 15px; padding: 0 8px; }
+    .btn.home-mute.is-muted { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+    .home-sources { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1.5px solid var(--rule); border-radius: 12px; overflow: hidden; }
+    .home-sources .cell {
+      appearance: none; border: 0; background: transparent; color: var(--ink); cursor: pointer; text-align: left;
+      min-height: 58px; padding: 0 14px; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      border-top: 1px solid var(--line2); border-left: 1px solid var(--line2);
+    }
+    .home-sources .cell:nth-child(-n+2) { border-top: 0; }
+    .home-sources .cell:nth-child(odd) { border-left: 0; }
+    .home-sources .cell:last-child:nth-child(odd) { grid-column: span 2; }
+    .home-sources .cell .n { font: 700 15px/1.15 var(--display); overflow-wrap: anywhere; }
+    .home-sources .cell .k { font: 10.5px/1 var(--mono); letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
+    .home-sources .cell.on { background: var(--accent); color: var(--on-accent); }
+    .home-sources .cell.on .k { color: inherit; }
+    .src-cap { justify-content: space-between; }
+    .auto-pill { appearance: none; cursor: pointer; border: 1px solid var(--line2); border-radius: 999px; background: transparent; color: var(--muted); font: 10.5px/1 var(--mono); letter-spacing: .06em; text-transform: uppercase; padding: 0 14px; min-height: 32px; }
+    .auto-pill.on { border-color: var(--accent); color: var(--accent); }
+    .home-hint { margin-top: 28px; }
+    .home-sources .cell:disabled { opacity: .45; cursor: not-allowed; }
+    .home-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .home-motu { display: flex; align-items: center; gap: 10px; }
+    .home-motu .btn { width: 44px; height: 44px; min-height: 44px; padding: 0; font-size: 18px; }
+    .home-motu .val { font: 15px/1 var(--mono); min-width: 64px; text-align: center; }
+    .linkish { appearance: none; background: none; border: 0; border-bottom: 1px solid currentColor; padding: 12px 0 2px; color: var(--accent); cursor: pointer; font: 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; }
+    @media (display-mode: standalone) { .home-hint { display: none; } }
+    .home-more .shead:first-child { margin-top: 0; }
+
+    .diag-row { display: grid; grid-template-columns: 18px minmax(120px, 220px) 1fr; gap: 8px; align-items: baseline; padding: 6px 0; border-bottom: 1px solid var(--line); }
+
+    /* ---------- Sound ---------- */
+    .audio-layout { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(280px, .8fr); gap: 18px; }
+    .eq-plot { width: 100%; min-height: 340px; display: block; touch-action: none; user-select: none; background: transparent; border: 1px solid var(--line); border-radius: 10px; }
+    .eq-grid-line { stroke: var(--line); stroke-width: 1; }
+    .eq-zero { stroke: var(--line2); stroke-width: 1.4; }
+    .eq-curve { fill: none; stroke: var(--accent); stroke-width: 2.6; }
+    .eq-band-curve { fill: none; stroke-width: 1.3; opacity: .5; }
+    .eq-band-curve.selected { stroke-width: 2.2; opacity: .95; }
+    .eq-band.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    .eq-fill { fill: url(#eqFill); opacity: .16; }
+    .eq-handle { stroke: var(--bg); stroke-width: 3; cursor: grab; }
     .eq-handle:active { cursor: grabbing; }
     .eq-axis { fill: var(--muted); font: 12px var(--mono); }
-    .eq-band-list { display: grid; gap: 8px; margin-top: 12px; }
-    .eq-band { display: grid; grid-template-columns: auto minmax(105px,1fr) repeat(3,minmax(74px,.65fr)) auto; gap: 8px; align-items: end; padding: 10px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel2); }
-    .eq-band label { color: var(--muted); font-size: 11px; letter-spacing: .05em; text-transform: uppercase; }
+    .eq-band-list { display: grid; gap: 8px; margin-top: 14px; }
+    .eq-band { display: grid; grid-template-columns: auto minmax(105px,1fr) repeat(3,minmax(74px,.65fr)) auto; gap: 8px; align-items: end; padding: 10px 12px; border: 1px solid var(--line2); border-radius: 10px; }
+    .eq-band label { color: var(--muted); font: 10.5px var(--mono); letter-spacing: .06em; text-transform: uppercase; }
     .eq-band label input, .eq-band label select { margin-top: 4px; width: 100%; }
     .eq-power { align-self: center; }
-    .audio-kv { display: grid; gap: 10px; }
+    .audio-kv { display: grid; gap: 14px; align-content: start; }
     .audio-state { font: 12px var(--mono); }
     .speaker-summary { display: grid; gap: 10px; }
-    .speaker-summary .active-name { font-size: 20px; font-weight: 720; }
+    .speaker-summary .active-name { font: 700 20px/1.15 var(--display); }
     .speaker-cell { display: grid; gap: 6px; }
     .speaker-cell > .btn { width: 100%; }
-    .audio-notice { display: none; margin-bottom: 12px; border-color: rgba(255,107,107,.45); }
+    .audio-notice { display: none; margin-bottom: 14px; border-color: var(--bad); }
     .audio-notice.show { display: flex; align-items: center; gap: 14px; }
     dialog.confirm-dialog {
       width: min(520px, calc(100vw - 28px)); padding: 0; color: var(--ink);
-      border: 1px solid var(--line2); border-radius: 14px; background: var(--panel);
-      box-shadow: 0 24px 80px rgba(0,0,0,.7);
+      border: 1.5px solid var(--rule); border-radius: 14px; background: var(--bg);
+      box-shadow: 0 24px 80px rgba(0,0,0,.35);
     }
-    dialog.confirm-dialog::backdrop { background: rgba(3,5,8,.82); backdrop-filter: blur(4px); }
-    .confirm-body { padding: 20px; }
-    .confirm-warning { margin: 14px 0; padding: 12px; border: 1px solid #704326; border-radius: 9px; background: #25180f; color: #ffd2a8; line-height: 1.5; }
+    dialog.confirm-dialog::backdrop { background: rgba(23,8,7,.55); backdrop-filter: blur(3px); }
+    .confirm-body { padding: 22px; }
+    .confirm-warning { margin: 14px 0; padding: 12px 14px; border: 1.5px solid var(--accent); border-radius: 10px; color: var(--ink); line-height: 1.5; }
 
     /* toggle switch */
     .switch { position: relative; display: inline-block; width: 42px; height: 24px; flex: none; }
     .switch input { opacity: 0; width: 0; height: 0; }
-    .switch span { position: absolute; inset: 0; background: var(--line2); border-radius: 999px; transition: 0.2s; }
-    .switch span::before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px; background: var(--ink); border-radius: 50%; transition: 0.2s; }
-    .switch input:checked + span { background: var(--cool); }
+    .switch span { position: absolute; inset: 0; background: var(--line2); border-radius: 999px; transition: .2s; }
+    .switch span::before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; top: 3px; background: var(--bg); border-radius: 50%; transition: .2s; }
+    .switch input:checked + span { background: var(--accent); }
     .switch input:checked + span::before { transform: translateX(18px); }
 
     /* action bar */
     .actionbar {
-      position: sticky; bottom: 0; margin-top: 14px; padding: 12px; z-index: 5;
+      position: sticky; bottom: var(--tabbar); margin-top: 14px; padding: 12px; z-index: 5;
       display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
-      background: rgba(16,18,22,0.92); backdrop-filter: blur(8px);
-      border: 1px solid var(--line); border-radius: 12px;
+      background: var(--bg); border: 1.5px solid var(--rule); border-radius: 12px;
     }
     .actionbar .spacer { flex: 1; }
-    .pending { font: 11px/1 var(--mono); color: var(--warm); letter-spacing: 0.5px; }
+    .spacer { flex: 1; }
+    .pending { font: 11px/1 var(--mono); color: var(--accent); letter-spacing: .04em; }
 
-    /* services */
+    /* ---------- System ---------- */
     .svc-group { margin-bottom: 18px; }
-    .svc-row { display: grid; grid-template-columns: minmax(0,1.4fr) auto auto; gap: 12px; align-items: center; padding: 11px 0; border-top: 1px solid var(--line); }
+    .svc-row { display: grid; grid-template-columns: minmax(0,1.4fr) auto auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
     .svc-row:first-child { border-top: 0; }
     .svc-name { min-width: 0; }
-    .svc-name .l { font-weight: 600; }
-    .svc-name .u { font: 10px/1.3 var(--mono); color: var(--faint); overflow-wrap: anywhere; }
+    .svc-name .l { font-weight: 500; font-size: 16px; }
+    .svc-name .u { font: 10.5px/1.3 var(--mono); color: var(--faint); overflow-wrap: anywhere; }
 
-    /* logs */
+    /* ---------- Logs ---------- */
     pre {
-      white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mono);
-      background: #08090b; border: 1px solid var(--line); border-radius: 10px; padding: 14px;
-      max-height: 60vh; overflow: auto; color: #c7cbd1;
+      white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.7 var(--mono);
+      background: var(--code-bg); color: var(--code-ink); border-radius: 12px; padding: 16px 18px;
+      max-height: 62vh; overflow: auto; margin: 0;
     }
 
     /* toast */
     #toast {
-      position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(20px);
-      background: #2a1618; border: 1px solid #5c2a2c; color: #ffd2d2; padding: 10px 16px; border-radius: 10px;
-      font: 12px/1.3 var(--mono); z-index: 50; opacity: 0; transition: 0.25s; pointer-events: none; max-width: 90vw;
+      position: fixed; left: 50%; bottom: calc(20px + var(--tabbar)); transform: translateX(-50%) translateY(20px);
+      background: var(--ink); color: var(--bg); padding: 11px 18px; border-radius: 999px;
+      font: 12px/1.3 var(--mono); z-index: 50; opacity: 0; transition: .25s; pointer-events: none; max-width: 90vw;
     }
     #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
     @media (max-width: 860px) {
       .hero { grid-template-columns: 1fr; }
+      .audio-layout { grid-template-columns: 1fr; }
     }
     @media (max-width: 560px) {
-      .word .sub { display: none; }
-      .word h1 { font-size: 17px; letter-spacing: 2px; }
       .val.big { font-size: 26px; }
       .volume { grid-template-columns: 1fr; }
       .volume .num { width: 100%; }
-      .audio-layout { grid-template-columns: 1fr; }
       .eq-band { grid-template-columns: auto 1fr 1fr; }
       .eq-band .eq-type { grid-column: span 2; }
+      .svc-row { grid-template-columns: minmax(0,1fr) auto; }
+      .svc-row > :last-child { grid-column: 1 / -1; }
+    }
+    @media (max-width: 720px) {
+      header { padding-bottom: 10px; }
+      main { padding-top: 14px; }
+      .home { gap: 12px; }
+      .ht { height: clamp(44px, 9vh, 96px); }
+      .home-source { font-size: clamp(22px, 7vw, 30px); margin-top: 4px; }
+      .home-level { margin-top: 6px; }
+      .home-db { font-size: clamp(32px, 10vw, 44px); }
+      .home-vol { margin-top: 8px; }
+      .big-btn, .btn.home-mute { height: 54px; min-height: 54px; }
+      .home-sources .cell { min-height: 50px; }
+      .home-sources + * { margin: 0; }
     }
   </style>
 </head>
 <body>
-  <div class="grain"></div>
   <div class="wrap">
     <header>
       <div class="brand">
-        <div class="eq" id="eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
         <div class="word">
           <h1><b>{{site}}</b></h1>
-          <div class="sub">sound · control</div>
         </div>
       </div>
       <div class="health" id="health"></div>
     </header>
 
     <nav id="nav">
-      <button class="active" data-tab="home">Home</button>
-      <button data-tab="dashboard">Dashboard</button>
-      <button data-tab="audio">Audio</button>
-      <button data-tab="services">Services</button>
+      <button class="active" data-tab="home">Remote</button>
+      <button data-tab="audio">Sound</button>
+      <button data-tab="services">System</button>
       <button data-tab="logs">Logs</button>
     </nav>
 
     <main>
       <section id="home" class="active">
-        <div class="home">
-          <div class="home-now">
-            <div class="cap">Now playing <span id="homeLive" class="badge">—</span></div>
-            <div class="home-source" id="homeSource">—</div>
-            <div class="meter silent" id="homeMeter"><i></i></div>
-          </div>
-          <div class="home-vol">
-            <button class="big-btn" data-home-vol="-1" aria-label="Volume down">−</button>
-            <div class="home-level">
-              <div class="home-db" id="homeVol">—</div>
-              <div class="sub2" id="homeVolSub">dB</div>
+        <div class="home-wrap">
+          <div class="home">
+            <div>
+              <div class="ht" id="homeMeter" aria-hidden="true"></div>
+              <div class="ht-axis"><span>−65</span><span id="homeSig">no input</span><span>−8 dBFS</span></div>
             </div>
-            <button class="big-btn" data-home-vol="1" aria-label="Volume up">+</button>
+            <div class="home-now">
+              <div class="cap">Now playing</div>
+              <div class="home-source" id="homeSource">—</div>
+              <div class="home-level">
+                <span class="home-db" id="homeVol">—</span>
+                <span class="sub2" id="homeVolSub">dB</span>
+              </div>
+            </div>
+            <div>
+              <div class="home-fader"><input id="homeRange" type="range" min="-50" max="0" step="0.5" value="-40" aria-label="Volume"></div>
+              <div class="home-vol">
+                <button class="big-btn" data-home-vol="-1" aria-label="Volume down">−</button>
+                <button class="btn home-mute" id="homeMute">Mute</button>
+                <button class="big-btn" data-home-vol="1" aria-label="Volume up">+</button>
+              </div>
+            </div>
+            <div>
+              <div class="cap src-cap">Source <button class="auto-pill" id="homeAuto" data-home-auto aria-pressed="true">Auto</button></div>
+              <div class="home-sources" id="homeSources"></div>
+            </div>
+            <div class="home-foot">
+              <div class="home-motu">
+                <span class="cap" style="margin:0">MOTU</span>
+                <button class="btn" data-home-motu="-1" aria-label="MOTU down">−</button>
+                <div class="val" id="homeMotu">—</div>
+                <button class="btn" data-home-motu="1" aria-label="MOTU up">+</button>
+              </div>
+              <button class="linkish" id="homeAmps">Amps off</button>
+            </div>
           </div>
-          <button class="btn home-mute" id="homeMute">Mute</button>
-          <div class="cap" style="margin-top:22px">Source</div>
-          <div class="home-sources" id="homeSources"></div>
-          <div class="cap" style="margin-top:22px">MOTU main output</div>
-          <div class="home-motu">
-            <button class="btn" data-home-motu="-1" aria-label="MOTU down">−</button>
-            <div class="val sm" id="homeMotu">—</div>
-            <button class="btn" data-home-motu="1" aria-label="MOTU up">+</button>
+
+          <div class="home-more" id="dashboard">
+            <div class="shead"><span class="ix">01</span><h2>Controls</h2><span class="rule"></span></div>
+            <div class="grid g-auto">
+              <div class="card">
+                <div class="cap">Source <span id="sourceMode" class="badge">—</span></div>
+                <div class="sources" id="sourcePanel"></div>
+                <div class="sub2" id="sourceCaption"></div>
+              </div>
+              <div class="card">
+                <div class="cap">CamillaDSP volume</div>
+                <div id="volumePanel"></div>
+              </div>
+              <div class="card">
+                <div class="cap">MOTU main output <span id="motuBadge" class="badge">—</span></div>
+                <div id="motuPanel"></div>
+                <div class="sub2" id="motuCaption"></div>
+              </div>
+              <div class="card">
+                <div class="cap">Per-source volume <span id="svBadge" class="badge">—</span></div>
+                <div id="sourceVolumePanel"></div>
+                <div class="sub2" id="sourceVolumeCaption"></div>
+              </div>
+              <div class="card">
+                <div class="cap">Speaker profile</div>
+                <div id="dashboardSpeaker" class="speaker-summary"></div>
+              </div>
+              <div class="card">
+                <div class="cap">Amplifier power</div>
+                <button class="btn danger" id="ampOff">Turn amps off now</button>
+                <div class="sub2">Turns off the trigger immediately. Automatic triggering stays enabled and will turn the amps on again with the next audio session.</div>
+              </div>
+            </div>
+            <div class="sub2 home-hint">Tip: add this page to your home screen (Share → Add to Home Screen on iPhone, ⋮ → Add to Home screen on Android) to use it like an app.</div>
           </div>
-          <button class="btn danger home-amps" id="homeAmps">Turn amps off</button>
-          <div class="sub2 home-hint">Tip: add this page to your home screen (Share → Add to Home Screen on iPhone, ⋮ → Add to Home screen on Android) to use it like an app.</div>
         </div>
-      </section>
-
-      <section id="dashboard">
-        <div class="shead"><span class="ix">01</span><h2>Now</h2><span class="rule"></span></div>
-        <div class="grid hero" id="heroGrid"></div>
-
-        <div class="shead"><span class="ix">02</span><h2>Controls</h2><span class="rule"></span></div>
-        <div class="grid g-auto">
-          <div class="card">
-            <div class="cap">Source <span id="sourceMode" class="badge">—</span></div>
-            <div class="sources" id="sourcePanel"></div>
-            <div class="sub2" id="sourceCaption"></div>
-          </div>
-          <div class="card">
-            <div class="cap">CamillaDSP volume</div>
-            <div id="volumePanel"></div>
-          </div>
-          <div class="card">
-            <div class="cap">MOTU main output <span id="motuBadge" class="badge">—</span></div>
-            <div id="motuPanel"></div>
-            <div class="sub2" id="motuCaption"></div>
-          </div>
-          <div class="card">
-            <div class="cap">Per-source volume <span id="svBadge" class="badge">—</span></div>
-            <div id="sourceVolumePanel"></div>
-            <div class="sub2" id="sourceVolumeCaption"></div>
-          </div>
-          <div class="card">
-            <div class="cap">Speaker profile</div>
-            <div id="dashboardSpeaker" class="speaker-summary"></div>
-          </div>
-          <div class="card">
-            <div class="cap">Amplifier power</div>
-            <button class="btn danger" id="ampOff">Turn amps off now</button>
-            <div class="sub2">Turns off the trigger immediately. Automatic triggering stays enabled and will turn the amps on again with the next audio session.</div>
-          </div>
-        </div>
-
-        <div class="shead"><span class="ix">03</span><h2>System</h2><span class="rule"></span></div>
-        <div class="grid g-auto" id="systemGrid"></div>
       </section>
 
       <section id="audio">
@@ -647,12 +679,14 @@ HTML = r"""<!doctype html>
       </section>
 
       <section id="services">
-        <div class="shead"><span class="ix">01</span><h2>Health check</h2><span class="rule"></span></div>
+        <div class="shead"><span class="ix">01</span><h2>Status</h2><span class="rule"></span></div>
+        <div class="grid g-auto" id="systemGrid" style="margin-bottom:12px"></div>
+        <div class="shead"><span class="ix">02</span><h2>Health check</h2><span class="rule"></span></div>
         <div class="card" style="margin-bottom:12px">
           <div class="row"><button class="btn primary" id="runDiagnose">Run health check</button><span class="sub2" id="diagnoseSummary">Checks services, configs, the audio lock, the MOTU link, the remote and power. Takes a few seconds.</span></div>
           <div id="diagnoseReport"></div>
         </div>
-        <div class="shead"><span class="ix">02</span><h2>Systemd services</h2><span class="rule"></span></div>
+        <div class="shead"><span class="ix">03</span><h2>Systemd services</h2><span class="rule"></span></div>
         <div id="servicesTable"></div>
       </section>
 
@@ -814,46 +848,13 @@ HTML = r"""<!doctype html>
         `<span class="chip" title="local time">${time}</span>`;
     }
 
-    function renderHero(data) {
-      const c = data.camilla || {};
-      const src = data.source || {};
-      const state = c.error ? "error" : (c.state || serviceText(data.services["camilladsp.service"]));
-      const stCls = c.error ? "bad" : (state === "RUNNING" ? "ok" : "warn");
-      const vol = c.volume_db != null ? Number(c.volume_db).toFixed(1) : "—";
-      const activeSrc = src.current ? (src.current[0].toUpperCase() + src.current.slice(1)) : (c.config_title || "—");
-      qs("#heroGrid").innerHTML =
-        `<div class="tile">
-          <div class="cap">Input signal <span id="sigBadge" class="badge">—</span></div>
-          <div class="meter silent" id="sigMeter"><i></i></div>
-          <div class="sub2" id="sigText">—</div>
-        </div>
-        <div class="tile">
-          <div class="cap">Output</div>
-          <div class="val big"><span id="heroVol">${vol}</span><span class="unit"> dB</span></div>
-          <div class="sub2"><span id="heroMute">${c.muted ? '<span class="warn">muted</span>' : "unmuted"}</span> · CamillaDSP <span class="${stCls}">${esc(state)}</span></div>
-        </div>
-        <div class="tile">
-          <div class="cap">Active source</div>
-          <div class="val sm">${esc(activeSrc)}</div>
-          <div class="sub2">${esc(c.config_title || "—")}</div>
-        </div>`;
-      updateSignal(c.signal_db);
-    }
-
     function updateSignal(db) {
-      const meter = qs("#sigMeter"); if (!meter) return;
       const lo = -65, hi = -8;
       const has = db != null && db > -200;
       const norm = has ? Math.max(0, Math.min(1, (db - lo) / (hi - lo))) : 0;
       signalTarget = norm;
-      const home = qs("#homeMeter");
-      if (home) { home.querySelector("i").style.width = (norm * 100).toFixed(1) + "%"; home.classList.toggle("silent", !has || norm < 0.02); }
-      meter.querySelector("i").style.width = (norm * 100).toFixed(1) + "%";
-      meter.classList.toggle("silent", !has || norm < 0.02);
-      const badge = qs("#sigBadge");
-      if (badge) { badge.textContent = has ? "signal" : "silent"; badge.className = "badge " + (has ? "ok" : ""); }
-      const txt = qs("#sigText");
-      if (txt) txt.innerHTML = has ? `${db.toFixed(1)} dBFS` : `<span class="faint">no input</span>`;
+      const txt = qs("#homeSig");
+      if (txt) txt.textContent = has ? `${db.toFixed(1)} dBFS` : "no input";
     }
 
     function renderSource(data) {
@@ -912,7 +913,7 @@ HTML = r"""<!doctype html>
     }
 
     /* ---------------- audio EQ ---------------- */
-    const EQ_COLORS = ["#5aa0ff", "#ffd166", "#63df8c", "#d78cff", "#ff8d6b", "#68d8e8", "#f27fb1", "#a8e063"];
+    const EQ_COLORS = ["#b0361b", "#2f6e9e", "#4b7a2a", "#8a4fa0", "#b86d0e", "#1d7f80", "#b8476f", "#6b6a1f"];
     const EQ_X0 = 55, EQ_X1 = 875, EQ_Y0 = 20, EQ_Y1 = 320;
     const EQ_TYPES = ["Peaking","Lowshelf","Highshelf","Lowpass","Highpass","Bandpass","Notch"];
     const EQ_GAIN_TYPES = new Set(["Peaking","Lowshelf","Highshelf"]);
@@ -970,12 +971,12 @@ HTML = r"""<!doctype html>
       const bandCurves=eqShowBandCurves?section.bands.map((band,index)=>{ const p=[]; for(let i=0;i<=160;i++){const x=EQ_X0+(EQ_X1-EQ_X0)*i/160;p.push(`${i?"L":"M"}${x.toFixed(1)},${eqY(bandResponseDb(eqFreq(x),band)).toFixed(1)}`);} return `<path class="eq-band-curve ${selectedEqBand===index?"selected":""}" stroke="${EQ_COLORS[index%EQ_COLORS.length]}" d="${p.join(" ")}"/>`; }).join(""):"";
       let markers="";
       if(selectedEqBand!=null&&section.bands[selectedEqBand]){const b=section.bands[selectedEqBand],q=Math.max(.1,b.q),root=Math.sqrt(1+1/(4*q*q)),lo=b.freq*(root-1/(2*q)),hi=b.freq*(root+1/(2*q));markers=`<line x1="${eqX(lo)}" x2="${eqX(lo)}" y1="${EQ_Y0}" y2="${EQ_Y1}" stroke="${EQ_COLORS[selectedEqBand%EQ_COLORS.length]}" stroke-dasharray="4 5" opacity=".55"/><line x1="${eqX(hi)}" x2="${eqX(hi)}" y1="${EQ_Y0}" y2="${EQ_Y1}" stroke="${EQ_COLORS[selectedEqBand%EQ_COLORS.length]}" stroke-dasharray="4 5" opacity=".55"/>`;}
-      svg.innerHTML = `<defs><linearGradient id="eqFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ff9a45"/><stop offset="1" stop-color="#4d8dff"/></linearGradient></defs>
+      svg.innerHTML = `<defs><linearGradient id="eqFill" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#d9531f"/><stop offset="1" stop-color="#d9531f" stop-opacity="0"/></linearGradient></defs>
         ${freqTicks.map(f => `<line class="eq-grid-line" x1="${eqX(f)}" x2="${eqX(f)}" y1="${EQ_Y0}" y2="${EQ_Y1}"/><text class="eq-axis" x="${eqX(f)}" y="342" text-anchor="middle">${f>=1000 ? (f/1000)+"k" : f}</text>`).join("")}
         ${gainTicks.map(g => `<line class="${g===0 ? "eq-zero" : "eq-grid-line"}" x1="${EQ_X0}" x2="${EQ_X1}" y1="${eqY(g)}" y2="${eqY(g)}"/><text class="eq-axis" x="45" y="${eqY(g)+4}" text-anchor="end">${g>0?"+":""}${g}</text>`).join("")}
         ${bandCurves}${markers}
         <path class="eq-fill" d="${fill}"/><path class="eq-curve" d="${curve}"/>
-        ${section.bands.map((b,i) => {const y=eqY(eqSupportsGain(b)?b.gain:0);return `<g opacity="${b.enabled && section.enabled && (eqSoloBand==null||eqSoloBand===i) ? 1 : .25}"><circle class="eq-handle" data-eq-handle="${i}" cx="${eqX(b.freq)}" cy="${y}" r="${selectedEqBand===i?14:12}" fill="${EQ_COLORS[i%EQ_COLORS.length]}"/><text x="${eqX(b.freq)}" y="${y+4}" text-anchor="middle" fill="#091014" font-size="11" font-weight="700">${i+1}</text></g>`;}).join("")}`;
+        ${section.bands.map((b,i) => {const y=eqY(eqSupportsGain(b)?b.gain:0);return `<g opacity="${b.enabled && section.enabled && (eqSoloBand==null||eqSoloBand===i) ? 1 : .25}"><circle class="eq-handle" data-eq-handle="${i}" cx="${eqX(b.freq)}" cy="${y}" r="${selectedEqBand===i?14:12}" fill="${EQ_COLORS[i%EQ_COLORS.length]}"/><text x="${eqX(b.freq)}" y="${y+4}" text-anchor="middle" fill="#fbf3ea" font-size="11" font-weight="700">${i+1}</text></g>`;}).join("")}`;
       svg.onpointerdown = e => {
         const handle = e.target.closest && e.target.closest("[data-eq-handle]");
         if (!handle) return;
@@ -1479,8 +1480,6 @@ HTML = r"""<!doctype html>
       const c = d.camilla || {};
       updateSignal(c.ok ? c.signal_db : null);
       if (c.ok) {
-        const hv = qs("#heroVol"); if (hv) hv.textContent = Number(c.volume_db).toFixed(1);
-        const hm = qs("#heroMute"); if (hm) hm.innerHTML = c.muted ? '<span class="warn">muted</span>' : "unmuted";
         const focus = document.activeElement;
         if (qs("#volRange") && focus !== qs("#volRange") && focus !== qs("#volNum")) {
           qs("#volRange").value = c.volume_db; qs("#volNum").value = Number(c.volume_db).toFixed(1);
@@ -1514,23 +1513,30 @@ HTML = r"""<!doctype html>
       const src = Object.assign({}, lastStatus?.source || {}, live?.source || {});
       const available = src.available || {};
       qs("#homeSource").textContent = SOURCE_LABELS[src.current] || titleCase(src.current);
-      const badge = qs("#homeLive");
-      badge.textContent = src.mode && src.mode !== "auto" ? "manual" : "auto";
-      badge.className = "badge " + (src.mode && src.mode !== "auto" ? "warn" : "ok");
       const vol = c.volume_db != null ? Number(c.volume_db) : null;
       const homeVol = qs("#homeVol");
       homeVol.textContent = vol == null ? "—" : vol.toFixed(1);
       homeVol.classList.toggle("muted", !!c.muted);
       qs("#homeVolSub").textContent = c.volume_max_db != null ? `dB · max ${Number(c.volume_max_db).toFixed(0)}` : "dB";
+      const range = qs("#homeRange");
+      const volMax = c.volume_max_db != null ? Number(c.volume_max_db) : 0;
+      range.min = Math.min(-50, volMax); range.max = volMax;
+      range.disabled = vol == null;
+      if (vol != null && document.activeElement !== range) range.value = vol;
       const mute = qs("#homeMute");
-      mute.textContent = c.muted ? "Muted · tap to unmute" : "Mute";
+      mute.textContent = c.muted ? "Unmute" : "Mute";
       mute.classList.toggle("is-muted", !!c.muted);
-      const chips = [`<button class="btn ${!src.mode || src.mode === "auto" ? "on" : ""}" data-home-source="auto">Auto</button>`];
+      const auto = !src.mode || src.mode === "auto";
+      const cells = [];
       for (const [key, item] of Object.entries(available)) {
         if (!item.exists) continue;
-        chips.push(`<button class="btn ${src.mode === key ? "on" : ""} ${src.current === key ? "live" : ""}" data-home-source="${esc(key)}">${esc(item.label)}</button>`);
+        const state = src.current === key ? (src.mode === key ? "● held" : "● live") : "";
+        cells.push(`<button class="cell ${src.current === key ? "on" : ""}" data-home-source="${esc(key)}"><span class="n">${esc(item.label)}</span><span class="k">${state}</span></button>`);
       }
-      const html = chips.join("");
+      const autoBtn = qs("#homeAuto");
+      autoBtn.classList.toggle("on", auto); autoBtn.setAttribute("aria-pressed", String(auto));
+      autoBtn.textContent = auto ? "● Auto" : "Auto · off";
+      const html = cells.join("");
       if (qs("#homeSources").innerHTML !== html) {
         qs("#homeSources").innerHTML = html;
         qsa("[data-home-source]").forEach(b => b.addEventListener("click", homeSource));
@@ -1542,7 +1548,7 @@ HTML = r"""<!doctype html>
     const SOURCE_LABELS = { streamer: "Streamer", gadget: "USB Gadget", toslink: "TOSLINK", analog: "Analog" };
     async function homeSource(e) {
       const btn = e.currentTarget; btn.disabled = true;
-      try { await api("/api/source", { method: "POST", body: JSON.stringify({ source: btn.dataset.homeSource }) }); await load(); }
+      try { await api("/api/source", { method: "POST", body: JSON.stringify({ source: btn.dataset.homeAuto != null ? "auto" : btn.dataset.homeSource }) }); await load(); }
       catch (err) { toast(err.message); } finally { btn.disabled = false; }
     }
     /* Press and hold repeats, like the remote's volume keys. */
@@ -1584,7 +1590,7 @@ HTML = r"""<!doctype html>
       renderServices(data.services || {});
       renderLogOptions(data.services || {});
       renderHealth(data);
-      renderHero(data);
+      updateSignal(data.camilla?.signal_db);
       renderSource(data);
       renderVolume(data);
       lastStatus = data;
@@ -1601,25 +1607,50 @@ HTML = r"""<!doctype html>
       catch (e) { /* keep last */ }
     }
 
-    // header equalizer, driven by real signal magnitude
-    const bars = qsa("#eq i");
-    let phase = 0;
+    // Remote's halftone meter: the lit columns follow the real signal level
+    // (−65 to −8 dBFS, left to right); the column heights only ripple.
+    const HT_COLS = 18, HT_ROWS = 7;
+    const htCells = [];
+    (() => {
+      const box = qs("#homeMeter");
+      for (let r = 0; r < HT_ROWS; r++) for (let c = 0; c < HT_COLS; c++) {
+        const i = document.createElement("i"); box.appendChild(i);
+        htCells.push({ el: i, c, up: HT_ROWS - 1 - r, key: "" });
+      }
+    })();
+    const calmMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let phase = 0, shownLevel = 0, htFrame = 0;
     function animateEq() {
-      phase += 0.08;
-      bars.forEach((b, i) => {
-        const wob = 0.5 + 0.5 * Math.sin(phase * (1.1 + i * 0.28) + i * 1.3);
-        const h = 12 + (12 + signalTarget * 74) * wob;
-        b.style.height = Math.min(100, h).toFixed(0) + "%";
-      });
       requestAnimationFrame(animateEq);
+      if (document.hidden || (++htFrame & 1)) return;
+      phase += 0.12;
+      shownLevel += (signalTarget - shownLevel) * 0.3;
+      const lit = shownLevel * HT_COLS;
+      const heights = [];
+      for (let c = 0; c < HT_COLS; c++) {
+        const wob = calmMotion ? 1 : 0.5 + 0.5 * Math.sin(phase * (0.9 + c * 0.11) + c * 1.7);
+        heights.push(c < lit ? Math.max(1, Math.round(HT_ROWS * (0.35 + 0.65 * wob))) : 0);
+      }
+      for (const cell of htCells) {
+        const h = heights[cell.c];
+        const on = cell.up < h, edge = cell.up === h && h > 0;
+        const scale = on ? 1 - cell.up * 0.075 : (edge ? 0.42 : 0.2);
+        const cls = on ? (cell.c >= HT_COLS * 0.82 ? "on hot" : "on") : "";
+        const key = cls + scale.toFixed(2);
+        if (key === cell.key) continue;
+        cell.key = key; cell.el.className = cls; cell.el.style.transform = `scale(${scale.toFixed(2)})`;
+      }
     }
 
     function activateTab(name) {
+      if (name === "dashboard") name = "home";  // the old Dashboard tab now lives under Remote
       const btn = qsa("nav button").find(b => b.dataset.tab === name);
       if (!btn) return;
       qsa("nav button").forEach(x => x.classList.remove("active"));
       qsa("section").forEach(s => s.classList.remove("active"));
       btn.classList.add("active"); qs("#" + name).classList.add("active");
+      // The hash names the section, so the browser scrolls it under the header; undo that.
+      window.scrollTo(0, 0); requestAnimationFrame(() => window.scrollTo(0, 0));
       if (name === "logs") refreshLogs();
       if (name === "audio" && !audioLoaded) loadAudio();
     }
@@ -1651,7 +1682,7 @@ HTML = r"""<!doctype html>
     qs("#speakerConfirm").addEventListener("cancel", () => { pendingSpeakerId=null; });
 
     animateEq();
-    if (location.hash.slice(1)) activateTab(location.hash.slice(1));
+    if (location.hash.slice(1)) { activateTab(location.hash.slice(1)); window.addEventListener("load", () => window.scrollTo(0, 0)); }
     load().catch(e => toast(e.message));
     // Once per page load, not with the 5 s status sweep: each device read
     // briefly drops the source switcher's meters.
@@ -1677,6 +1708,8 @@ HTML = r"""<!doctype html>
       setVolume({ muted: !c.muted });
     });
     qs("#homeAmps").addEventListener("click", ampsOff);
+    qs("#homeAuto").addEventListener("click", homeSource);
+    qs("#homeRange").addEventListener("change", e => { setVolume({ volume_db: Number(e.target.value) }); e.target.blur(); });
   </script>
 </body>
 </html>
@@ -2041,10 +2074,10 @@ def _release_live_stream() -> None:
 
 
 # ---- installable web app: manifest and icons ----
-THEME_COLOR = "#0b0c0e"
+THEME_COLOR = "#f3e7d8"
 ICON_BARS = (0.34, 0.62, 0.9, 0.7, 0.46)
-ICON_COOL = (0x4D, 0x8D, 0xFF)
-ICON_WARM = (0xFF, 0x9A, 0x45)
+ICON_COOL = (0x2A, 0x1A, 0x10)
+ICON_WARM = (0xB0, 0x36, 0x1B)
 
 
 def manifest() -> dict[str, Any]:
@@ -2950,6 +2983,16 @@ class Handler(BaseHTTPRequestHandler):
         icon_sizes = {"/icon-192.png": 192, "/icon-512.png": 512, "/apple-touch-icon.png": 180}
         if parsed.path in icon_sizes:
             self.send_body(icon_png(icon_sizes[parsed.path]), "image/png")
+            return
+        if parsed.path.startswith("/fonts/") and parsed.path[len("/fonts/"):] in FONT_FILES:
+            # A missing file is a plain 404, which sends the page on to its
+            # Google copy of the font.
+            try:
+                font = (FONTS_DIR / parsed.path[len("/fonts/"):]).read_bytes()
+            except OSError:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_body(font, "font/woff2")
             return
 
         if parsed.path == "/api/events":
